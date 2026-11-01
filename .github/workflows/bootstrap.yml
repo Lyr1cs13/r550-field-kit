@@ -1,0 +1,48 @@
+name: Initialize deployment source
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bootstrap.yml']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Verify, test and publish source tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os,tarfile,hashlib,pathlib,subprocess,sys
+          root=pathlib.Path.cwd();bundle=root/'source-bootstrap.tar.gz'
+          if hashlib.sha256(bundle.read_bytes()).hexdigest()!='a8181b9ceb4e97ead98a3be4c51304d33b5157003676fa224c0ab4243f3b9604':raise RuntimeError('Source archive checksum mismatch')
+          with tarfile.open(bundle) as t:
+              for member in t.getmembers():
+                  p=pathlib.PurePosixPath(member.name)
+                  if p.is_absolute() or '..' in p.parts or not member.isfile() or '.git' in p.parts or '.github' in p.parts:raise RuntimeError('Invalid archive member')
+              t.extractall(root)
+          bundle.unlink()
+          subprocess.run([sys.executable,'-m','pip','install','-r','requirements.txt'],check=True)
+          subprocess.run([sys.executable,'-m','unittest','discover','-s','demo/tests'],check=True)
+          subprocess.run([sys.executable,'tools/check_repository.py'],check=True)
+          subprocess.run(['git','config','user.name','github-actions[bot]'],check=True)
+          subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
+          subprocess.run(['git','add','--all'],check=True)
+          subprocess.run(['git','commit','-m','Add portable R550 deployment, mapping, navigation and WS63 kit'],check=True)
+          ask=pathlib.Path(os.environ['RUNNER_TEMP'])/'r550-askpass.py'
+          ask.write_text('#!/usr/bin/env python3\nimport os,sys\nprint("x-access-token" if "Username" in sys.argv[1] else os.environ["GH_TOKEN"])\n')
+          ask.chmod(0o700)
+          env=dict(os.environ,GIT_ASKPASS=str(ask),GIT_TERMINAL_PROMPT='0')
+          try:
+              result=subprocess.run(['git','-c','credential.helper=','push','origin','HEAD:main'],env=env,capture_output=True,text=True)
+              if result.returncode:raise RuntimeError('Source push failed (exit '+str(result.returncode)+')')
+              print('Source tree published; no user credential was stored.')
+          finally:ask.unlink(missing_ok=True)
+          PY
