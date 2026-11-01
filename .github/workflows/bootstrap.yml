@@ -28,6 +28,7 @@ jobs:
                   p=pathlib.PurePosixPath(member.name)
                   if p.is_absolute() or '..' in p.parts or not member.isfile() or '.git' in p.parts or '.github' in p.parts:raise RuntimeError('Invalid archive member')
               t.extractall(root)
+              for member in t.getmembers():os.utime(root/member.name,None)
           bundle.unlink()
           subprocess.run([sys.executable,'-m','pip','install','-r','requirements.txt'],check=True)
           subprocess.run([sys.executable,'-m','unittest','discover','-s','demo/tests'],check=True)
