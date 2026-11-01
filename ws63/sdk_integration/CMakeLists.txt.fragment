@@ -1,0 +1,4 @@
+# Add before set(SOURCES "${SOURCES}" PARENT_SCOPE) in the SLE parent CMakeLists.
+if(DEFINED CONFIG_SAMPLE_SUPPORT_BEACON_SURVEY_TX OR DEFINED CONFIG_SAMPLE_SUPPORT_BEACON_SURVEY_RX)
+    add_subdirectory_if_exist(beacon_survey)
+endif()

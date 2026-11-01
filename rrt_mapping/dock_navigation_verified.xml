@@ -1,0 +1,32 @@
+<!-- Native Nav2 nodes only. Low speed collision-checked escape before spinning. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="4" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
+            <ComputePathToPose server_timeout="1000" goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ClearEntireCostmap server_timeout="1000" name="ClearGlobalCostmap" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+          <FollowPath server_timeout="1000" path="{path}" controller_id="FollowPath" goal_checker_id="goal_checker"/>
+          <ClearEntireCostmap server_timeout="1000" name="ClearLocalCostmap" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearBothCostmaps">
+            <ClearEntireCostmap server_timeout="1000" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap server_timeout="1000" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <DriveOnHeading server_timeout="1000" dist_to_travel="0.12" speed="0.04" time_allowance="8.0"/>
+          <BackUp server_timeout="1000" backup_dist="-0.12" backup_speed="0.04" time_allowance="8.0"/>
+          <Spin server_timeout="1000" spin_dist="0.35" time_allowance="8.0"/>
+          <Wait server_timeout="1000" wait_duration="2.0"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

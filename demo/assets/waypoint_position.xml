@@ -1,0 +1,36 @@
+<!-- Keep valid routes stable. Native DWB finds alternative safe velocities
+     when RPP's rotation is blocked; RPP still verifies the final position. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode name="ReachPositionWithAlternativeController" number_of_retries="1">
+      <Sequence name="FreshGoalPathFirst">
+      <ComputePathToPose goal="{goal}" path="{path}" planner_id="WaypointGrid"/>
+      <Fallback>
+        <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother" max_smoothing_duration="0.3" check_for_collisions="true"/>
+        <AlwaysSuccess/>
+      </Fallback>
+    <PipelineSequence name="NavigateWithReplanning">
+      <RateController hz="1.0">
+        <Fallback>
+          <IsPathValid path="{path}"/>
+          <Sequence>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="WaypointGrid"/>
+            <Fallback>
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother" max_smoothing_duration="0.3" check_for_collisions="true"/>
+              <AlwaysSuccess/>
+            </Fallback>
+          </Sequence>
+        </Fallback>
+      </RateController>
+      <FollowPath path="{path}" controller_id="PointPosition" goal_checker_id="point_position_checker"/>
+    </PipelineSequence>
+      </Sequence>
+      <Sequence name="RefreshObservationsAndFindSafeMotion">
+        <ClearEntireCostmap name="RefreshLocalObservations" service_name="local_costmap/clear_entirely_local_costmap" server_timeout="1000"/>
+        <Wait wait_duration="1.0"/>
+        <ComputePathToPose goal="{goal}" path="{recovery_path}" planner_id="WaypointGrid"/>
+        <FollowPath path="{recovery_path}" controller_id="PointRecovery" goal_checker_id="recovery_position_checker"/>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

@@ -1,0 +1,10 @@
+# Inside the existing SLE Sample choice:
+osource "application/samples/bt/sle/beacon_survey/Kconfig"
+
+# Outside the choice:
+config SUPPORT_SLE_PERIPHERAL
+    bool
+    default y if SAMPLE_SUPPORT_BEACON_SURVEY_TX
+config SUPPORT_SLE_CENTRAL
+    bool
+    default y if SAMPLE_SUPPORT_BEACON_SURVEY_RX

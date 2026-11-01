@@ -1,0 +1,15 @@
+{
+  "calibrated": true,
+  "robot_pose": {
+    "x": 0.0,
+    "y": 0.0,
+    "yaw": 0.0
+  },
+  "charger_approach": {
+    "p_x": 0.6,
+    "p_y": 0.0,
+    "orien_z": -0.13052619222005157,
+    "orien_w": 0.9914448613738104
+  },
+  "departure_distance": 0.3
+}

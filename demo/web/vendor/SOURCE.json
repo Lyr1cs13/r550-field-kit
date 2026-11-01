@@ -1,0 +1,18 @@
+{
+  "tabler": "https://github.com/tabler/tabler",
+  "tabler_version": "1.6.1",
+  "icons": "https://github.com/tabler/tabler-icons",
+  "icons_version": "3.49.0",
+  "license": "MIT",
+  "download_urls": {
+    "tabler.min.css": "https://cdn.jsdelivr.net/npm/@tabler/core@1.6.1/dist/css/tabler.min.css",
+    "TABLER_LICENSE": "https://raw.githubusercontent.com/tabler/tabler/dev/LICENSE",
+    "TABLER_ICONS_LICENSE": "https://raw.githubusercontent.com/tabler/tabler-icons/v3.49.0/LICENSE"
+  },
+  "sha256": {
+    "icons.svg": "fc9da3f5bc3711477694dac2142432ca3f15d93a3de569f6858bbaf4ce14193c",
+    "tabler.min.css": "09c0ad77d135f90fd8cbc583824b2fdbd247adbc001234d27a36f284bfecab5e",
+    "TABLER_ICONS_LICENSE": "b740a1d46122672da62833e97f7e7c8a13fa85cbc7445b584b297cc00dde93db",
+    "TABLER_LICENSE": "4f88a82d13be3c5c63a12c5631eae914aa4381b6dc17641bf1ab85f3f8f6c8a5"
+  }
+}

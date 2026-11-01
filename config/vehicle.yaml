@@ -1,0 +1,10 @@
+model: R550 Pro 4WD
+computer: RDK X5
+ros_distro: humble
+robot_workspace: ~/wheeltec_ros2
+base_frame: base_footprint
+odom_frame: odom_combined
+antenna_filter:
+  enabled: false
+  center: [-0.120, -0.073]
+  radius: 0.027

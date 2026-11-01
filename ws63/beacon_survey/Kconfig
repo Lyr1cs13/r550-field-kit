@@ -1,0 +1,6 @@
+config SAMPLE_SUPPORT_BEACON_SURVEY_TX
+    bool "R550 fixed RSSI beacon (no connection)"
+
+config SAMPLE_SUPPORT_BEACON_SURVEY_RX
+    bool "R550 mobile RSSI broadcast receiver (no connection)"
+    depends on AT_SUPPORT_PLT

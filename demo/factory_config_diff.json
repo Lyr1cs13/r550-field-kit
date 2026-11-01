@@ -1,0 +1,909 @@
+{
+  "source_archive": "X5_wheeltec_ros2_src_20260903.zip",
+  "profile": "precision",
+  "controller": "native_rotation_shim_rpp_and_dwb",
+  "entry": "src/wheeltec_robot_nav2/param/wheeltec_params/param_mini_4wd.yaml",
+  "source_sha256": "4d326c7ed83b25db3abf00773abcc607320695ad200fca2a99263f1029140f7d",
+  "changes": [
+    {
+      "path": "amcl.ros__parameters.set_initial_pose",
+      "factory": true,
+      "demo": false
+    },
+    {
+      "path": "amcl.ros__parameters.update_min_a",
+      "factory": 0.1,
+      "demo": 0.05
+    },
+    {
+      "path": "amcl.ros__parameters.update_min_d",
+      "factory": 0.1,
+      "demo": 0.03
+    },
+    {
+      "path": "behavior_server",
+      "factory": null,
+      "demo": {
+        "ros__parameters": {
+          "use_sim_time": false,
+          "global_frame": "odom_combined",
+          "robot_base_frame": "base_footprint",
+          "transform_tolerance": 0.2,
+          "cycle_frequency": 20.0,
+          "max_rotational_vel": 0.25,
+          "min_rotational_vel": 0.12,
+          "rotational_acc_lim": 0.12
+        }
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.AckermannConstraints",
+      "factory": {
+        "min_turning_r": 0.0
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.BaseObstacle.scale",
+      "factory": null,
+      "demo": 1.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.ConstraintCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 4.0
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.GoalAlign.scale",
+      "factory": null,
+      "demo": 24.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.GoalAngleCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 3.0,
+        "threshold_to_consider": 0.5
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.GoalCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 15.0,
+        "threshold_to_consider": 1.4
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.GoalDist.scale",
+      "factory": null,
+      "demo": 24.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.ObstaclesCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "repulsion_weight": 3.0,
+        "critical_weight": 30.0,
+        "consider_footprint": true,
+        "collision_cost": 10000.0,
+        "collision_margin_distance": 0.2,
+        "near_goal_distance": 0.2,
+        "cost_scaling_factor": 3.0,
+        "inflation_radius": 0.15
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.Oscillation.oscillation_reset_angle",
+      "factory": null,
+      "demo": 0.05
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.Oscillation.oscillation_reset_dist",
+      "factory": null,
+      "demo": 0.05
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathAlign.forward_point_distance",
+      "factory": null,
+      "demo": 0.1
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathAlign.scale",
+      "factory": null,
+      "demo": 32.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathAlignCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 12.0,
+        "max_path_occupancy_ratio": 0.07,
+        "trajectory_point_step": 4,
+        "threshold_to_consider": 0.5,
+        "offset_from_furthest": 20,
+        "use_path_orientations": false
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathAngleCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 4.0,
+        "offset_from_furthest": 4,
+        "threshold_to_consider": 0.5,
+        "max_angle_to_furthest": 1.0,
+        "mode": 0
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathDist.scale",
+      "factory": null,
+      "demo": 32.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PathFollowCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 12.0,
+        "offset_from_furthest": 5,
+        "threshold_to_consider": 1.4
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.PreferForwardCritic",
+      "factory": {
+        "enabled": true,
+        "cost_power": 1,
+        "cost_weight": 12.0,
+        "threshold_to_consider": 0.5
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.RotateToGoal.lookahead_time",
+      "factory": null,
+      "demo": 1.2
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.RotateToGoal.scale",
+      "factory": null,
+      "demo": 32.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.RotateToGoal.slowing_factor",
+      "factory": null,
+      "demo": 5.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.TrajectoryVisualizer",
+      "factory": {
+        "trajectory_step": 5,
+        "time_step": 3
+      },
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.acc_lim_theta",
+      "factory": null,
+      "demo": 0.25
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.acc_lim_x",
+      "factory": null,
+      "demo": 0.25
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.acc_lim_y",
+      "factory": null,
+      "demo": 0.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.angular_dist_threshold",
+      "factory": 0.785,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.angular_granularity",
+      "factory": null,
+      "demo": 0.05
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.ax_max",
+      "factory": 1.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.ax_min",
+      "factory": -1.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.ay_max",
+      "factory": 0.0,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.az_max",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.batch_size",
+      "factory": 2000,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.critics",
+      "factory": [
+        "ConstraintCritic",
+        "ObstaclesCritic",
+        "GoalCritic",
+        "GoalAngleCritic",
+        "PathAlignCritic",
+        "PathFollowCritic",
+        "PathAngleCritic",
+        "PreferForwardCritic"
+      ],
+      "demo": [
+        "RotateToGoal",
+        "Oscillation",
+        "BaseObstacle",
+        "GoalAlign",
+        "PathAlign",
+        "PathDist",
+        "GoalDist"
+      ]
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.decel_lim_theta",
+      "factory": null,
+      "demo": -0.25
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.decel_lim_x",
+      "factory": null,
+      "demo": -0.25
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.decel_lim_y",
+      "factory": null,
+      "demo": 0.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.enforce_path_inversion",
+      "factory": false,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.forward_sampling_distance",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.gamma",
+      "factory": 0.015,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.iteration_count",
+      "factory": 1,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.max_angular_accel",
+      "factory": 3.2,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.max_speed_xy",
+      "factory": null,
+      "demo": 0.2
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.max_vel_theta",
+      "factory": null,
+      "demo": 0.22
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.max_vel_x",
+      "factory": null,
+      "demo": 0.2
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.max_vel_y",
+      "factory": null,
+      "demo": 0.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.min_speed_theta",
+      "factory": null,
+      "demo": 0.1
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.min_speed_xy",
+      "factory": null,
+      "demo": 0.01
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.min_vel_x",
+      "factory": null,
+      "demo": -0.06
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.min_vel_y",
+      "factory": null,
+      "demo": 0.0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.model_dt",
+      "factory": 0.05,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.motion_model",
+      "factory": "DiffDrive",
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.plugin",
+      "factory": "nav2_rotation_shim_controller::RotationShimController",
+      "demo": "dwb_core::DWBLocalPlanner"
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.primary_controller",
+      "factory": "nav2_mppi_controller::MPPIController",
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.prune_distance",
+      "factory": 1.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.rotate_to_goal_heading",
+      "factory": true,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.rotate_to_heading_angular_vel",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.short_circuit_trajectory_evaluation",
+      "factory": null,
+      "demo": true
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.sim_time",
+      "factory": null,
+      "demo": 1.7
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.simulate_ahead_time",
+      "factory": 1.0,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.stateful",
+      "factory": null,
+      "demo": true
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.temperature",
+      "factory": 0.3,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.time_steps",
+      "factory": 56,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.trans_stopped_velocity",
+      "factory": null,
+      "demo": 0.02
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.transform_tolerance",
+      "factory": 0.1,
+      "demo": 0.2
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.visualize",
+      "factory": false,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vtheta_samples",
+      "factory": null,
+      "demo": 40
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vx_max",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vx_min",
+      "factory": -0.2,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vx_samples",
+      "factory": null,
+      "demo": 20
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vx_std",
+      "factory": 0.2,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vy_max",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vy_samples",
+      "factory": null,
+      "demo": 0
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.vy_std",
+      "factory": 0.2,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.wz_max",
+      "factory": 0.5,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.wz_std",
+      "factory": 0.2,
+      "demo": null
+    },
+    {
+      "path": "controller_server.ros__parameters.FollowPath.xy_goal_tolerance",
+      "factory": null,
+      "demo": 0.025
+    },
+    {
+      "path": "controller_server.ros__parameters.PointHeading",
+      "factory": null,
+      "demo": {
+        "plugin": "dwb_core::DWBLocalPlanner",
+        "min_vel_x": 0.0,
+        "min_vel_y": 0.0,
+        "max_vel_x": 0.0,
+        "max_vel_y": 0.0,
+        "max_vel_theta": 0.2,
+        "min_speed_xy": 0.01,
+        "max_speed_xy": 0.0,
+        "min_speed_theta": 0.035,
+        "acc_lim_x": 0.25,
+        "acc_lim_y": 0.0,
+        "acc_lim_theta": 0.35,
+        "decel_lim_x": -0.25,
+        "decel_lim_y": 0.0,
+        "decel_lim_theta": -0.6,
+        "vx_samples": 1,
+        "vy_samples": 0,
+        "vtheta_samples": 101,
+        "sim_time": 1.0,
+        "angular_granularity": 0.05,
+        "transform_tolerance": 0.2,
+        "xy_goal_tolerance": 0.1,
+        "trans_stopped_velocity": 0.02,
+        "short_circuit_trajectory_evaluation": true,
+        "stateful": true,
+        "critics": [
+          "ObstacleFootprint",
+          "RotateToGoal"
+        ],
+        "BaseObstacle.scale": 1.0,
+        "PathAlign.scale": 32.0,
+        "PathAlign.forward_point_distance": 0.1,
+        "GoalAlign.scale": 24.0,
+        "PathDist.scale": 32.0,
+        "GoalDist.scale": 24.0,
+        "RotateToGoal.scale": 32.0,
+        "RotateToGoal.slowing_factor": 5.0,
+        "RotateToGoal.lookahead_time": 0.5,
+        "Oscillation.oscillation_reset_dist": 0.05,
+        "Oscillation.oscillation_reset_angle": 0.05,
+        "ObstacleFootprint.scale": 0.02
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.PointPosition",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_rotation_shim_controller::RotationShimController",
+        "desired_linear_vel": 0.2,
+        "lookahead_dist": 0.4,
+        "min_lookahead_dist": 0.35,
+        "max_lookahead_dist": 0.55,
+        "lookahead_time": 2.0,
+        "use_velocity_scaled_lookahead_dist": true,
+        "rotate_to_heading_angular_vel": 0.18,
+        "rotate_to_heading_min_angle": 0.45,
+        "max_angular_accel": 0.4,
+        "use_rotate_to_heading": false,
+        "allow_reversing": false,
+        "min_approach_linear_velocity": 0.025,
+        "approach_velocity_scaling_dist": 0.5,
+        "use_regulated_linear_velocity_scaling": true,
+        "use_cost_regulated_linear_velocity_scaling": true,
+        "regulated_linear_scaling_min_radius": 0.9,
+        "regulated_linear_scaling_min_speed": 0.025,
+        "cost_scaling_dist": 0.15,
+        "cost_scaling_gain": 1.0,
+        "inflation_cost_scaling_factor": 3.0,
+        "use_collision_detection": true,
+        "max_allowed_time_to_collision_up_to_carrot": 1.0,
+        "transform_tolerance": 0.2,
+        "use_interpolation": true,
+        "primary_controller": "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController",
+        "angular_dist_threshold": 0.3,
+        "angular_disengage_threshold": 0.1,
+        "forward_sampling_distance": 0.45,
+        "simulate_ahead_time": 1.0,
+        "rotate_to_goal_heading": false,
+        "closed_loop": false
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.PointRecovery",
+      "factory": null,
+      "demo": {
+        "plugin": "dwb_core::DWBLocalPlanner",
+        "min_vel_x": 0.0,
+        "min_vel_y": 0.0,
+        "max_vel_x": 0.1,
+        "max_vel_y": 0.0,
+        "max_vel_theta": 0.22,
+        "min_speed_xy": 0.01,
+        "max_speed_xy": 0.1,
+        "min_speed_theta": 0.1,
+        "acc_lim_x": 0.25,
+        "acc_lim_y": 0.0,
+        "acc_lim_theta": 0.25,
+        "decel_lim_x": -0.25,
+        "decel_lim_y": 0.0,
+        "decel_lim_theta": -0.25,
+        "vx_samples": 20,
+        "vy_samples": 0,
+        "vtheta_samples": 40,
+        "sim_time": 1.2,
+        "angular_granularity": 0.05,
+        "transform_tolerance": 0.2,
+        "xy_goal_tolerance": 0.1,
+        "trans_stopped_velocity": 0.02,
+        "short_circuit_trajectory_evaluation": true,
+        "stateful": true,
+        "critics": [
+          "ObstacleFootprint",
+          "Oscillation",
+          "PathAlign",
+          "PathDist",
+          "GoalDist"
+        ],
+        "BaseObstacle.scale": 1.0,
+        "PathAlign.scale": 32.0,
+        "PathAlign.forward_point_distance": 0.1,
+        "GoalAlign.scale": 24.0,
+        "PathDist.scale": 32.0,
+        "GoalDist.scale": 24.0,
+        "RotateToGoal.scale": 32.0,
+        "RotateToGoal.slowing_factor": 5.0,
+        "RotateToGoal.lookahead_time": 1.2,
+        "Oscillation.oscillation_reset_dist": 0.05,
+        "Oscillation.oscillation_reset_angle": 0.05,
+        "ObstacleFootprint.scale": 0.02
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.controller_plugins",
+      "factory": [
+        "FollowPath"
+      ],
+      "demo": [
+        "FollowPath",
+        "PointPosition",
+        "PointRecovery",
+        "PointHeading"
+      ]
+    },
+    {
+      "path": "controller_server.ros__parameters.goal_checker.rot_stopped_velocity",
+      "factory": null,
+      "demo": 0.03
+    },
+    {
+      "path": "controller_server.ros__parameters.goal_checker.trans_stopped_velocity",
+      "factory": null,
+      "demo": 0.015
+    },
+    {
+      "path": "controller_server.ros__parameters.goal_checker.xy_goal_tolerance",
+      "factory": 0.2,
+      "demo": 0.025
+    },
+    {
+      "path": "controller_server.ros__parameters.goal_checker.yaw_goal_tolerance",
+      "factory": 0.25,
+      "demo": 0.05235987756
+    },
+    {
+      "path": "controller_server.ros__parameters.goal_checker_plugins",
+      "factory": null,
+      "demo": [
+        "goal_checker",
+        "point_position_checker",
+        "recovery_position_checker",
+        "point_heading_checker"
+      ]
+    },
+    {
+      "path": "controller_server.ros__parameters.odom_topic",
+      "factory": "/odom_combined",
+      "demo": "/odom"
+    },
+    {
+      "path": "controller_server.ros__parameters.point_heading_checker",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_controller::SimpleGoalChecker",
+        "xy_goal_tolerance": 0.1,
+        "yaw_goal_tolerance": 0.05235987756,
+        "stateful": true
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.point_position_checker",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_controller::PositionGoalChecker",
+        "xy_goal_tolerance": 0.035,
+        "stateful": true
+      }
+    },
+    {
+      "path": "controller_server.ros__parameters.progress_checker.movement_time_allowance",
+      "factory": 10.0,
+      "demo": 20.0
+    },
+    {
+      "path": "controller_server.ros__parameters.progress_checker.plugin",
+      "factory": "nav2_controller::SimpleProgressChecker",
+      "demo": "nav2_controller::PoseProgressChecker"
+    },
+    {
+      "path": "controller_server.ros__parameters.progress_checker.required_movement_angle",
+      "factory": null,
+      "demo": 0.035
+    },
+    {
+      "path": "controller_server.ros__parameters.progress_checker.required_movement_radius",
+      "factory": 0.5,
+      "demo": 0.03
+    },
+    {
+      "path": "controller_server.ros__parameters.recovery_position_checker",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_controller::PositionGoalChecker",
+        "xy_goal_tolerance": 0.1,
+        "stateful": true
+      }
+    },
+    {
+      "path": "demo_arrival",
+      "factory": null,
+      "demo": {
+        "ros__parameters": {
+          "enabled": true,
+          "nominal_speed": 0.2,
+          "approach_speed": 0.1,
+          "creep_speed": 0.05,
+          "approach_distance": 0.65,
+          "creep_distance": 0.2,
+          "final_spin": false,
+          "waypoint_position_then_heading": true,
+          "heading_timeout": 30.0,
+          "heading_retries": 1,
+          "final_position_tolerance": 0.05,
+          "docking_timeout": 90.0,
+          "allow_near_arrival": false,
+          "near_position_tolerance": 0.08,
+          "near_yaw_tolerance": 0.0872664626
+        }
+      }
+    },
+    {
+      "path": "global_costmap.global_costmap.ros__parameters.filters",
+      "factory": null,
+      "demo": [
+        "threshold_keepout"
+      ]
+    },
+    {
+      "path": "global_costmap.global_costmap.ros__parameters.threshold_keepout",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_costmap_2d::KeepoutFilter",
+        "enabled": true,
+        "filter_info_topic": "/threshold_filter_info"
+      }
+    },
+    {
+      "path": "local_costmap.local_costmap.ros__parameters.filters",
+      "factory": null,
+      "demo": [
+        "threshold_keepout"
+      ]
+    },
+    {
+      "path": "local_costmap.local_costmap.ros__parameters.global_frame",
+      "factory": "map",
+      "demo": "odom_combined"
+    },
+    {
+      "path": "local_costmap.local_costmap.ros__parameters.resolution",
+      "factory": 0.05,
+      "demo": 0.02
+    },
+    {
+      "path": "local_costmap.local_costmap.ros__parameters.threshold_keepout",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_costmap_2d::KeepoutFilter",
+        "enabled": true,
+        "filter_info_topic": "/threshold_filter_info"
+      }
+    },
+    {
+      "path": "planner_server.ros__parameters.GridBased.allow_unknown",
+      "factory": true,
+      "demo": false
+    },
+    {
+      "path": "planner_server.ros__parameters.GridBased.tolerance",
+      "factory": 0.5,
+      "demo": 0.0
+    },
+    {
+      "path": "planner_server.ros__parameters.WaypointGrid",
+      "factory": null,
+      "demo": {
+        "plugin": "nav2_smac_planner/SmacPlanner2D",
+        "tolerance": 0.0,
+        "downsample_costmap": false,
+        "allow_unknown": false,
+        "max_iterations": 1000000,
+        "max_on_approach_iterations": 1000,
+        "max_planning_time": 1.0,
+        "cost_travel_multiplier": 2.0,
+        "use_final_approach_orientation": false,
+        "smoother": {
+          "max_iterations": 1000,
+          "w_smooth": 0.3,
+          "w_data": 0.2,
+          "tolerance": 1e-10
+        }
+      }
+    },
+    {
+      "path": "planner_server.ros__parameters.planner_plugins",
+      "factory": [
+        "GridBased"
+      ],
+      "demo": [
+        "GridBased",
+        "WaypointGrid"
+      ]
+    },
+    {
+      "path": "smoother_server.ros__parameters.simple_smoother.max_its",
+      "factory": 1000,
+      "demo": 3000
+    },
+    {
+      "path": "smoother_server.ros__parameters.simple_smoother.tolerance",
+      "factory": 0.1,
+      "demo": 1e-06
+    },
+    {
+      "path": "smoother_server.ros__parameters.simple_smoother.w_data",
+      "factory": null,
+      "demo": 0.0
+    },
+    {
+      "path": "smoother_server.ros__parameters.simple_smoother.w_smooth",
+      "factory": null,
+      "demo": 0.4
+    },
+    {
+      "path": "velocity_smoother",
+      "factory": null,
+      "demo": {
+        "ros__parameters": {
+          "use_sim_time": false,
+          "smoothing_frequency": 20.0,
+          "scale_velocities": true,
+          "feedback": "OPEN_LOOP",
+          "max_velocity": [
+            0.2,
+            0.0,
+            0.3
+          ],
+          "min_velocity": [
+            -0.1,
+            0.0,
+            -0.3
+          ],
+          "max_accel": [
+            0.5,
+            0.0,
+            0.6
+          ],
+          "max_decel": [
+            -1.0,
+            0.0,
+            -0.8
+          ],
+          "deadband_velocity": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "velocity_timeout": 0.3,
+          "odom_topic": "/odom_combined",
+          "odom_duration": 0.1
+        }
+      }
+    }
+  ],
+  "ekf": {
+    "source_entry": "src/turn_on_wheeltec_robot/config/ekf_nav.yaml",
+    "source_sha256": "bb6710ddd46c505b6d7cda14eb1e08459ad619d6e8ca2e66c368ae44a88458ba",
+    "changes": [
+      {
+        "path": "nav_ekf_filter_node.ros__parameters.imu0_twist_rejection_threshold",
+        "factory": 1.542,
+        "demo": 5.0
+      },
+      {
+        "path": "nav_ekf_filter_node.ros__parameters.predict_to_current_time",
+        "factory": null,
+        "demo": true
+      },
+      {
+        "path": "nav_ekf_filter_node.ros__parameters.frequency",
+        "factory": 10.0,
+        "demo": 20.0
+      }
+    ]
+  },
+  "version": "V2",
+  "notes": "Unmodified manufacturer/installed Nav2 plugins; task/refinement and charging confirmation are project additions"
+}
