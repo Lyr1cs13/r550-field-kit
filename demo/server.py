@@ -133,6 +133,8 @@ def handler(app):
                 self.respond(app.mission.collection.export(),content='application/x-ndjson; charset=utf-8')
             elif path == '/api/collection/bundle':
                 self.respond(app.mission.collection.export(packed=True),content='application/zip')
+            elif path == '/api/collection/servo/export':
+                self.respond(app.mission.collection.servo_store.export(packed=True), content='application/zip')
             elif path == '/api/broadcast/data':
                 b=app.mission.collection.broadcast
                 from broadcast_survey import saved_data

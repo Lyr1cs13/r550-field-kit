@@ -54,11 +54,12 @@ case "$command" in
   explore) ros_env; exec python3 tools/slam.py "$@" ;;
   hold) ros_env; python3 tools/control.py stop 2>/dev/null || true; exec python3 tools/hold.py ;;
   api) exec python3 tools/control.py "$@" ;;
+  servo-probe) exec python3 tools/servo_car_probe.py "$@" ;;
   stop)
     ros_env
     python3 tools/control.py stop 2>/dev/null || true
     python3 tools/hold.py
     for session in r550_nav r550_ui r550_mapping; do screen -S "$session" -p 0 -X stuff $'\003' 2>/dev/null || true; done
     echo '已请求停车并关闭本工程会话。' ;;
-  *) printf '%s\n' './kit setup robot|viewer' './kit network --interface NIC --peer IP [--domain 20]' './kit doctor | preview | view | teleop' './kit mapping new --at-dock [--auto] | resume CHECKPOINT | save' './kit explore pause|resume|return' './kit scene new|use|dock|keepout|survey|list' './kit nav | api status|initial_dock|confirm|return' './kit hold | stop | test' ;;
+  *) printf '%s\n' './kit setup robot|viewer' './kit network --interface NIC --peer IP [--domain 20]' './kit doctor | preview | view | teleop' './kit mapping new --at-dock [--auto] | resume CHECKPOINT | save' './kit explore pause|resume|return' './kit scene new|use|dock|keepout|survey|list' './kit nav | api status|initial_dock|confirm|return' './kit servo-probe [--device PORT]' './kit hold | stop | test' ;;
 esac

@@ -12,7 +12,7 @@ def main():
     if a.action!='status':
         req=urllib.request.Request(base+'/api/command',data=json.dumps({'action':a.action}).encode(),headers={'Content-Type':'application/json','X-Control-Token':s['control_token']},method='POST')
         s=json.load(urllib.request.urlopen(req,timeout=8))
-    print(json.dumps({k:s[k] for k in ('phase','message','health')},ensure_ascii=False,indent=2))
+    print(json.dumps({k:s[k] for k in ('phase','message','health','collection')},ensure_ascii=False,indent=2))
 
 
 if __name__=='__main__':main()

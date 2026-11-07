@@ -34,11 +34,11 @@ class Point:
         return values
 
 
-class Link:
-    def __init__(self, stream, *, allow_mock=False, clock=time.monotonic):
-        self.stream=stream;self.allow_mock=allow_mock;self.clock=clock
-        self.buffer=bytearray();self.events=[];self.run=None;self.visit=0;self.mode=None
-        self.pending=False
+class LineTransport:
+    def __init__(self, stream, clock=time.monotonic):
+        self.stream = stream
+        self.clock = clock
+        self.buffer = bytearray()
 
     def line(self, deadline):
         while self.clock()<deadline:
@@ -51,11 +51,22 @@ class Link:
             if len(self.buffer)>8192:raise ProtocolError('Overlong UART line')
         raise TimeoutError('UART response timeout')
 
-    def command(self, cmd, timeout=2.):
+    def send(self, cmd):
         if '\r' in cmd or '\n' in cmd:raise ValueError('Embedded command delimiter')
         data=(cmd+'\r\n').encode('ascii')
         if self.stream.write(data)!=len(data):raise ProtocolError('Incomplete serial write')
-        self.stream.flush();out=[];deadline=self.clock()+timeout
+        self.stream.flush()
+
+
+class Link(LineTransport):
+    def __init__(self, stream, *, allow_mock=False, clock=time.monotonic):
+        super().__init__(stream, clock)
+        self.allow_mock=allow_mock;self.events=[];self.run=None;self.visit=0;self.mode=None
+        self.pending=False
+
+    def command(self, cmd, timeout=2.):
+        self.send(cmd)
+        out=[];deadline=self.clock()+timeout
         while True:
             line=self.line(deadline)
             if line.startswith('+RDKREADY:'):raise DeviceReset('MCU restarted; establish a new session')

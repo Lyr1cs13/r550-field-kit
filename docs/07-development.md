@@ -12,6 +12,7 @@
 | 回桩后自动定位校准 | `demo/dock_localization.py` |
 | 连续采集线路与避障接回 | `demo/survey_ros.py`、`survey_path.py` |
 | WS63 串口、校时与位置关联 | `demo/broadcast_survey.py`、`device_clock.py` |
+| SERVO_CAR_2 定点协议与结果存储 | `demo/servo_car.py`、`servo_storage.py` |
 | 新场景导入与标定 | `tools/scene.py` |
 | 手动/自动 SLAM 组合 | `rrt_mapping/mapping.launch.py` |
 | RRT 任务调度 | `rrt_mapping/frontier_tasks.py` |

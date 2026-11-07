@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 
+from servo_car import MODE as SERVO_MODE
+
 
 TERMINAL = {'succeeded', 'failed', 'canceled'}
 QUIET = {'idle', 'completed', 'failed', 'docked'}
@@ -122,6 +124,7 @@ class Mission:
                 self._navigate_current()
 
     def _depart(self):
+        self.collection.require_motion_allowed()
         if not getattr(self.backend,'dock_calibrated',True):raise ValueError('先标定桩位，再从充电桩发车')
         x,y,heading = self.backend.dock_pose
         distance = getattr(self.backend,'departure_distance',.30)
@@ -131,6 +134,7 @@ class Mission:
         self.phase = 'departing';self.message = '先直行驶离充电桩，再前往导航点'
 
     def _navigate_current(self):
+        self.collection.require_motion_allowed()
         point = self.run[self.index]
         moving=self.collection.snapshot().get('profile')=='moving_loop_demo'
         self.operation = self.backend.navigate(point, 'survey' if moving else 'waypoint')
@@ -145,7 +149,10 @@ class Mission:
             p = self.run[self.index]
             if self.collection.snapshot().get('profile')=='moving_loop_demo':
                 self._advance();return
-            if self.collection.snapshot()['mode'] in ('ws63','broadcast'):
+            mode = self.collection.snapshot()['mode']
+            if mode in ('ws63', 'broadcast', SERVO_MODE):
+                if mode == SERVO_MODE:
+                    self.backend.stop()
                 self.collection.begin(p,self.backend.snapshot())
                 self.phase='collecting';self.message=f'{p["name"]} 已停稳，等待 WS63 本轮采集完成'
                 self.event(self.message)
@@ -171,10 +178,12 @@ class Mission:
     def configure_collection(self, mode, device='auto'):
         with self.lock:
             if self.phase not in QUIET: raise ValueError('请先停止当前任务，再切换采集模式')
-            if mode in ('ws63','broadcast') and self.backend.snapshot().get('mode')=='offline':
+            if mode in ('ws63','broadcast',SERVO_MODE) and self.backend.snapshot().get('mode')=='offline':
                 raise ValueError('离线演练不能启动真实 WS63 采集，请使用实车入口')
             self.collection.configure(mode,device)
-            self.event('切换到 WS63 采集停留' if mode=='ws63' else '切换到原有定时停留')
+            labels = {'timed':'定时停留', 'ws63':'旧版 WS63 采集', 'broadcast':'广播沿途采集',
+                      SERVO_MODE:'旋转定点采集（SERVO_CAR_2）'}
+            self.event(f'切换到{labels[mode]}')
 
     def _advance(self):
         self.index += 1
@@ -186,6 +195,7 @@ class Mission:
 
     def return_to_dock(self, automatic=False):
         with self.lock:
+            self.collection.require_motion_allowed()
             if not getattr(self.backend,'dock_calibrated',True):raise ValueError('当前场景尚未标定充电桩')
             if not automatic:self.dock_retry_count=0;self.dock_retry_pending=False
             if (self.phase in ('collecting','paused_collection','canceling_collection')
@@ -205,6 +215,7 @@ class Mission:
                 self._return()
 
     def _return(self):
+        self.collection.require_motion_allowed()
         if hasattr(self.backend,'set_survey_planning'):self.backend.set_survey_planning(False)
         if self.collection.broadcast:self.collection.broadcast.finish_drive()
         self.backend.survey_speed_limit=None
@@ -332,6 +343,9 @@ class Mission:
                 voltage = health.get('voltage')
                 self.low_since = (self.low_since if self.low_since is not None else now) if voltage is not None and voltage < 10.0 else None
                 if self.low_since is not None and now-self.low_since >= 20:
+                    if self.collection.snapshot().get('motion_blocked'):
+                        self._fail('电压持续过低，旋转定点采集已停止，请先恢复未放行的轮次')
+                        return
                     self.event('电压持续低于 10.0 V，结束任务并回充');self.return_to_dock();return
             if self.phase == 'canceling':
                 if self.operation and self.backend.operation(self.operation)['status'] not in TERMINAL:
@@ -410,9 +424,13 @@ class Mission:
                 status=self.collection.snapshot()
                 if not health.get('stationary'):
                     self._fail('采集期间底盘未停稳，本轮已作废');return
+                if status['mode'] == SERVO_MODE and not health.get('localization_confirmed'):
+                    self._fail('采集期间定位确认失效，保持停车');return
                 if status['stage']=='error':
                     self._fail('WS63 采集未完成：'+str(status['error']));return
                 if status['stage']=='done' and self.phase=='collecting':
+                    if status['mode'] == SERVO_MODE and not self.collection.consume_servo_permission():
+                        self._fail('本轮移动许可未能确认，保持停车');return
                     self.event(f'{self.run[self.index]["name"]} WS63 采集完成')
                     self._advance()
             elif self.phase=='canceling_collection':

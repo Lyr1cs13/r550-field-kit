@@ -34,8 +34,11 @@ function render(){const h=state.health,locked=!quiet();$('mode').textContent=h.m
  $('collection-status').textContent=c.mode==='timed'?'定时模式，无需连接 WS63':c.error?'WS63：'+c.error:c.stage==='sampling'?'采集中 · 已用 '+Math.floor(c.elapsed||0)+' 秒'+(c.scan!=null?' · scan '+c.scan:''):c.connected?'串口就绪 · '+c.stage+' · '+(c.device_resolved||''):'WS63：'+c.stage;
  ['survey-load','survey-restore','anchor-save'].forEach(k=>$(k).disabled=locked);
  const loopReady=!state.points.some(p=>p.id.startsWith("north-loop-"))||c.profile==="moving_loop_demo";
- const collectionReady=loopReady&&!collectionDirty&&(c.mode!=='broadcast'||c.beacon_recent)&&(!['ws63','broadcast'].includes(c.mode)||(c.connected&&['ready','done'].includes(c.stage)));
+ const collectionReady=loopReady&&!collectionDirty&&!c.motion_blocked&&(c.mode!=='broadcast'||c.beacon_recent)&&(!['ws63','broadcast','servo_car_v2'].includes(c.mode)||(c.connected&&['ready','done'].includes(c.stage)));
+ $('return').disabled=$('return').disabled||c.motion_blocked;
  if(c.mode==='broadcast'&&!collectionDirty)$('collection-status').textContent=c.error?'WS63：'+c.error:c.connected?(c.beacon_recent?'基站1 '+c.last_rssi+' dBm · 沿途有效 '+(c.samples||0)+' 条 · '+(c.measured_points||0)+' 个热力格' :'Client 已连接，等待固定基站广播'):'广播 Client：'+c.stage;
+ if(c.mode==='servo_car_v2')$('collection-status').textContent=servoStatus(c);
+ else if(c.motion_blocked)$('collection-status').textContent='有未放行的旋转轮次。请切到旋转定点模式恢复连接。';
  if(collectionDirty)$('collection-status').textContent='设置尚未应用，请点“应用 / 重新连接”';
  $('start').disabled=$('start').disabled||!collectionReady;
  renderPoints(locked);document.querySelectorAll('#points .go').forEach(b=>b.disabled=locked||!h.ready||!h.localization_confirmed||!collectionReady);$('events').innerHTML=state.events.slice(0,6).map(e=>'<div class="activity-item"><span class="activity-time">'+esc(e.time)+'</span><span>'+esc(e.text)+'</span></div>').join('')||'<div class="hint" style="padding-top:15px">任务开始、到达、停留结束和回充反馈会显示在这里。</div>';document.dispatchEvent(new CustomEvent('cruise-state',{detail:state}));draw();}
@@ -55,5 +58,27 @@ $('collection-apply').onclick=()=>{const data={action:'collection_config',mode:$
 $('survey-load').onclick=async()=>{await command({action:'survey_load_north'});fit(false);};
 $('survey-restore').onclick=async()=>{await command({action:'survey_restore_points'});fit(false);};
 $('anchor-save').onclick=()=>command({action:'survey_anchor',notes:$('anchor-notes').value,height_m:$('anchor-height').value?Number($('anchor-height').value):null});
-$('collection-export').onclick=()=>{const a=document.createElement('a');a.href=state.collection?.mode==='broadcast'?'/api/broadcast/export':'/api/collection/bundle';a.download=state.collection?.mode==='broadcast'?'场景RSSI热力图与数据.zip':'WS63采集位置与地图.zip';a.click();};
+function servoStatus(collection) {
+ if(collection.error)return collection.error;
+ if(collection.stage==='sampling'){
+  const stage=collection.waiting_move?'已写盘，等待移动许可':'已收 '+(collection.node_count||0)+'/2 个角度';
+  return '点位 '+collection.position_id+' · 第 '+collection.round_id+' 轮 · '+stage+' · '+Math.floor(collection.elapsed||0)+' 秒';
+ }
+ if(collection.stage==='done')return '两个角度均已保存，收到移动许可';
+ if(collection.stage==='submitting')return '小车已停稳，正在触发旋转测量';
+ if(collection.stage==='ready')return 'SERVO_CAR_2 串口和 SLE 链路已就绪';
+ if(collection.stage==='waiting_peer')return collection.link_ready?'等待 Client 完成上一轮':'等待 Client 连接旋转基站';
+ if(collection.stage==='canceling')return '正在停止本地采集';
+ return '正在检查 SERVO_CAR_2 串口';
+}
+$('collection-export').onclick=()=>{
+ const a=document.createElement('a'),mode=state.collection?.mode;
+ if(mode==='servo_car_v2'){
+  a.href='/api/collection/servo/export';a.download='WS63旋转定点采集与地图.zip';
+ }else{
+  a.href=mode==='broadcast'?'/api/broadcast/export':'/api/collection/bundle';
+  a.download=mode==='broadcast'?'场景RSSI热力图与数据.zip':'WS63采集位置与地图.zip';
+ }
+ a.click();
+};
 window.addEventListener('resize',draw);window.addEventListener('keydown',e=>{if(e.key==='Escape' && state)command({action:'stop'});});poll();
