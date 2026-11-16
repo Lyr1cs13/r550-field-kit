@@ -36,7 +36,7 @@ class App:
         action = data['action'];m = self.mission
         with m.lock:
             if action == 'collection_config':
-                m.configure_collection(data['mode'],str(data.get('device','auto')))
+                m.configure_collection(data['mode'], str(data.get('device','auto')), data.get('c5', False))
             elif action == 'survey_load_north':
                 if m.phase not in QUIET:raise ValueError('请先停止任务再加载采样点')
                 from survey_route import north_route
@@ -135,6 +135,14 @@ def handler(app):
                 self.respond(app.mission.collection.export(packed=True),content='application/zip')
             elif path == '/api/collection/servo/export':
                 self.respond(app.mission.collection.servo_store.export(packed=True), content='application/zip')
+            elif path == '/api/collection/c5/export':
+                mission = app.mission
+                try:
+                    content = mission.c5.export(mission.collection.directory / 'maps')
+                except (OSError, ValueError, KeyError) as exc:
+                    self.respond({'error':str(exc)}, 409)
+                    return
+                self.respond(content, content='application/zip')
             elif path == '/api/broadcast/data':
                 b=app.mission.collection.broadcast
                 from broadcast_survey import saved_data
@@ -215,7 +223,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        app.running = False;app.mission.collection.close();backend.stop();web.server_close()
+        app.running = False;app.mission.collection.close();backend.stop();app.mission.c5.close();web.server_close()
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 
+from c5_station import C5Station, utc
 from servo_car import MODE as SERVO_MODE
 
 
@@ -28,6 +29,8 @@ class Mission:
         self._load()
         from collection import Collection
         self.collection = Collection(self.directory,grid)
+        self.c5 = C5Station(self.collection.directory / 'c5')
+        self.c5_session = None
 
     def _load(self):
         p = self.directory / 'waypoints.json'
@@ -108,8 +111,17 @@ class Mission:
             if any(p['id'].startswith('north-loop-') for p in chosen) and self.collection.snapshot().get('profile')!='moving_loop_demo':
                 raise ValueError('快速回环引导点请使用“广播 RSSI 快速回环”模式，避免按普通精确停靠逐点执行')
             if any(p.get('survey_path') for p in chosen) and self.collection.snapshot().get('profile')!='moving_loop_demo':raise ValueError('连续采集路线仅用于广播采集模式')
+            mode = self.collection.snapshot()['mode']
+            if self.c5.enabled:
+                self._require_motion_allowed()
+                if self.c5.check() != self.c5.plan:
+                    raise ValueError('C5 采集方案已变更，请重新应用采集设置')
+                self.collection.archive_map()
+                self.require_ready()
             self.collection.prepare(chosen)
-            if self.collection.snapshot()['mode']=='broadcast':
+            if self.c5.enabled:
+                self.c5_session = self.collection.session if mode == SERVO_MODE else uuid.uuid4().hex
+            if mode=='broadcast':
                 self.backend.survey_speed_limit=.12 if self.collection.snapshot().get('profile')=='moving_loop_demo' else .14
             if hasattr(self.backend,'set_survey_planning'):
                 self.backend.set_survey_planning(self.collection.snapshot().get('profile')=='moving_loop_demo')
@@ -123,8 +135,13 @@ class Mission:
             else:
                 self._navigate_current()
 
-    def _depart(self):
+    def _require_motion_allowed(self):
         self.collection.require_motion_allowed()
+        if self.c5.active:
+            raise ValueError('C5 正在采集或收尾，请停止任务并等待采集端结束')
+
+    def _depart(self):
+        self._require_motion_allowed()
         if not getattr(self.backend,'dock_calibrated',True):raise ValueError('先标定桩位，再从充电桩发车')
         x,y,heading = self.backend.dock_pose
         distance = getattr(self.backend,'departure_distance',.30)
@@ -134,7 +151,7 @@ class Mission:
         self.phase = 'departing';self.message = '先直行驶离充电桩，再前往导航点'
 
     def _navigate_current(self):
-        self.collection.require_motion_allowed()
+        self._require_motion_allowed()
         point = self.run[self.index]
         moving=self.collection.snapshot().get('profile')=='moving_loop_demo'
         self.operation = self.backend.navigate(point, 'survey' if moving else 'waypoint')
@@ -150,11 +167,28 @@ class Mission:
             if self.collection.snapshot().get('profile')=='moving_loop_demo':
                 self._advance();return
             mode = self.collection.snapshot()['mode']
-            if mode in ('ws63', 'broadcast', SERVO_MODE):
-                if mode == SERVO_MODE:
+            collect_ws63 = mode in ('ws63', 'broadcast', SERVO_MODE)
+            if collect_ws63 or self.c5.enabled:
+                if mode == SERVO_MODE or self.c5.enabled:
                     self.backend.stop()
-                self.collection.begin(p,self.backend.snapshot())
-                self.phase='collecting';self.message=f'{p["name"]} 已停稳，等待 WS63 本轮采集完成'
+                health = self.backend.snapshot()
+                visit_id = None
+                if self.c5.enabled:
+                    if not all(health.get(key) for key in ('ready', 'stationary', 'localization_confirmed')):
+                        raise ValueError('到点停稳及定位确认之前不能启动 C5 采集')
+                    visit_id = uuid.uuid4().hex
+                    self.c5.begin({
+                        'visit_id': visit_id, 'session_id': self.c5_session, 'map_id': self.grid.map_id,
+                        'point_id': p['id'], 'point_name': p['name'], 'arrived_utc': utc(),
+                        'actual_pose': health.get('pose'),
+                    })
+                if collect_ws63:
+                    if visit_id:
+                        self.collection.begin(p, health, visit_id=visit_id)
+                    else:
+                        self.collection.begin(p, health)
+                devices = 'WS63 和 C5' if collect_ws63 and visit_id else 'C5' if visit_id else 'WS63'
+                self.phase='collecting';self.message=f'{p["name"]} 已停稳，等待 {devices} 本轮采集完成'
                 self.event(self.message)
                 return
             self.until = now+p['wait']
@@ -175,15 +209,22 @@ class Mission:
         return ((math.hypot(pose[0]-approach['x'],pose[1]-approach['y']) <= .10 or near_home)
                 and abs(angle) <= math.radians(30))
 
-    def configure_collection(self, mode, device='auto'):
+    def configure_collection(self, mode, device='auto', c5=False):
         with self.lock:
             if self.phase not in QUIET: raise ValueError('请先停止当前任务，再切换采集模式')
+            if type(c5) is not bool or (c5 and mode not in ('timed', SERVO_MODE)):
+                raise ValueError('C5 可用于单独定点采集或与 SERVO_CAR_2 同站采集')
+            if c5 and self.backend.snapshot().get('mode') == 'offline':
+                raise ValueError('请从实车入口开启 C5 采集')
             if mode in ('ws63','broadcast',SERVO_MODE) and self.backend.snapshot().get('mode')=='offline':
                 raise ValueError('离线演练不能启动真实 WS63 采集，请使用实车入口')
+            selection = self.c5.selection(c5)
             self.collection.configure(mode,device)
+            self.c5.configure(*selection)
             labels = {'timed':'定时停留', 'ws63':'旧版 WS63 采集', 'broadcast':'广播沿途采集',
                       SERVO_MODE:'旋转定点采集（SERVO_CAR_2）'}
-            self.event(f'切换到{labels[mode]}')
+            label = 'C5 定点采集' if c5 and mode == 'timed' else labels[mode] + (' + C5' if c5 else '')
+            self.event(f'切换到{label}')
 
     def _advance(self):
         self.index += 1
@@ -195,7 +236,9 @@ class Mission:
 
     def return_to_dock(self, automatic=False):
         with self.lock:
-            self.collection.require_motion_allowed()
+            self._require_motion_allowed()
+            if self.c5.enabled and self.phase in ('collecting','paused_collection'):
+                raise ValueError('请先停止当前停靠任务，再主动回充')
             if not getattr(self.backend,'dock_calibrated',True):raise ValueError('当前场景尚未标定充电桩')
             if not automatic:self.dock_retry_count=0;self.dock_retry_pending=False
             if (self.phase in ('collecting','paused_collection','canceling_collection')
@@ -215,7 +258,7 @@ class Mission:
                 self._return()
 
     def _return(self):
-        self.collection.require_motion_allowed()
+        self._require_motion_allowed()
         if hasattr(self.backend,'set_survey_planning'):self.backend.set_survey_planning(False)
         if self.collection.broadcast:self.collection.broadcast.finish_drive()
         self.backend.survey_speed_limit=None
@@ -252,7 +295,7 @@ class Mission:
         with self.lock:
             self.require_ready()
             if self.phase == 'paused_collection':
-                self.phase='collecting';self.message='继续等待 WS63 采集确认'
+                self.phase='collecting';self.message='继续等待采集确认'
             elif self.phase == 'paused_dwell':
                 self.until = self.clock()+self.remaining;self.phase = 'dwelling';self.message = '继续停留计时'
             elif self.phase == 'paused_navigation':
@@ -274,6 +317,7 @@ class Mission:
             if hasattr(self.backend,'set_survey_planning'):self.backend.set_survey_planning(False)
             self.dock_retry_pending=False;self.dock_failure_reconcile=False
             self.backend.survey_speed_limit=None
+            self.c5.cancel()
             self.collection.cancel()
             self.backend.stop()
             if self.operation and self.backend.operation(self.operation)['status'] not in TERMINAL:
@@ -291,6 +335,7 @@ class Mission:
         self.dock_retry_pending=retryable
         if retryable:self.dock_retry_due=self.clock()+2.;self.dock_retry_stationary_since=None
         self.backend.survey_speed_limit=None
+        self.c5.cancel()
         self.collection.cancel()
         self.backend.stop()
         if self.operation and self.backend.operation(self.operation)['status'] not in TERMINAL:
@@ -343,6 +388,9 @@ class Mission:
                 voltage = health.get('voltage')
                 self.low_since = (self.low_since if self.low_since is not None else now) if voltage is not None and voltage < 10.0 else None
                 if self.low_since is not None and now-self.low_since >= 20:
+                    if self.c5.enabled and self.phase in ('collecting','paused_collection'):
+                        self._fail('电压持续过低，已停止本轮定点采集')
+                        return
                     if self.collection.snapshot().get('motion_blocked'):
                         self._fail('电压持续过低，旋转定点采集已停止，请先恢复未放行的轮次')
                         return
@@ -424,15 +472,25 @@ class Mission:
                 status=self.collection.snapshot()
                 if not health.get('stationary'):
                     self._fail('采集期间底盘未停稳，本轮已作废');return
-                if status['mode'] == SERVO_MODE and not health.get('localization_confirmed'):
+                if (status['mode'] == SERVO_MODE or self.c5.enabled) and not health.get('localization_confirmed'):
                     self._fail('采集期间定位确认失效，保持停车');return
                 if status['stage']=='error':
                     self._fail('WS63 采集未完成：'+str(status['error']));return
-                if status['stage']=='done' and self.phase=='collecting':
-                    if status['mode'] == SERVO_MODE and not self.collection.consume_servo_permission():
-                        self._fail('本轮移动许可未能确认，保持停车');return
-                    self.event(f'{self.run[self.index]["name"]} WS63 采集完成')
-                    self._advance()
+                if self.c5.enabled:
+                    c5 = self.c5.snapshot()
+                    if c5['stage'] in ('error', 'canceled'):
+                        self._fail(c5.get('error') or 'C5 采集未完成');return
+                    if c5['stage'] != 'done':
+                        return
+                if self.phase != 'collecting' or (status['mode'] != 'timed' and status['stage'] != 'done'):
+                    return
+                if status['mode'] == SERVO_MODE and not self.collection.consume_servo_permission():
+                    self._fail('本轮移动许可未能确认，保持停车');return
+                if self.c5.enabled:
+                    self.c5.release()
+                device = 'WS63 和 C5' if self.c5.enabled and status['mode'] == SERVO_MODE else 'C5' if self.c5.enabled else 'WS63'
+                self.event(f'{self.run[self.index]["name"]} {device} 采集完成')
+                self._advance()
             elif self.phase=='canceling_collection':
                 status=self.collection.snapshot()
                 if status['stage'] in ('canceled','done'):
@@ -468,5 +526,5 @@ class Mission:
             return {'phase': self.phase, 'message': self.message, 'points': self.points,
                     'run': self.run, 'index': self.index, 'remaining': remaining,
                     'auto_return': self.auto_return, 'health': health, 'collection':self.collection.snapshot(),
-                    'dock': self.backend.dock_pose,
+                    'c5': self.c5.snapshot(), 'dock': self.backend.dock_pose,
                     'events': list(self.events), 'map': self.grid.info()}

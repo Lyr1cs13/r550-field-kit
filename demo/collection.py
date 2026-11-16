@@ -133,17 +133,25 @@ class Collection:
                 raise ValueError('旋转 Client 尚未通过协议握手')
             self.session = uuid.uuid4().hex
             self.numbers = {p['id']:i+1 for i,p in enumerate(points)}
-            saved_map=self.directory/'maps'/self.grid.map_id
-            if not saved_map.exists():
-                saved_map.parent.mkdir(parents=True,exist_ok=True)
-                temporary=saved_map.with_name(saved_map.name+'.tmp-'+uuid.uuid4().hex)
-                shutil.copytree(self.grid.directory,temporary)
-                os.replace(temporary,saved_map)
+            saved_map=self.archive_map()
             # Full hashes, map geometry and route are persisted before departure.
             self._log('session', session=self.session, map=self.grid.info(),
                       frame_id='map', base_frame='base_footprint', units={'position':'m','yaw':'rad'},
                       points=points, saved_map=str(saved_map.relative_to(self.directory)),
                       dock_reference='dock_start.json')
+
+    def archive_map(self):
+        saved_map = self.directory / 'maps' / self.grid.map_id
+        if not saved_map.exists():
+            saved_map.parent.mkdir(parents=True, exist_ok=True)
+            temporary = saved_map.with_name(saved_map.name + '.tmp-' + uuid.uuid4().hex)
+            try:
+                shutil.copytree(self.grid.directory, temporary)
+                os.replace(temporary, saved_map)
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+        return saved_map
 
     def _log(self, event, **values):
         payload = {'time_utc':datetime.now(timezone.utc).isoformat(), 'event':event, **values}
@@ -161,7 +169,7 @@ class Collection:
             from collection_export import bundle
             return bundle(self.directory,data)
 
-    def begin(self, target, health):
+    def begin(self, target, health, visit_id=None):
         if self.broadcast:return self.broadcast.begin(target,health)
         if self.config['mode']=='broadcast':raise ValueError('广播接收组件尚未就绪')
         pose = health.get('pose')
@@ -180,6 +188,8 @@ class Collection:
                     'actual_pose': list(pose), 'target_pose': [target[k] for k in ('x','y','yaw')],
                     'frame_id': 'map', 'position_source': 'ros_localization',
                 }
+                if visit_id is not None:
+                    station['visit_id'] = visit_id
                 if any(not -2**31 <= station[axis] < 2**31 for axis in ('x_mm', 'y_mm')):
                     raise ValueError('实际位置超出协议毫米坐标范围')
                 self.servo_health = dict(health)

@@ -27,15 +27,20 @@ function draw(){if(!state)return;const ratio=window.devicePixelRatio||1,w=canvas
 }
 function render(){const h=state.health,locked=!quiet();$('mode').textContent=h.mode==='offline'?'离线演练':'实车控制';$('mode').className='badge '+h.mode;$('offline-banner').hidden=h.mode!=='offline';$('phase').textContent=phaseNames[state.phase]||state.phase;$('message').textContent=state.message;$('voltage').textContent=h.voltage==null?'—':h.voltage.toFixed(2)+' V';$('charging').textContent=h.charging==null?'未知':h.charging?'充电中':'未充电';$('charge-current').textContent=h.current==null?'':h.current.toFixed(2)+' A';$('remaining').textContent=state.remaining==null?'—':Math.ceil(state.remaining)+' 秒';$('progress').textContent=state.run.length?'本轮点位 '+Math.min(state.index+1,state.run.length)+' / '+state.run.length:'任务尚未启动';$('readiness').textContent=h.dock_localization?.status==='applying'?'充电停稳，正在自动校准桩位定位…':h.readiness;$('loc-badge').textContent=h.localization_confirmed?(h.dock_localization?.status==='confirmed'?'桩位已校准':'已确认'):'未确认';$('loc-badge').className='small-badge'+(h.localization_confirmed?' confirmed':'');$('map-version').textContent=state.map.version+' · 5 cm / 格 · 地图 +X 向上';$('point-count').textContent=state.points.length;$('empty-points').hidden=state.points.length>0;
  $('start').disabled=locked||!h.ready||!h.localization_confirmed||!state.points.some(p=>p.enabled);$('confirm').disabled=locked||!h.ready;$('initial-dock').disabled=locked;$('pause').disabled=!['navigating','returning','departing','dwelling','collecting','docking','settling','settling_return','settling_departure'].includes(state.phase);$('resume').disabled=!state.phase.startsWith('paused_')||!h.ready||!h.localization_confirmed;$('return').disabled=state.phase==='canceling'||(!h.charging&&(!h.ready||!h.localization_confirmed));$('add-point').disabled=locked;$('auto-return').disabled=locked;
- const c=state.collection||{mode:'timed',stage:'disabled'};
- if(!collectionDirty){$('collection-mode').value=c.mode;$('collection-device').value=c.device||'auto';}
+ const c=state.collection||{mode:'timed',stage:'disabled'}, c5=state.c5||{};
+ if(!collectionDirty){$('collection-mode').value=c.mode;$('collection-device').value=c.device||'auto';$('collection-c5').checked=!!c5.enabled;}
  $('collection-ports').innerHTML=(c.ports||[]).map(p=>'<option value="'+esc(p)+'"></option>').join('');
- $('collection-mode').disabled=$('collection-device').disabled=$('collection-apply').disabled=locked||h.mode==='offline';
+ $('collection-mode').disabled=$('collection-device').disabled=$('collection-apply').disabled=locked||h.mode==='offline'||!!c5.active;
+ $('collection-c5').disabled=$('collection-mode').disabled||!['timed','servo_car_v2'].includes($('collection-mode').value);
+ $('c5-status').hidden=!c5.enabled;
+ $('c5-status').textContent=c5Status(c5);
  $('collection-status').textContent=c.mode==='timed'?'定时模式，无需连接 WS63':c.error?'WS63：'+c.error:c.stage==='sampling'?'采集中 · 已用 '+Math.floor(c.elapsed||0)+' 秒'+(c.scan!=null?' · scan '+c.scan:''):c.connected?'串口就绪 · '+c.stage+' · '+(c.device_resolved||''):'WS63：'+c.stage;
  ['survey-load','survey-restore','anchor-save'].forEach(k=>$(k).disabled=locked);
  const loopReady=!state.points.some(p=>p.id.startsWith("north-loop-"))||c.profile==="moving_loop_demo";
- const collectionReady=loopReady&&!collectionDirty&&!c.motion_blocked&&(c.mode!=='broadcast'||c.beacon_recent)&&(!['ws63','broadcast','servo_car_v2'].includes(c.mode)||(c.connected&&['ready','done'].includes(c.stage)));
- $('return').disabled=$('return').disabled||c.motion_blocked;
+ const c5Ready=!c5.active&&(!c5.enabled||['ready','done','canceled'].includes(c5.stage));
+ const collectionReady=loopReady&&!collectionDirty&&!c.motion_blocked&&c5Ready&&(c.mode!=='broadcast'||c.beacon_recent)&&(!['ws63','broadcast','servo_car_v2'].includes(c.mode)||(c.connected&&['ready','done'].includes(c.stage)));
+ $('return').disabled=$('return').disabled||c.motion_blocked||!!c5.active||(c5.enabled&&['collecting','paused_collection'].includes(state.phase));
+ if(c.mode==='timed'&&c5.enabled)$('collection-status').textContent='每站等待 C5 保存完成后离站';
  if(c.mode==='broadcast'&&!collectionDirty)$('collection-status').textContent=c.error?'WS63：'+c.error:c.connected?(c.beacon_recent?'基站1 '+c.last_rssi+' dBm · 沿途有效 '+(c.samples||0)+' 条 · '+(c.measured_points||0)+' 个热力格' :'Client 已连接，等待固定基站广播'):'广播 Client：'+c.stage;
  if(c.mode==='servo_car_v2')$('collection-status').textContent=servoStatus(c);
  else if(c.motion_blocked)$('collection-status').textContent='有未放行的旋转轮次。请切到旋转定点模式恢复连接。';
@@ -53,11 +58,27 @@ canvas.addEventListener('wheel',e=>{e.preventDefault();const [x,y]=local(e),fact
 $('pan-tool').onclick=()=>setMode('pan');$('add-tool').onclick=$('add-point').onclick=()=>setMode('add');$('pose-tool').onclick=()=>setMode('pose');$('fit').onclick=()=>fit(false);$('full').onclick=()=>fit(true);
 ['stop','pause','resume','return','confirm'].forEach(id=>$(id).onclick=()=>command({action:id}));$('initial-dock').onclick=()=>command({action:'initial_dock'});$('start').onclick=()=>command({action:'start',auto_return:$('auto-return').checked});
 $('export').onclick=async()=>{const data=await(await fetch('/api/export')).json();const link=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));link.href=url;link.download='实验室导航点.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};$('import').onclick=()=>$('file').click();$('file').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());command({action:'import',map_id:data.map_id,points:data.points});}catch(err){toast('点位文件无法读取：'+err.message);}e.target.value='';};
-$('collection-mode').onchange=$('collection-device').oninput=()=>{collectionDirty=true;render();};
-$('collection-apply').onclick=()=>{const data={action:'collection_config',mode:$('collection-mode').value,device:$('collection-device').value.trim()||'auto'};collectionDirty=false;command(data);};
+$('collection-device').oninput=$('collection-c5').onchange=()=>{collectionDirty=true;render();};
+$('collection-mode').onchange=()=>{
+ if(!['timed','servo_car_v2'].includes($('collection-mode').value))$('collection-c5').checked=false;
+ collectionDirty=true;render();
+};
+$('collection-apply').onclick=()=>{
+ const data={action:'collection_config',mode:$('collection-mode').value,device:$('collection-device').value.trim()||'auto',c5:$('collection-c5').checked};
+ collectionDirty=false;command(data);
+};
 $('survey-load').onclick=async()=>{await command({action:'survey_load_north'});fit(false);};
 $('survey-restore').onclick=async()=>{await command({action:'survey_restore_points'});fit(false);};
 $('anchor-save').onclick=()=>command({action:'survey_anchor',notes:$('anchor-notes').value,height_m:$('anchor-height').value?Number($('anchor-height').value):null});
+function c5Status(c5) {
+ if(c5.error)return 'C5：'+c5.error;
+ if(c5.stage==='starting')return 'C5：'+c5.point_name+' 已停稳，正在启动采集';
+ if(c5.stage==='sampling')return 'C5：'+c5.point_name+' 正在采集 · '+(c5.elapsed||0)+' 秒';
+ if(c5.stage==='done')return 'C5：'+c5.point_name+' 已保存 · 有效 CSI '+c5.result.valid_csi+' 条';
+ if(c5.stage==='canceling')return 'C5：正在停止并保存已采数据';
+ if(c5.stage==='canceled')return 'C5：本轮已取消';
+ return c5.enabled?'C5 采集端就绪 · '+(c5.plan==='variable'?'可变状态扫描':'固定状态采集'):'';
+}
 function servoStatus(collection) {
  if(collection.error)return collection.error;
  if(collection.stage==='sampling'){

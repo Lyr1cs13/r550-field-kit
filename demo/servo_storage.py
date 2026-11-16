@@ -169,7 +169,7 @@ class ServoStore:
                     station = rounds[row['round_id']]
                     nodes.append({
                         'session_id': station['session_id'], 'map_id': station['map_id'],
-                        'point_id': station['point_id'], 'frame_id': 'map',
+                        'point_id': station['point_id'], 'visit_id': station.get('visit_id', ''), 'frame_id': 'map',
                         'position_source': 'ros_localization', 'yaw_rad': station['actual_pose'][2],
                         **json.loads(row['result']), 'car_receive_time': row['car_receive_time'],
                         'round_status': station['state'],
@@ -178,7 +178,7 @@ class ServoStore:
             return ''.join(json.dumps(n, ensure_ascii=False) + '\n' for n in nodes).encode('utf-8')
         output = io.StringIO()
         fields = ('session_id', 'map_id', 'point_id', 'frame_id', 'position_source', 'yaw_rad',
-                  *RESULT_FIELDS, 'car_receive_time', 'round_status')
+                  *RESULT_FIELDS, 'car_receive_time', 'round_status', 'visit_id')
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         for node in nodes:
