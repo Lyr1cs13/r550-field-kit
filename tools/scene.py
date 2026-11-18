@@ -28,15 +28,15 @@ def scene_dir(name):
     return ROOT/'scenes'/name
 
 
-def ensure_stopped():
+def ensure_stopped(nav_port=8890):
     if os.name!='nt' and Path('/proc').exists():
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():continue
             try:cmd=(proc/'cmdline').read_bytes()
             except OSError:continue
-            if any(x in cmd for x in (b'wheeltec_robot_node',b'controller_server',b'sync_slam_toolbox_node',b'async_slam_toolbox_node')):raise ValueError('先运行 ./kit stop 关闭底盘/建图/导航，再切换场景')
+            if any(x in cmd for x in (b'wheeltec_robot_node',b'controller_server',b'sync_slam_toolbox_node',b'async_slam_toolbox_node',b'motion_gate.py',b'self_return_filter.py')):raise ValueError('先运行 ./kit stop 关闭底盘/建图/导航，再切换场景')
     try:
-        with urllib.request.urlopen('http://127.0.0.1:8890/api/state', timeout=1) as r:
+        with urllib.request.urlopen(f'http://127.0.0.1:{nav_port}/api/state', timeout=1) as r:
             s = json.load(r)
     except urllib.error.URLError:
         return
@@ -63,9 +63,10 @@ def make_mask(directory, rectangles):
     (directory/'threshold_keepout.yaml').write_text(yaml.safe_dump(info), encoding='utf-8')
 
 
-def create(name, source):
+def create(name, source, *, target=None):
     import yaml
-    target = scene_dir(name)
+    canonical=scene_dir(name)
+    target = target or canonical
     target.mkdir(exist_ok=False)
     source = source.expanduser().resolve();info = yaml.safe_load(source.read_text(encoding='utf-8'))
     image = (source.parent/info['image']).resolve()
@@ -89,18 +90,35 @@ def create(name, source):
     return target
 
 
-def activate(name):
-    ensure_stopped();directory=scene_dir(name);grid=MapGrid(directory)
-    assets=ROOT/'demo/assets';backup=ROOT/'state/backups'/time.strftime('scene_%Y%m%d_%H%M%S')
+def activate(name, *, nav_port=8890):
+    ensure_stopped(nav_port);directory=scene_dir(name);grid=MapGrid(directory)
+    assets=ROOT/'demo/assets';backup=ROOT/'state/backups'/f"scene_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()%1000000}"
     backup.mkdir(parents=True, exist_ok=False)
     names=['map.yaml','WHEELTEC.yaml','WHEELTEC.pgm','threshold_keepout.pgm','threshold_keepout.yaml',
            'boundary.json','dock_start.json','map_metadata.json','survey_settings.json','survey_route.json']
-    for name in names:
-        old=assets/name
-        if old.exists():shutil.copy2(old,backup/name)
-        if (directory/name).exists():shutil.copy2(directory/name,old)
-        elif name=='survey_route.json':old.unlink(missing_ok=True)
-    write_json(ROOT/'state/active_scene.json',{'scene':directory.name,'map_id':grid.map_id})
+    for file in names:
+        original=assets/file
+        if original.exists():shutil.copy2(original,backup/file)
+    try:
+        for file in names:
+            original=assets/file
+            if (directory/file).exists():
+                pending=original.with_suffix(original.suffix+'.scene-tmp')
+                shutil.copy2(directory/file,pending)
+                pending.replace(original)
+            elif file=='survey_route.json':
+                original.unlink(missing_ok=True)
+        status=ROOT/'state/active_scene.json'
+        pending=status.with_suffix('.tmp')
+        write_json(pending,{'scene':directory.name,'map_id':grid.map_id})
+        pending.replace(status)
+    except OSError:
+        for file in names:
+            if (backup/file).exists():
+                shutil.copy2(backup/file,assets/file)
+            else:
+                (assets/file).unlink(missing_ok=True)
+        raise
     print('已启用：',directory.name,'map_id:',grid.map_id)
 
 

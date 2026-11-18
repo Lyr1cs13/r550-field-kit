@@ -6,7 +6,7 @@ if [[ "${2:-}" != --skip-apt ]]; then
   sudo apt-get update
   sudo apt-get install -y git screen python3-yaml python3-serial python3-numpy python3-scipy python3-pil fonts-noto-cjk \
     python3-colcon-common-extensions python3-rosdep ros-humble-rmw-cyclonedds-cpp ros-humble-teleop-twist-keyboard \
-    ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-slam-toolbox ros-humble-rviz2
+    ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-nav2-collision-monitor ros-humble-slam-toolbox ros-humble-rviz2
 fi
 mkdir -p "$root/state" "$root/maps"
 if [[ "$role" == robot ]]; then

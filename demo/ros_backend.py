@@ -1,5 +1,6 @@
 """Bridge to native Nav2/AMCL and the factory STM32 IR docking mode."""
 import math
+import os
 from collections import deque
 from pathlib import Path
 import threading
@@ -19,13 +20,22 @@ from rcl_interfaces.srv import SetParametersAtomically
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.srv import GetState
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
-from nav2_msgs.action import ComputePathToPose, NavigateToPose, FollowPath, Spin
+from nav2_msgs.action import ComputePathToPose, DriveOnHeading, NavigateToPose, FollowPath, Spin
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float32, UInt8, Int8
+from std_msgs.msg import Bool, Float32, UInt8, Int8, String
 from tf2_ros import Buffer, TransformListener
 from dock_localization import DockLocalization, localization_inputs_ready
-from arrival_policy import refinement_stage, heading_profile, should_capture_pose
+from arrival_policy import (FAS_STATION_YAW_TOLERANCE, RSSI_STATION_POSITION_TOLERANCE, RSSI_STATION_YAW_TOLERANCE,
+                            refinement_stage, heading_profile, in_place_heading_profile,
+                            heading_needs_brake, fas_heading_needs_brake)
 from charge_confirmation import ChargeConfirmation, NativeDockingWatchdog
+from directed_route import departure_leg, fas_axis_leg, straight_approach_speed, straight_leg
+from nav2_msgs.srv import IsPathValid
+from motion_health import LocalizationGuard
+from fleet_zone import FleetZone
+from slip_monitor import SlipMonitor
+from guarded_retreat import RETREAT_DISTANCE
+from std_srvs.srv import Empty
 
 
 def yaw(q):
@@ -62,6 +72,19 @@ class RosBackend(SurveyPathMixin, Node):
         info_path=Path(__file__).parent/'factory_config_diff.json'
         self.profile=json.loads(info_path.read_text()).get('profile','factory') if info_path.exists() else 'factory'
         self.grid = grid;self.lock = threading.RLock()
+        zone_path=os.environ.get('R550_FLEET_ZONE')
+        self.fleet_config=FleetZone.load(zone_path,grid.map_id) if zone_path else None
+        self.fleet_latch=Path(zone_path).with_suffix('.paired') if zone_path else None
+        self.fleet_zone=self.fleet_config if self.fleet_latch and self.fleet_latch.exists() else None
+        self.fleet_lease_until=0.
+        self.pose_stamp=0.
+        self.localization_guard=LocalizationGuard()
+        self.slip_monitor=SlipMonitor()
+        self.encoders=None;self.slip_site=None
+        self.scan_agreement=None;self.scan_known_count=0
+        import numpy as np
+        from scipy.ndimage import distance_transform_edt
+        self.wall_distances=distance_transform_edt(np.asarray(grid.cells).reshape(grid.height,grid.width)<65)*grid.resolution
         self.dock_calibrated=dock.get('calibrated',True)
         home = dock['robot_pose'];self.dock_pose = [home['x'], home['y'], home['yaw']]
         self.dock_localization=DockLocalization(self.dock_pose);self.last_amcl=0.
@@ -72,22 +95,35 @@ class RosBackend(SurveyPathMixin, Node):
         self.amcl_seen = False;self.covariance = None;self.map_matches = False;self.known_dock_start=False
         self.charging = None;self.last_charge = 0;self.voltage = None;self.current = None
         self.last_numeric={};self.charge_confirmation=ChargeConfirmation();self.charging_stable=False
+        self.last_charge_contact=-math.inf
         self.native_docking_watchdog=NativeDockingWatchdog()
         self.native_docking_stage='native_capture';self.charge_motion_since=None
         self.ir_count = 0;self.last_ir = 0;self.docking_since = None;self.docking_error = None
         self.docking_ir_lost_since=None;self.docking_last_valid_ir=None
         self.ops = {};self.active = None;self.path = [];self.initial_request = None
-        self.last_wheel = 0;self.stationary_since = None;self.wheel_distance=0.
+        self.track = deque(maxlen=450)
+        self.last_wheel = 0;self.stationary_since = None;self.wheel_distance=0.;self.wheel_yaw_rate=0.
         self.tf = Buffer();self.listener = TransformListener(self.tf, self)
         self.plan = ActionClient(self, ComputePathToPose, '/compute_path_to_pose')
         self.nav = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self.follow = ActionClient(self, FollowPath, '/follow_path')
+        self.drive_heading = ActionClient(self, DriveOnHeading, '/drive_on_heading')
+        self.leg_validator = self.create_client(IsPathValid, '/is_path_valid')
+        self.nomotion_update=self.create_client(Empty,'/request_nomotion_update')
+        self.nomotion_future=None;self.nomotion_at=0.
         self.spin_action = ActionClient(self, Spin, '/spin')
         self.controller_parameters=self.create_client(SetParametersAtomically,'/controller_server/set_parameters_atomically')
         self.survey_planner_parameters=self.create_client(SetParametersAtomically,'/planner_server/set_parameters_atomically')
         self.survey_plan_desired=None;self.survey_plan_applied=None;self.survey_plan_future=None;self.survey_plan_retry_at=0.
 
-        self.cmd = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.cmd = self.create_publisher(Twist, '/collision_cmd_vel', 1)
+        self.motion_permit=self.create_publisher(Bool,'/navigation_motion_permit',1)
+        self.retreat_permit=self.create_publisher(String,'/navigation_retreat_permit',1)
+        self.last_retreat_status=0.
+        self.create_subscription(String,'/navigation_retreat_status',self.retreat_status_received,1)
+        self.oem_lease=self.create_publisher(Bool,'/navigation_oem_active',1)
+        self.last_gate=0.
+        self.create_subscription(Bool,'/navigation_gate_alive',self.gate_received,1)
         self.raw_cmd=self.create_publisher(Twist,'/nav_cmd_vel',1) if self.smoothing else None
         self.ir = self.create_publisher(Int8, '/robot_recharge_flag', 10)
         self.initial = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
@@ -106,9 +142,74 @@ class RosBackend(SurveyPathMixin, Node):
         self.lifecycle = {};self.inflight = set()
         self.mapping = False
         self.lifecycle_clients = {name: self.create_client(GetState, f'/{name}/get_state')
-                        for name in ('amcl','map_server','controller_server','planner_server','bt_navigator')+ (('velocity_smoother',) if self.smoothing else ())}
+                        for name in ('amcl','map_server','controller_server','planner_server','bt_navigator','collision_monitor')+ (('velocity_smoother',) if self.smoothing else ())}
         self.create_timer(2.0, self.probe)
         self.create_timer(.1, self.update)
+        self.create_timer(.05, self.publish_motion_permit)
+
+    def gate_received(self,message):
+        if message.data:self.last_gate=time.monotonic()
+
+    def retreat_status_received(self,message):
+        with self.lock:
+            self.last_retreat_status=time.monotonic()
+            identity,_,state=message.data.partition(':')
+            if not identity or identity!=self.active:
+                return
+            op=self.ops[identity]
+            if op['status']!='retreating':
+                return
+            if state=='done':
+                op.update(status='succeeded',finished_at=self.last_retreat_status)
+            elif state not in ('idle','backing'):
+                detail={'blocked':'后方或车身净空不足，或传感器未就绪','moving':'车轮未停稳',
+                        'stalled':'短退未取得有效进展','deviated':'短退时发生偏移'}
+                op.update(status='failed',error=detail.get(state,'短退许可已结束'))
+
+    def publish_motion_permit(self):
+        with self.lock:
+            op=self.ops[self.active] if self.active else {}
+            status=op.get('status')
+            health=self.snapshot()
+            permitted=(status in ('navigating','heading','heading_wait','spinning','spin_wait')
+                       and health['ready'] and self.confirmed and not self.localization_guard.reason)
+            if op.get('kind')=='return' and health['charge_contact_live']:
+                permitted=False
+            if self.fleet_zone:
+                permitted=permitted and health['fleet']['leased'] and not health['fleet']['motion_reason']
+            fas = getattr(self,'fas_lease',None)
+            if fas and fas.owner:
+                kind = 'return' if op.get('kind') == 'return' else 'move'
+                permitted = permitted and fas.allows(kind,health,self.path)
+            self.motion_permit.publish(Bool(data=bool(permitted)))
+            retreat=(status=='retreating' and health['ready'] and self.confirmed and not self.fleet_zone and not (fas and fas.owner)
+                     and not self.localization_guard.reason and self.docking_since is None)
+            self.retreat_permit.publish(String(data=self.active if retreat else ''))
+            oem = self.docking_since is not None and self.fleet_zone is None
+            if fas and fas.owner:
+                oem = oem and fas.allows('return',health)
+            self.oem_lease.publish(Bool(data=oem))
+
+    def retreat(self):
+        with self.lock:
+            health=self.snapshot()
+            if (self.fleet_zone or not self.confirmed or not health['ready'] or not health['stationary']
+                    or self.charging_stable or self.docking_since is not None or (self.scan_agreement or 0.)<.80
+                    or health['voltage'] is None or health['voltage']<10.65
+                    or time.monotonic()-self.last_retreat_status>.35):
+                raise ValueError('短退需要单车停稳、雷达对图和后退保护均就绪')
+            if self.active and self.ops[self.active]['status'] not in ('succeeded','failed','canceled'):
+                raise ValueError('旧导航尚未停止')
+            x,y,heading=self.pose
+            for distance in (.05,.10,.15,RETREAT_DISTANCE):
+                target={'x':x-distance*math.cos(heading),'y':y-distance*math.sin(heading),'yaw':heading}
+                self.grid.validate(target['x'],target['y'],clearance=.14)
+            identity=uuid.uuid4().hex
+            self.ops[identity]={'kind':'retreat','goal':target,'status':'retreating','controller_id':'RearGuard',
+                                'started':time.monotonic(),'timeout':9.,'cancel':False,'handle':None,
+                                'heading_attempts':0,'arrival_retries':0}
+            self.active=identity;self.path=[[x,y],[target['x'],target['y']]]
+            return identity
 
     def map_received(self, m):
         good = (m.info.width == self.grid.width and m.info.height == self.grid.height
@@ -134,26 +235,38 @@ class RosBackend(SurveyPathMixin, Node):
             if m.header.frame_id.lstrip('/') != 'map' or not m.poses or not self.active:
                 return
             op=self.ops[self.active]
-            if op['status'] not in ('planning','navigating'):
+            if (op['status']!='navigating' or op.get('explicit_path') or
+                    (op.get('route_path') and not op.get('route_rejoining'))):
+                return
+            stamp=m.header.stamp.sec*1_000_000_000+m.header.stamp.nanosec
+            if stamp<op.get('path_stamp',0):
                 return
             end=m.poses[-1].pose.position;goal=op['goal']
-            if math.hypot(end.x-goal['x'],end.y-goal['y'])<.4:
+            if math.hypot(end.x-goal['x'],end.y-goal['y'])<=max(.08,op.get('xy_tolerance',0.)+.045):
+                op['path_stamp']=stamp
                 self.path=[[p.pose.position.x,p.pose.position.y] for p in m.poses
                            if math.isfinite(p.pose.position.x) and math.isfinite(p.pose.position.y)]
 
     def charge_received(self, m):
         with self.lock:
             self.charging = bool(m.data);self.last_charge = time.monotonic()
+            if self.charging:self.last_charge_contact=self.last_charge
 
     def numeric_received(self, name, m):
         with self.lock:
             setattr(self,name,float(m.data) if math.isfinite(m.data) else None)
             self.last_numeric[name]=time.monotonic()
+            if name=='current' and math.isfinite(m.data) and m.data>=self.charge_confirmation.minimum_current:
+                self.last_charge_contact=self.last_numeric[name]
 
     def wheel_received(self, m):
         with self.lock:
             now=time.monotonic();dt=min(.2,max(0.,now-self.last_wheel));self.last_wheel=now
             t=m.twist.twist
+            self.wheel_yaw_rate=t.angular.z if math.isfinite(t.angular.z) else 0.
+            p=m.pose.pose
+            encoders=(p.position.x,p.position.y,yaw(p.orientation))
+            self.encoders=encoders if all(math.isfinite(v) for v in encoders) else None
             if math.isfinite(t.linear.x) and math.isfinite(t.linear.y):
                 self.wheel_distance+=math.hypot(t.linear.x,t.linear.y)*dt
             if self.active:
@@ -163,6 +276,11 @@ class RosBackend(SurveyPathMixin, Node):
             stopped=all(math.isfinite(v) and abs(v)<limit for v,limit in
                         ((t.linear.x,.02),(t.linear.y,.02),(t.angular.z,.05)))
             self.stationary_since=(self.stationary_since or now) if stopped else None
+            if self.active:
+                op=self.ops[self.active]
+                if (op.get('fas_station') and op['status'] in ('heading','heading_wait') and self.pose
+                        and self.should_brake_heading(op,now)):
+                    self.settle_waypoint_heading(op)
 
     def ir_received(self, m):
         with self.lock:
@@ -170,6 +288,8 @@ class RosBackend(SurveyPathMixin, Node):
 
     def scan_received(self, m):
         with self.lock:
+            stamp=m.header.stamp.sec+m.header.stamp.nanosec*1e-9
+            if abs(self.get_clock().now().nanoseconds*1e-9-stamp)>.5:return
             self.last_scan = time.monotonic()
             self.pending_scans.append(m)
 
@@ -196,6 +316,13 @@ class RosBackend(SurveyPathMixin, Node):
                         a = angle+m.angle_min+i*m.angle_increment
                         points.append([t.translation.x+distance*math.cos(a), t.translation.y+distance*math.sin(a)])
                 self.laser = points  # Display only; native localization/navigation gets the full scan.
+                known=[]
+                for px,py in points:
+                    ix,iy=self.grid.cell_xy(px,py)
+                    if self.grid.value(ix,iy)>=0:
+                        known.append(self.wall_distances[iy,ix]<=.15)
+                self.scan_known_count=len(known)
+                self.scan_agreement=sum(known)/len(known) if known else None
             except Exception:
                 if time.monotonic()-self.last_scan > 2:
                     self.laser = [];self.pending_scans.clear()
@@ -215,6 +342,26 @@ class RosBackend(SurveyPathMixin, Node):
             except Exception:
                 self.lifecycle[name] = (0, time.monotonic())
 
+    def detect_wheel_slip(self,now):
+        op=self.ops[self.active] if self.active else None
+        if (not op or op['status'] not in ('navigating','heading','retreating') or not self.confirmed or not self.pose
+                or self.encoders is None or now-self.last_wheel>.30 or now-self.last_scan>.35
+                or not self.pending_scans):
+            self.slip_monitor.reset()
+            return
+        if self.slip_monitor.reference is None and (self.scan_agreement or 0.)<.75:
+            return
+        scan=self.pending_scans[-1]
+        stamp=scan.header.stamp.sec+scan.header.stamp.nanosec*1e-9
+        anchor=self.slip_monitor.observe(stamp,self.encoders,self.pose,scan)
+        if anchor is None:
+            return
+        previous=self.slip_site
+        repeated=previous is not None and math.dist(anchor[:2],previous[:2])<.20
+        self.slip_site=anchor
+        self.localization_guard.trip_slip(anchor,repeated=repeated)
+        self.get_logger().warning(self.localization_guard.fault)
+
     def update(self):
         with self.lock:
             self.update_laser()
@@ -229,14 +376,33 @@ class RosBackend(SurveyPathMixin, Node):
             try:
                 m = self.tf.lookup_transform('map', 'base_footprint', Time())
                 t = m.transform
-                if abs(time.time()-m.header.stamp.sec-m.header.stamp.nanosec/1e9) > 2:
+                self.pose_stamp=m.header.stamp.sec+m.header.stamp.nanosec/1e9
+                if abs(time.time()-self.pose_stamp) > 2:
                     raise ValueError('stale transform')
                 pose = [t.translation.x, t.translation.y, yaw(t.rotation)]
                 if not all(math.isfinite(v) for v in pose):
                     raise ValueError('nonfinite transform')
                 self.pose = pose
+                self.pose_observed_at = now
             except Exception:
                 self.pose = None
+            moving=bool(self.active and self.ops[self.active]['status'] not in ('succeeded','failed','canceled'))
+            had_fault=bool(self.localization_guard.fault)
+            if not had_fault:self.detect_wheel_slip(now)
+            self.localization_guard.update(now,moving=moving,covariance=self.covariance,
+                scan_fraction=self.scan_agreement,scan_count=self.scan_known_count)
+            if self.localization_guard.fault:
+                if not had_fault:self.guard_was_confirmed=self.confirmed
+                self.confirmed=False
+                if (now-self.nomotion_at>=1. and self.stationary_since is not None and
+                        self.nomotion_update.service_is_ready() and
+                        (self.nomotion_future is None or self.nomotion_future.done())):
+                    self.nomotion_future=self.nomotion_update.call_async(Empty.Request());self.nomotion_at=now
+                recovered=self.localization_guard.recover(now,
+                    stationary=self.stationary_since is not None and now-self.stationary_since>=.7,
+                    covariance=self.covariance,scan_fraction=self.scan_agreement,scan_count=self.scan_known_count,
+                    pose=self.pose,fresh=now-self.last_scan<.3 and now-self.last_wheel<.3 and now-self.last_amcl<1.5)
+                if recovered:self.confirmed=getattr(self,'guard_was_confirmed',False)
             if self.initial_request:
                 message, remaining = self.initial_request
                 message.header.stamp = self.get_clock().now().to_msg();self.initial.publish(message)
@@ -247,24 +413,19 @@ class RosBackend(SurveyPathMixin, Node):
                 if op['status'] in ('succeeded','failed','canceled'):op.setdefault('finished_at',now)
                 if op['status'] == 'canceling':
                     self.zero_motion()
-                elif (self.joint_terminal and op['status'] in ('heading','heading_wait') and self.pose
-                      and self.stationary_since is not None and now-self.stationary_since>=.7
-                      and refinement_stage(math.hypot(self.pose[0]-op['goal']['x'],self.pose[1]-op['goal']['y']),
-                          math.atan2(math.sin(op['goal']['yaw']-self.pose[2]),math.cos(op['goal']['yaw']-self.pose[2])),
-                          position_tolerance=self.arrival.get('final_position_tolerance',.05),
-                          yaw_tolerance=op['yaw_tolerance'])=='complete'):
-                    # Apply the same stopped-pose acceptance throughout, rather
-                    # than waiting for a stricter inner checker to time out.
-                    op.update(cancel=True,status='canceling',settle_after_cancel='heading_settling')
-                    if op['handle']:op['handle'].cancel_goal_async()
-                    self.zero_motion()
-                elif (not self.joint_terminal and op['status'] in ('heading','heading_wait')
+                elif (op['status'] in ('heading','heading_wait') and self.pose and
+                      ((self.stationary_since is not None and now-self.stationary_since>=.7
+                        and self.heading_needs_settle(op)) or self.should_brake_heading(op,now))):
+                    self.settle_waypoint_heading(op)
+                elif (op.get('heading_controller')=='PointHeading' and op['status'] in ('heading','heading_wait')
                       and op.get('heading_travel',0.)>op['heading_budget']):
-                    op.update(cancel=True,status='canceling',settle_after_cancel='heading_settling')
-                    if op['handle']:op['handle'].cancel_goal_async()
-                    self.zero_motion()
+                    self.settle_waypoint_heading(op)
                 elif op['status'] not in ('succeeded','canceled','failed') and now-op['started'] > op['timeout']:
-                    if op['sequential'] and op['status'] in ('navigating','heading','heading_wait'):
+                    if op.get('kind') in ('return','departure') and op['status']=='navigating':
+                        op.update(cancel=True,status='canceling',settle_after_cancel='transit_recovery')
+                        if op['handle']:op['handle'].cancel_goal_async()
+                        self.zero_motion()
+                    elif op['sequential'] and op['status'] in ('navigating','heading','heading_wait'):
                         # End the native action before checking usable arrival.
                         # An elapsed refinement timer is not a user stop.
                         stage='position_settling' if op['status']=='navigating' else 'heading_settling'
@@ -281,26 +442,37 @@ class RosBackend(SurveyPathMixin, Node):
                     self.send_arrival_retry(op)
                 elif self.precision_arrival and op['status'] in ('nav_settling','spin_settling'):
                     self.finish_arrival(op,now)
-                elif self.precision_arrival and op['status']=='navigating' and self.pose:
+                elif self.precision_arrival and op['status']=='navigating' and self.pose and op['kind']!='departure':
                     distance=math.hypot(self.pose[0]-op['goal']['x'],self.pose[1]-op['goal']['y'])
-                    angle=math.atan2(math.sin(op['goal']['yaw']-self.pose[2]),math.cos(op['goal']['yaw']-self.pose[2]))
-                    if op['sequential'] and self.joint_terminal and should_capture_pose(distance,angle):
+                    stop_distance=self.arrival.get('final_position_tolerance',.05)
+                    if op['sequential'] and op['kind']=='waypoint' and distance<=stop_distance:
                         op.update(cancel=True,status='canceling',settle_after_cancel='position_settling')
                         if op['handle']:op['handle'].cancel_goal_async()
                         self.zero_motion()
                         return
                     speed=(self.arrival['creep_speed'] if distance<self.arrival['creep_distance'] else
                            self.arrival['approach_speed'] if distance<self.arrival['approach_distance'] else self.arrival['nominal_speed'])
+                    if op['controller_id']=='FixedHeading':
+                        speed=straight_approach_speed(distance,reverse=bool(op.get('fas_station') and op.get('reverse')))
                     # Return is a transit leg; do not apply the waypoint creep
                     # or terminal precision loop before the OEM IR handoff.
                     if op.get('route_path') and not op.get('route_rejoining'):speed=op.get('track_speed',.08)
                     if op['kind']=='return':speed=.10 if distance<.35 else self.arrival['nominal_speed']
                     self.request_speed(speed,op['controller_id'])
+                if (self.pose and op['status'] in ('navigating','position_settling','heading','heading_settling')
+                        and not self.localization_guard.fault
+                        and (not self.track or math.dist(self.track[-1],self.pose[:2])>=.02)):
+                    self.track.append(list(self.pose[:2]))
             if self.docking_since is not None:
                 self.update_oem_docking(now,charge_current)
             self.update_dock_localization(now)
 
     def update_oem_docking(self,now,current):
+        fas = getattr(self,'fas_lease',None)
+        if fas and fas.owner and not fas.allows('return',self.snapshot()):
+            self.docking_error='双车回充许可已失效，已停车'
+            self.stop()
+            return
         # The STM32 owns all IR steering and contact compression. A first
         # current/flag frame never resets or stops its state machine.
         if self.charging_stable:
@@ -358,8 +530,11 @@ class RosBackend(SurveyPathMixin, Node):
             if self.active:
                 op=self.ops[self.active];g=op['goal'];p=self.pose
                 arrival={'kind':op['kind'],'status':op['status'],
-                         'quality':op.get('quality'),
+                         'quality':op.get('quality'),'controller':op.get('controller_id'),
                          'heading_attempts':op['heading_attempts'],'position_retries':op['arrival_retries'],
+                         'travel_direction':op.get('travel_direction'),
+                         'heading_refinement_seconds':((op.get('finished_at') or now)-op['first_heading_at']
+                                                       if 'first_heading_at' in op else 0.),
                          'elapsed':(op.get('finished_at') or now)-op.get('created',op['started']),
                          'position_error':math.hypot(p[0]-g['x'],p[1]-g['y']) if p else None,
                          'yaw_error_deg':math.degrees(abs(math.atan2(math.sin(g['yaw']-p[2]),math.cos(g['yaw']-p[2])))) if p else None}
@@ -374,30 +549,87 @@ class RosBackend(SurveyPathMixin, Node):
                 reason = '雷达数据中断，不能开始导航'
             elif now-self.last_wheel > 2:
                 reason = '底盘运动反馈中断，不能开始导航'
+            elif now-self.last_gate > .5:
+                reason = '速度保护节点心跳中断，保持停车'
             elif self.pose is None or not self.amcl_seen:
                 reason = '请在地图上设置当前位置和车头朝向'
+            elif self.localization_guard.fault:
+                reason = self.localization_guard.fault
+            fleet=None
+            if self.fleet_config:
+                status=self.ops[self.active]['status'] if self.active else ''
+                route=self.path if self.fleet_zone and status=='navigating' else ()
+                fleet={'robot_id':self.fleet_config.robot_id,'bounds':self.fleet_config.bounds,
+                       'active':self.fleet_zone is not None,'leased':now<self.fleet_lease_until,
+                       'motion_reason':self.fleet_motion_reason(route)}
+            feedback_fresh=now-self.last_charge<2
+            current_fresh=now-self.last_numeric.get('current',0)<2 and self.current is not None
+            contact=bool(now-self.last_charge_contact<1.5 or (feedback_fresh and self.charging) or
+                         (current_fresh and self.current>=self.charge_confirmation.minimum_current))
             return {'mode': 'robot', 'ready': not reason, 'readiness': reason or '导航与雷达已就绪',
                     'localization_confirmed': self.confirmed, 'pose': self.pose,
+                    'pose_age_s':abs(time.time()-self.pose_stamp) if self.pose is not None else None,
+                    'dock_calibrated':self.dock_calibrated,'fleet':fleet,
                     'dock_position_confirmed':self.known_dock_start and self.pose is not None and math.hypot(self.pose[0]-self.dock_pose[0],self.pose[1]-self.dock_pose[1])<.15 and abs(math.atan2(math.sin(self.pose[2]-self.dock_pose[2]),math.cos(self.pose[2]-self.dock_pose[2])))<.25,
                     'charging': self.charging_stable or (self.charging if now-self.last_charge < 2 else None),
                     'charging_feedback_flag': self.charging if now-self.last_charge < 2 else None,
+                    'charge_contact_live':contact,'charge_telemetry_fresh':current_fresh and feedback_fresh,
                     'charging_stable': self.charging_stable,
                     'docking_contact_stage': self.native_docking_stage if self.docking_since is not None else None,
-                    'voltage': self.voltage, 'current': self.current,
+                    'voltage': self.voltage if now-self.last_numeric.get('voltage',0)<2 else None, 'current': self.current,
+                    'motion_fault':self.localization_guard.fault,
+                    'scan_map_agreement':self.scan_agreement,
                     'ir': self.ir_count if now-self.last_ir < 2 else 0,
                     'stationary': now-self.last_wheel<2 and self.stationary_since is not None and now-self.stationary_since>=.5,
-                    'path': self.path, 'laser': self.laser, 'map_matches': self.map_matches,
+                    'path': self.path, 'track':list(self.track), 'laser': self.laser, 'map_matches': self.map_matches,
                     'localization_covariance': self.covariance,'navigation_profile':self.profile,'arrival':arrival,
                     'dock_localization':self.dock_localization.snapshot()}
 
     def tick(self):
         pass
 
+    def fleet_motion_reason(self,path):
+        return self.fleet_config.motion_reason(self.pose,abs(time.time()-self.pose_stamp),
+                                              self.covariance,self.scan_agreement,path)
+
+    def set_fleet_mode(self, active):
+        with self.lock:
+            if not self.fleet_config:
+                raise ValueError('当前入口未配置车辆运行区')
+            health=self.snapshot()
+            if not health['stationary'] or self.docking_since is not None:
+                raise ValueError('车辆停稳后才能切换运行模式')
+            if self.active and self.ops[self.active]['status'] not in ('succeeded','failed','canceled'):
+                raise ValueError('请先结束当前导航任务')
+            if active:
+                if not health['ready'] or not health['localization_confirmed']:
+                    raise ValueError('请先核对车辆定位')
+                reason=self.fleet_motion_reason(())
+                if reason:
+                    raise ValueError(reason)
+            try:
+                if active:
+                    self.fleet_latch.touch()
+                else:
+                    self.fleet_latch.unlink(missing_ok=True)
+            except OSError as error:
+                raise ValueError('无法保存车辆运行模式') from error
+            self.fleet_zone=self.fleet_config if active else None
+            self.fleet_lease_until=0.
+
+    def renew_fleet_lease(self):
+        with self.lock:
+            if not self.fleet_zone or self.fleet_zone.bounds is None:
+                raise ValueError('车端双车运行区尚未配置')
+            self.fleet_lease_until=time.monotonic()+1.
+
     def initialize_pose(self, pose, known_dock=False,automatic=False):
         with self.lock:
             if not automatic:
                 if known_dock:self.dock_localization.manual_dock(time.monotonic())
                 else:self.dock_localization.suppress()
+                self.slip_site=None
+            self.slip_monitor.reset()
             message = PoseWithCovarianceStamped();message.header.frame_id = 'map'
             message.pose.pose.position.x, message.pose.pose.position.y = pose[0], pose[1]
             message.pose.pose.orientation.z = math.sin(pose[2]/2);message.pose.pose.orientation.w = math.cos(pose[2]/2)
@@ -405,6 +637,7 @@ class RosBackend(SurveyPathMixin, Node):
             message.pose.covariance[7] = (.05 if known_dock else .5)**2
             message.pose.covariance[35] = math.radians(5 if known_dock else 15)**2
             self.confirmed = False;self.amcl_seen = False;self.initial_request = (message, 3);self.known_dock_start=known_dock
+            self.localization_guard.reset()
 
     def confirm_localization(self):
         with self.lock:
@@ -438,7 +671,103 @@ class RosBackend(SurveyPathMixin, Node):
                     self.survey_plan_future=None;self.survey_plan_retry_at=time.monotonic()+1.
             self.survey_plan_future.add_done_callback(done)
 
+    def fas_line(self, pose, point):
+        if not self.leg_validator.service_is_ready():
+            return None
+        leg=fas_axis_leg(pose,point)
+        if not leg:
+            return None
+        try:
+            for p in leg['poses']:
+                self.grid.validate(p['x'],p['y'],clearance=.23)
+        except ValueError:
+            return None
+        route=NavPath()
+        route.header.frame_id='map'
+        route.header.stamp=self.get_clock().now().to_msg()
+        route.poses=[self.stamped(p) for p in leg['poses']]
+        return route,leg['reverse']
+
+    def preview_route(self, point, kind, health):
+        """Request a native planner path without sending a navigation action."""
+        def result(future):
+            complete = threading.Event()
+            future.add_done_callback(lambda _:complete.set())
+            if not complete.wait(3.):
+                raise ValueError('原生路径预览超时')
+            return future.result()
+
+        pose = list(health['pose'])
+        path = [pose[:2]]
+        if kind == 'move' and (health['charging'] or health['dock_position_confirmed']):
+            x,y,heading = self.dock_pose
+            end = {'x':x+self.departure_distance*math.cos(heading),
+                   'y':y+self.departure_distance*math.sin(heading)}
+            clear = departure_leg(pose,self.dock_pose,end)
+            if clear['poses']:
+                final = clear['poses'][-1]
+                pose[:2] = final['x'], final['y']
+                path.extend([[p['x'],p['y']] for p in clear['poses']])
+        if math.dist(pose[:2], (point['x'],point['y'])) > .04:
+            candidate=self.fas_line(pose,point) if kind=='move' and self.sequential_waypoints else None
+            if candidate:
+                line, _=candidate
+                request=IsPathValid.Request()
+                request.path=line
+                if result(self.leg_validator.call_async(request)).is_valid:
+                    return path+self.plan_coordinates(line)
+            goal = ComputePathToPose.Goal()
+            goal.start = self.stamped(dict(zip(('x','y','yaw'),pose)))
+            goal.goal = self.stamped(point)
+            goal.use_start = True
+            goal.planner_id = 'WaypointGrid' if kind == 'move' else 'GridBased'
+            handle = result(self.plan.send_goal_async(goal))
+            if not handle.accepted:
+                raise ValueError('Nav2 拒绝路径预览')
+            response = result(handle.get_result_async())
+            if response.status != 4 or not response.result.path.poses:
+                raise ValueError('当前没有可走的原生导航路线')
+            path.extend(self.plan_coordinates(response.result.path))
+        path.append([point['x'],point['y']])
+        if kind == 'return':
+            path.append(list(self.dock_pose[:2]))
+        return path
+
+    @staticmethod
+    def plan_coordinates(path):
+        return [[p.pose.position.x,p.pose.position.y] for p in path.poses]
+
+    def send_fas_line(self, identity):
+        op=self.ops[identity]
+        if not op.get('fas_station') or op.get('direct_failed'):
+            return False
+        result=self.fas_line(self.pose,op['goal'])
+        if result is None:
+            return False
+        line,reverse=result
+        path=self.plan_coordinates(line)
+        fas=getattr(self,'fas_lease',None)
+        if fas and fas.owner and not fas.allows('move',self.snapshot(),path):
+            return False
+        op.update(directed_path=line,reverse=reverse,started=time.monotonic(),timeout=20.)
+        self.send_navigation(identity)
+        return True
+
+    def plan_navigation(self,identity):
+        op=self.ops[identity]
+        op.update(status='planning',started=time.monotonic(),timeout=20.,handle=None)
+        goal=ComputePathToPose.Goal()
+        goal.goal=self.stamped(op['goal'])
+        goal.planner_id='WaypointGrid' if op['sequential'] else 'GridBased'
+        goal.use_start=False
+        self.plan.send_goal_async(goal).add_done_callback(lambda f:self.plan_accepted(f,identity))
+
     def navigate(self, point, kind):
+        if self.fleet_zone:
+            reason=self.fleet_motion_reason(((point['x'],point['y']),))
+            if reason:raise ValueError(reason)
+            if kind=='return' or point.get('survey_path'):
+                raise ValueError('双车模式仅允许各自运行区内的普通导航点')
         if kind=='survey' and point.get('survey_path'):return self.navigate_survey_path(point)
         with self.lock:
             if self.active and self.ops[self.active]['status'] not in ('succeeded','failed','canceled'):
@@ -451,20 +780,58 @@ class RosBackend(SurveyPathMixin, Node):
             op['sequential']=self.sequential_waypoints and kind in ('waypoint','survey')
             op['controller_id']='PointPosition' if op['sequential'] else 'FollowPath'
             op['xy_tolerance'] = (.05 if kind=='departure' else .08 if kind=='return' else self.goal_xy_tolerance) if self.precision_arrival else self.goal_xy_tolerance
-            if op['sequential']:op['xy_tolerance']=self.position_xy_tolerance
             op['yaw_tolerance'] = (math.radians(8) if kind=='departure' else math.radians(10) if kind=='return' else self.goal_yaw_tolerance) if self.precision_arrival else self.goal_yaw_tolerance
+            if op['sequential']:
+                op['xy_tolerance']=self.position_xy_tolerance
+                op['yaw_tolerance']=self.arrival.get('final_yaw_tolerance',self.goal_yaw_tolerance)
+                if kind=='waypoint' and point.get('fas_station'):
+                    op['fas_station']=True
+                    op['yaw_tolerance']=FAS_STATION_YAW_TOLERANCE
+                elif kind=='waypoint' and point.get('rssi_station'):
+                    op['stop_xy_tolerance']=RSSI_STATION_POSITION_TOLERANCE
+                    op['strict_yaw_tolerance']=op['yaw_tolerance']
+                    op['yaw_tolerance']=RSSI_STATION_YAW_TOLERANCE
+                elif kind=='waypoint' and point.get('return_via'):
+                    op['stop_xy_tolerance']=.12
+                    op['yaw_tolerance']=math.pi
             if kind=='survey':op['xy_tolerance']=min(.22,point.get('survey_pass_radius',.5));op['yaw_tolerance']=math.pi
-            self.ops[identity] = op;self.active = identity;self.path = []
+            self.ops[identity] = op;self.active = identity;self.path = [];self.track.clear()
             self.dock_localization.arm()
+            if kind=='departure':
+                self.send_departure(op)
+                return identity
             if op['sequential'] and self.pose and self.stationary_since and time.monotonic()-self.stationary_since>=.7:
                 distance=math.hypot(self.pose[0]-point['x'],self.pose[1]-point['y'])
-                if distance<=self.arrival.get('final_position_tolerance',.05):
-                    op.update(status='position_settling',timeout=15.,already_at_position=True)
+                if distance<=op.get('stop_xy_tolerance',self.arrival.get('final_position_tolerance',.05)):
+                    op.update(status='position_settling',timeout=15.,already_at_position=True,travel_direction='stationary')
                     return identity
-            goal = ComputePathToPose.Goal();goal.goal = self.stamped(point)
-            goal.planner_id = 'WaypointGrid' if op['sequential'] else 'GridBased';goal.use_start = False
-            self.plan.send_goal_async(goal).add_done_callback(lambda f: self.plan_accepted(f,identity))
+            if not self.send_fas_line(identity):
+                self.plan_navigation(identity)
             return identity
+
+    def send_departure(self,op):
+        op['controller_id']='StraightDeparture'
+        try:
+            leg=departure_leg(self.pose,self.dock_pose,op['goal'])
+            if not leg['distance']:
+                op.update(status='succeeded',actual_pose=list(self.pose))
+                self.path=[]
+                return
+            if not self.drive_heading.server_is_ready():
+                raise ValueError('原生直行离桩动作未就绪')
+        except ValueError as exc:
+            op.update(status='failed',error=str(exc))
+            self.zero_motion()
+            return
+        speed=.08
+        allowance=math.ceil(leg['distance']/speed)+5
+        goal=DriveOnHeading.Goal()
+        goal.target.x=leg['distance'];goal.speed=speed;goal.time_allowance.sec=allowance
+        identity=self.active
+        self.path=[[p['x'],p['y']] for p in leg['poses']]
+        op.update(status='navigating',explicit_path=True,departure_target=leg['poses'][-1],
+                  started=time.monotonic(),timeout=allowance+3,handle=None)
+        self.drive_heading.send_goal_async(goal).add_done_callback(lambda f:self.nav_accepted(f,identity))
 
     def plan_accepted(self, future, identity):
         with self.lock:
@@ -487,10 +854,34 @@ class RosBackend(SurveyPathMixin, Node):
             try:
                 result = future.result()
                 if result.status != 4 or not result.result.path.poses:
-                    if op['sequential']:
+                    if op['sequential'] or op.get('kind') in ('return','departure'):
                         self.retry_arrival(op,'目标或通路被实时障碍占用，等待可通行后自动继续');return
                     raise ValueError('目标没有可通行路线，未发送运动导航')
-                self.path = [[p.pose.position.x,p.pose.position.y] for p in result.result.path.poses]
+                self.path = self.plan_coordinates(result.result.path)
+                fas = getattr(self,'fas_lease',None)
+                if fas and fas.owner and not fas.allows('return' if op['kind']=='return' else 'move',self.snapshot(),self.path):
+                    op.update(status='failed',error='规划超出双车已预约走廊，保持停车')
+                    self.path = []
+                    return
+                if self.fleet_zone:
+                    reason=self.fleet_motion_reason(self.path)
+                    if reason:
+                        op.update(status='failed',error=reason)
+                        self.path=[]
+                        return
+                op.pop('directed_path',None);op.pop('explicit_path',None)
+                leg = (straight_leg(self.pose,op['goal'],self.path)
+                       if op['kind']=='waypoint' and not op.get('fas_station') else None)
+                if leg and self.leg_validator.service_is_ready():
+                    try:
+                        for p in leg['poses']:
+                            self.grid.validate(p['x'],p['y'],clearance=.18)
+                    except ValueError:
+                        pass
+                    else:
+                        candidate=NavPath();candidate.header.frame_id='map';candidate.header.stamp=self.get_clock().now().to_msg()
+                        candidate.poses=[self.stamped(p) for p in leg['poses']]
+                        op['directed_path']=candidate;op['reverse']=leg['reverse']
                 distance = sum(math.hypot(b[0]-a[0],b[1]-a[1]) for a,b in zip(self.path,self.path[1:]))
                 op['timeout'] = max(60,min(600,distance/.08+60));op['started'] = time.monotonic()
                 if self.precision_arrival:
@@ -519,10 +910,71 @@ class RosBackend(SurveyPathMixin, Node):
 
     def send_navigation(self,identity):
         op=self.ops[identity];op['status']='navigating'
+        if op.get('directed_path') is not None:
+            op['status']='validating_leg'
+            request=IsPathValid.Request();request.path=op['directed_path']
+            self.leg_validator.call_async(request).add_done_callback(lambda f:self.directed_validated(f,identity))
+            return
+        op['controller_id']='PointPosition' if op['sequential'] else 'FollowPath'
+        op['travel_direction']='native'
+        op['path_stamp']=self.get_clock().now().nanoseconds
         goal=NavigateToPose.Goal();goal.pose=self.stamped(op['goal'])
         goal.behavior_tree=(str(Path(__file__).parent/'assets/waypoint_position.xml')
                             if op['sequential'] else self.native_behavior_tree)
         self.nav.send_goal_async(goal).add_done_callback(lambda f:self.nav_accepted(f,identity))
+
+    def directed_validated(self,future,identity):
+        with self.lock:
+            op=self.ops[identity]
+            if op['cancel']:op['status']='canceled';return
+            try:
+                if not future.result().is_valid:
+                    op.pop('directed_path',None)
+                    if op.get('fas_station'):
+                        self.plan_navigation(identity)
+                    else:
+                        self.send_navigation(identity)
+                    return
+                if not op.get('fas_station'):
+                    self.follow_directed(identity)
+                    return
+                if not self.pose:
+                    raise ValueError('直行前等待定位')
+                distance=math.dist(self.pose[:2],(op['goal']['x'],op['goal']['y']))
+                speed=straight_approach_speed(distance,reverse=op['reverse'])
+                request=SetParametersAtomically.Request()
+                request.parameters=[Parameter('FixedHeading.desired_linear_vel',value=speed).to_parameter_msg()]
+                op.update(status='configuring',timeout=max(20.,distance/speed+20.))
+                self.controller_parameters.call_async(request).add_done_callback(
+                    lambda f:self.directed_speed_ready(f,identity,speed))
+            except Exception as exc:
+                op.update(status='failed',error='直线路线检查失败：'+str(exc));self.zero_motion()
+
+    def directed_speed_ready(self,future,identity,speed):
+        with self.lock:
+            op=self.ops[identity]
+            if op['cancel']:
+                op['status']='canceled'
+                return
+            try:
+                response=future.result().result
+                if not response.successful:
+                    raise ValueError(response.reason)
+                self.speed_limits['FixedHeading']=speed
+                self.follow_directed(identity)
+            except Exception as exc:
+                op.update(status='failed',error='直行速度设置失败：'+str(exc));self.zero_motion()
+
+    def follow_directed(self,identity):
+        op=self.ops[identity]
+        goal=FollowPath.Goal()
+        goal.path=op['directed_path']
+        goal.controller_id='FixedHeading'
+        goal.goal_checker_id='directed_position_checker'
+        op.update(status='navigating',controller_id='FixedHeading',explicit_path=True,started=time.monotonic(),
+                  travel_direction='reverse' if op.get('reverse') else 'forward')
+        self.path=self.plan_coordinates(goal.path)
+        self.follow.send_goal_async(goal).add_done_callback(lambda f:self.nav_accepted(f,identity))
 
     def nav_accepted(self, future, identity):
         with self.lock:
@@ -546,6 +998,14 @@ class RosBackend(SurveyPathMixin, Node):
                 if op['cancel']:
                     self.finish_native_cancellation(op)
                 elif result.status == 4:
+                    if op['kind']=='departure':
+                        target=op['departure_target']
+                        if self.pose is None or math.hypot(self.pose[0]-target['x'],self.pose[1]-target['y'])>.09:
+                            self.retry_arrival(op,'直行离桩后位置未确认，停车复核')
+                        else:
+                            op.update(status='succeeded',actual_pose=list(self.pose))
+                        self.zero_motion();self.path=[]
+                        return
                     if op.get('route_rejoining'):
                         self.finish_survey_rejoin(identity);return
                     p = self.pose;g = op['goal']
@@ -563,10 +1023,15 @@ class RosBackend(SurveyPathMixin, Node):
                         raise ValueError('到达朝向不符，请检查定位')
                     op['status'] = 'succeeded'
                 else:
+                    if op.get('kind') in ('return','departure'):
+                        op['handle']=None
+                        self.retry_arrival(op,'通路受阻，保持停车并等待重新规划');return
                     if op['sequential']:
                         # A native progress failure near the goal is not by
                         # itself proof the sampling point is unusable. Stop,
                         # inspect real pose, and permit one bounded recovery.
+                        if op.get('fas_station') and op.get('explicit_path'):
+                            op['direct_failed']=True
                         op.update(status='position_settling',handle=None,started=time.monotonic(),timeout=15.)
                         self.zero_motion();return
                     raise ValueError('导航未能完成，已停止当前任务')
@@ -582,11 +1047,12 @@ class RosBackend(SurveyPathMixin, Node):
                     'quality':op.get('quality'),'position_error':op.get('final_position_error'),
                     'yaw_error_deg':op.get('final_yaw_error_deg'),
                     'stage':('waiting' if op['status']=='recovery_wait' else
-                             'terminal' if self.joint_terminal and op['status'] in ('heading_configuring','heading_wait','heading','heading_settling') else
+                             'terminal' if op.get('heading_controller')=='PointPose' and op['status'] in ('heading_configuring','heading_wait','heading','heading_settling') else
                              'heading' if op['status'] in ('heading_configuring','heading_wait','heading','heading_settling') else 'position'),
                     'detail':op.get('recovery_message')}
 
     def request_speed(self,speed,controller_id='FollowPath'):
+        if controller_id=='FixedHeading':speed=min(speed,.12)
         cap=getattr(self,'survey_speed_limit',None)
         if cap is not None:speed=min(speed,cap)
         # Use DWB's own dynamic limits, preserving angular authority at low vx.
@@ -596,7 +1062,7 @@ class RosBackend(SurveyPathMixin, Node):
         if not self.controller_parameters.service_is_ready():
             return
         request=SetParametersAtomically.Request()
-        if controller_id=='PointPosition' and self.position_is_rpp:
+        if controller_id=='FixedHeading' or (controller_id=='PointPosition' and self.position_is_rpp):
             request.parameters=[Parameter(controller_id+'.desired_linear_vel',value=float(speed)).to_parameter_msg()]
         else:
             request.parameters=[Parameter(k,value=float(speed)).to_parameter_msg()
@@ -604,7 +1070,7 @@ class RosBackend(SurveyPathMixin, Node):
         # This bundled DWB version refreshes max_speed_xy_sq_ in the
         # min_speed_theta branch, not in max_speed_xy's branch. Reapply its
         # configured value last in the same atomic request; no source patch.
-        if not (controller_id=='PointPosition' and self.position_is_rpp):
+        if not (controller_id=='FixedHeading' or (controller_id=='PointPosition' and self.position_is_rpp)):
             request.parameters.append(Parameter(controller_id+'.min_speed_theta',value=float(self.minimum_angular_speed)).to_parameter_msg())
         self.speed_update=self.controller_parameters.call_async(request)
         def done(future):
@@ -631,30 +1097,66 @@ class RosBackend(SurveyPathMixin, Node):
         goal=op['goal'];distance=math.hypot(self.pose[0]-goal['x'],self.pose[1]-goal['y'])
         error=math.atan2(math.sin(goal['yaw']-self.pose[2]),math.cos(goal['yaw']-self.pose[2]))
         stage=refinement_stage(distance,error,
-            position_tolerance=self.arrival.get('final_position_tolerance',.05),yaw_tolerance=op['yaw_tolerance'])
-        if stage=='position' and not (self.joint_terminal and distance<=.20):
+            position_tolerance=op.get('stop_xy_tolerance',self.arrival.get('final_position_tolerance',.05)),yaw_tolerance=op['yaw_tolerance'])
+        if stage=='position' and (not self.joint_terminal or distance>.12 or op.get('joint_adjusted')):
             self.retry_arrival(op,'等待目标和路线可通行，继续修正位置');return
         if stage=='complete':
             self.complete_waypoint(op,now,distance,error);return
+        if op.get('settle_corrections',0)>=1+self.arrival.get('heading_retries',1):
+            self.retry_arrival(op,'停车复核后重新规划到当前采集点');return
         self.begin_waypoint_heading(op)
 
     def begin_waypoint_heading(self,op):
         if not self.follow.server_is_ready():
             op.update(status='failed',error='原生朝向跟踪动作未就绪');self.zero_motion();return
         error=math.atan2(math.sin(op['goal']['yaw']-self.pose[2]),math.cos(op['goal']['yaw']-self.pose[2]))
-        profile=heading_profile(error,op.get('previous_heading_error'),op.get('previous_heading_limit'))
-        if self.joint_terminal and math.hypot(self.pose[0]-op['goal']['x'],self.pose[1]-op['goal']['y'])>.04:
+        distance=math.hypot(self.pose[0]-op['goal']['x'],self.pose[1]-op['goal']['y'])
+        joint=self.joint_terminal and distance>op.get('stop_xy_tolerance',self.arrival.get('final_position_tolerance',.05))
+        speed_profile = heading_profile if joint else in_place_heading_profile
+        profile=speed_profile(error,op.get('previous_heading_error'),op.get('previous_heading_limit'))
+        if joint and distance>.04:
             profile['max_vel_theta']=.20  # Permit a small corrective arc for lateral error.
+        timeout=12. if joint else max(9.,abs(error)/.10+5.)
+        if joint:op['joint_adjusted']=True
         op.update(previous_heading_error=error,previous_heading_limit=profile['max_vel_theta'],
+                  heading_controller='PointPose' if joint else 'PointHeading',
                   status='heading_configuring',handle=None,started=time.monotonic(),
-                  timeout=float(self.arrival.get('heading_timeout',30.)),
+                  timeout=min(timeout,float(self.arrival.get('heading_timeout',30.))),
+                  settle_corrections=op.get('settle_corrections',0)+1,
                   heading_travel=0.,heading_budget=abs(error)+math.radians(45))
         request=SetParametersAtomically.Request()
-        request.parameters=([Parameter('PointPose.wz_max',value=float(profile['max_vel_theta'])).to_parameter_msg()]
-                            if self.joint_terminal else
-                            [Parameter('PointHeading.'+k,value=float(v)).to_parameter_msg() for k,v in profile.items()])
+        if joint:
+            request.parameters=[Parameter('PointPose.wz_max',value=float(profile['max_vel_theta'])).to_parameter_msg()]
+        else:
+            request.parameters=[Parameter('PointHeading.'+k,value=float(v)).to_parameter_msg() for k,v in profile.items()]
+            request.parameters.append(Parameter('point_heading_checker.yaw_goal_tolerance',
+                                                value=op['yaw_tolerance']*.5).to_parameter_msg())
         self.controller_parameters.call_async(request).add_done_callback(
             lambda f,identity=self.active:self.heading_configured(f,identity))
+
+    def settle_waypoint_heading(self,op):
+        op.update(cancel=True,status='canceling',settle_after_cancel='heading_settling')
+        if op['handle']:
+            op['handle'].cancel_goal_async()
+        self.zero_motion()
+
+    def heading_needs_settle(self,op):
+        goal=op['goal']
+        distance=math.hypot(self.pose[0]-goal['x'],self.pose[1]-goal['y'])
+        error=math.atan2(math.sin(goal['yaw']-self.pose[2]),math.cos(goal['yaw']-self.pose[2]))
+        stage=refinement_stage(distance,error,
+            position_tolerance=op.get('stop_xy_tolerance',self.arrival.get('final_position_tolerance',.05)),yaw_tolerance=op['yaw_tolerance'])
+        # Release joint translation as soon as the stopped position is usable.
+        return stage=='complete' or (stage=='heading' and op.get('heading_controller')=='PointPose')
+
+    def should_brake_heading(self, op, now):
+        if op.get('heading_controller')!='PointHeading' or now-self.last_wheel>.18:
+            return False
+        error=math.remainder(op['goal']['yaw']-self.pose[2],2*math.pi)
+        if op.get('fas_station'):
+            return fas_heading_needs_brake(error,self.wheel_yaw_rate,op['yaw_tolerance'],
+                                           now-self.pose_observed_at)
+        return heading_needs_brake(error,self.wheel_yaw_rate,op['yaw_tolerance'])
 
     def heading_configured(self,future,identity):
         with self.lock:
@@ -667,13 +1169,15 @@ class RosBackend(SurveyPathMixin, Node):
             except Exception as e:op.update(status='failed',error=str(e));self.zero_motion()
 
     def send_waypoint_heading(self,op,identity):
+        op.setdefault('first_heading_at',time.monotonic())
         op['heading_attempts']+=1;op['status']='heading_wait'
-        goal=FollowPath.Goal();goal.controller_id='PointPose' if self.joint_terminal else 'PointHeading'
-        goal.goal_checker_id='point_pose_checker' if self.joint_terminal else 'point_heading_checker'
+        goal=FollowPath.Goal();goal.controller_id=op['heading_controller']
+        goal.goal_checker_id='point_pose_checker' if goal.controller_id=='PointPose' else 'point_heading_checker'
         path=NavPath();path.header.frame_id='map';path.header.stamp=self.get_clock().now().to_msg()
         start={'x':self.pose[0],'y':self.pose[1],'yaw':self.pose[2]}
-        path.poses=[self.stamped(start),self.stamped(op['goal'])];goal.path=path
-        self.path=[[start['x'],start['y']],[op['goal']['x'],op['goal']['y']]]
+        target=op['goal'] if goal.controller_id=='PointPose' else {**start,'yaw':op['goal']['yaw']}
+        path.poses=[self.stamped(start),self.stamped(target)];goal.path=path
+        self.path=[[start['x'],start['y']],[target['x'],target['y']]]
         self.follow.send_goal_async(goal).add_done_callback(lambda f:self.heading_accepted(f,identity))
 
     def heading_accepted(self,future,identity):
@@ -703,16 +1207,15 @@ class RosBackend(SurveyPathMixin, Node):
 
     def finish_native_cancellation(self,op):
         stage=op.pop('settle_after_cancel',None)
+        if stage=='transit_recovery':
+            op.update(cancel=False,handle=None)
+            self.retry_arrival(op,'行驶受阻，停车后重试同一目标');return
         if stage:
             op.update(status=stage,cancel=False,handle=None,started=time.monotonic(),timeout=15.)
         else:
             op['status']='failed' if op.get('error') else 'canceled'
 
     def finish_waypoint_heading(self,op,now):
-        self.zero_motion()
-        if not self.pose or not self.stationary_since or now-self.stationary_since<.7:return
-        goal=op['goal'];distance=math.hypot(self.pose[0]-goal['x'],self.pose[1]-goal['y'])
-        error=math.atan2(math.sin(goal['yaw']-self.pose[2]),math.cos(goal['yaw']-self.pose[2]))
         self.finish_waypoint_position(op,now)
 
     def near_waypoint(self,distance,error):
@@ -720,7 +1223,8 @@ class RosBackend(SurveyPathMixin, Node):
                 abs(error)<=self.arrival.get('near_yaw_tolerance',math.radians(5)))
 
     def complete_waypoint(self,op,now,distance,error):
-        quality=('normal' if distance<=self.arrival.get('final_position_tolerance',.05) and abs(error)<=op['yaw_tolerance'] else 'near')
+        strict_yaw = op.get('strict_yaw_tolerance', op['yaw_tolerance'])
+        quality=('normal' if distance<=self.arrival.get('final_position_tolerance',.05) and abs(error)<=strict_yaw else 'near')
         op.update(status='succeeded',finished_at=now,quality=quality,
                   final_position_error=distance,final_yaw_error_deg=math.degrees(abs(error)),
                   actual_pose=list(self.pose))
@@ -757,7 +1261,7 @@ class RosBackend(SurveyPathMixin, Node):
         if op.get('kind')=='survey' and self.pose and math.hypot(self.pose[0]-op['goal']['x'],self.pose[1]-op['goal']['y'])<=op['goal'].get('survey_pass_radius',.5):
             op.update(status='position_settling',handle=None,started=time.monotonic(),timeout=15.)
             self.zero_motion();return
-        if op['sequential']:
+        if op['sequential'] or op.get('kind') in ('return','departure'):
             op['arrival_retries']+=1
             previous=op.get('retry_pose');p=self.pose
             progressed=bool(previous and p and math.hypot(p[0]-previous[0],p[1]-previous[1])>.03)
@@ -775,14 +1279,16 @@ class RosBackend(SurveyPathMixin, Node):
         self.send_arrival_retry(op)
 
     def send_arrival_retry(self,op):
-        if op['sequential']:
+        if op['kind']=='departure':
+            self.send_departure(op)
+            return
+        if op['sequential'] or op.get('kind') in ('return','departure'):
             # Check a fresh native path before starting another motion action.
             # A blocked sampling point remains pending, without repeated BT clears.
-            op.update(status='planning',started=time.monotonic(),timeout=20.,handle=None)
-            goal=ComputePathToPose.Goal();goal.goal=self.stamped(op['goal'])
-            goal.planner_id='WaypointGrid';goal.use_start=False
             identity=self.active
-            self.plan.send_goal_async(goal).add_done_callback(lambda f:self.plan_accepted(f,identity))
+            op.update(settle_corrections=0,joint_adjusted=False)
+            if not self.send_fas_line(identity):
+                self.plan_navigation(identity)
             return
         op.update(status='navigating',started=time.monotonic(),timeout=60.,handle=None)
         self.request_speed(self.arrival['creep_speed'],op['controller_id'])
@@ -820,7 +1326,10 @@ class RosBackend(SurveyPathMixin, Node):
                 return
             op.pop('settle_after_cancel',None)  # A user stop always suppresses recovery.
             op['cancel'] = True
-            if op['status'] in ('planning','configuring','heading_configuring','recovery_wait','nav_settling','spin_settling','position_settling','heading_settling'):
+            if op['status']=='retreating':
+                op['status']='failed' if op.get('error') else 'canceled'
+                self.retreat_permit.publish(String())
+            elif op['status'] in ('planning','validating_leg','configuring','heading_configuring','recovery_wait','nav_settling','spin_settling','position_settling','heading_settling'):
                 op['status'] = 'canceled'  # Planning never commands wheels; callbacks suppress navigation.
             else:
                 op['status'] = 'canceling'
@@ -849,6 +1358,12 @@ class RosBackend(SurveyPathMixin, Node):
 
     def begin_docking(self):
         with self.lock:
+            if getattr(self,'fleet_zone',None):
+                raise ValueError('双车模式暂未配置独立回充区')
+            fas = getattr(self,'fas_lease',None)
+            if fas and fas.owner and not fas.allows('return',self.snapshot()):
+                raise ValueError('等待双车回充走廊的专用许可')
+            self.oem_lease.publish(Bool(data=True))
             self.dock_localization.arm()
             self.oem_ir_enabled=False;self.charge_motion_since=None
             self.native_docking_stage='native_capture'

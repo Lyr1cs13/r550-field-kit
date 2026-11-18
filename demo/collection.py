@@ -21,6 +21,9 @@ from servo_car import CarLink, MODE as SERVO_MODE, measure_station
 from servo_storage import ServoStore
 
 
+BROADCAST_STATION = 'broadcast_station'
+BROADCAST_MODES = ('broadcast', BROADCAST_STATION)
+
 _ports_cache=(0.,[])
 _ports_cache_lock=threading.Lock()
 
@@ -83,7 +86,7 @@ class Collection:
 
     def snapshot(self):
         if self.broadcast:
-            return {**self.config,**self.broadcast.snapshot(),'ports':ws63_ports()}
+            return {**self.broadcast.snapshot(),**self.config,'ports':ws63_ports()}
         with self.lock:
             blocked = self._servo_blocked()
             return {**self.config, **self.status, 'pending':bool(self.link and self.link.pending) or blocked,
@@ -103,7 +106,7 @@ class Collection:
         with self.lock: self.status.update(values)
 
     def configure(self, mode, device='auto'):
-        if mode not in ('timed','ws63','broadcast',SERVO_MODE): raise ValueError('未知停留模式')
+        if mode not in ('timed','ws63',SERVO_MODE,*BROADCAST_MODES): raise ValueError('未知停留模式')
         if device != 'auto' and not (device.startswith('/dev/serial/by-id/') or device.startswith('/dev/ttyUSB') or device.startswith('/dev/ttyACM')):
             raise ValueError('请选择 /dev/serial/by-id/ 下的 WS63 串口')
         if self.broadcast:
@@ -124,7 +127,7 @@ class Collection:
     def prepare(self, points):
         self.require_motion_allowed()
         if self.broadcast:return self.broadcast.prepare(points)
-        if self.config['mode']=='broadcast':raise ValueError('广播接收组件尚未连接就绪，请等待握手和基站数据')
+        if self.config['mode'] in BROADCAST_MODES:raise ValueError('广播接收组件尚未连接就绪，请等待握手和基站数据')
         with self.lock:
             if self.config['mode'] not in ('ws63', SERVO_MODE): return
             if not self.status['connected'] or self.status['stage'] not in ('ready','done'):
@@ -171,7 +174,7 @@ class Collection:
 
     def begin(self, target, health, visit_id=None):
         if self.broadcast:return self.broadcast.begin(target,health)
-        if self.config['mode']=='broadcast':raise ValueError('广播接收组件尚未就绪')
+        if self.config['mode'] in BROADCAST_MODES:raise ValueError('广播接收组件尚未就绪')
         pose = health.get('pose')
         if not health.get('stationary') or not health.get('localization_confirmed') or not health.get('ready'):
             raise ValueError('到点停稳及定位确认之前不能启动采集')
@@ -267,10 +270,10 @@ class Collection:
         if self.stream: self.stream.close()
         self.stream = None; self.link = None; self.servo_link = None
         if self.config['mode']=='timed': return
-        if self.config['mode']=='broadcast':
+        if self.config['mode'] in BROADCAST_MODES:
             from broadcast_survey import BroadcastSurvey
-            self.broadcast=BroadcastSurvey(self.directory,self.grid,self.config['device'],self.factory)
-            self.broadcast.moving_demo=True
+            self.broadcast=BroadcastSurvey(self.directory,self.grid,self.config['device'],self.factory,
+                                           moving_demo=self.config['mode']=='broadcast')
             if hasattr(self,'anchor_metadata'):self.broadcast.anchor_metadata=dict(self.anchor_metadata)
             return
         self.stream, device = open_ws63(self.config['device'], self.factory)

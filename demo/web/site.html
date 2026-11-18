@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>新场地建图</title>
+  <link rel="stylesheet" href="/site.css">
+  <script defer src="/site.js"></script>
+</head>
+<body>
+  <header>
+    <h1>新场地建图</h1>
+    <span id="connection" class="badge">连接中</span>
+    <a id="cruise" href="#">巡航面板 ↗</a>
+    <button id="stop" class="danger">停车并暂停建图</button>
+  </header>
+  <main>
+    <aside>
+      <section>
+        <h2>充电桩</h2>
+        <label class="field" for="name">场地名称<input id="name" maxlength="40" placeholder="例如 新实验室"></label>
+        <label class="check"><input type="checkbox" id="seated"> 车尾已贴合，车头朝向场内</label>
+        <button id="new" class="primary">将当前位置设为桩位</button>
+        <button id="restore">手动放回后校准</button>
+      </section>
+      <section>
+        <h2>建图与回桩</h2>
+        <div class="row">
+          <button id="manual">遥控建图</button>
+          <button id="explore" class="primary">开始自动探索</button>
+        </div>
+        <div id="drive" hidden>
+          <div class="direction">
+            <button id="forward" data-drive="forward" aria-label="前进">↑</button>
+            <button id="left" data-drive="left" aria-label="左转">←</button>
+            <button id="drive-stop" data-drive="stop" aria-label="停止遥控">■</button>
+            <button id="right" data-drive="right" aria-label="右转">→</button>
+            <button id="back" data-drive="back" aria-label="后退">↓</button>
+          </div>
+          <p class="help">按住按钮或方向键，松手停车</p>
+        </div>
+        <button id="return">主动回充</button>
+        <button id="save">保存检查点</button>
+        <button id="leave">结束本次建图</button>
+      </section>
+      <section>
+        <h2>巡航场地</h2>
+        <button id="export">将检查点保存为巡航场地</button>
+        <label class="field" for="scene">已保存场地<select id="scene"></select></label>
+        <button id="activate">启用所选场地</button>
+      </section>
+    </aside>
+    <section class="map-panel">
+      <div class="map-header">
+        <div>
+          <h2 id="map-title">现场地图</h2>
+          <p id="status" role="status"></p>
+        </div>
+        <div class="row">
+          <button id="region" aria-pressed="false">框选探索范围</button>
+          <button id="fit">适配地图</button>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="map" aria-label="实时建图、车身、充电桩与探索范围"></canvas>
+        <p id="empty">贴合充电桩后标定当前位置，开始生成地图。</p>
+      </div>
+      <div class="legend"><span class="wall">障碍</span><span class="unknown">未知</span><span class="car">车身</span><span class="dock">充电桩</span><span class="range">探索范围</span><span class="radar">雷达</span></div>
+    </section>
+  </main>
+</body>
+</html>

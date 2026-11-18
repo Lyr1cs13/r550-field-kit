@@ -4,3 +4,11 @@ config SAMPLE_SUPPORT_BEACON_SURVEY_TX
 config SAMPLE_SUPPORT_BEACON_SURVEY_RX
     bool "R550 mobile RSSI broadcast receiver (no connection)"
     depends on AT_SUPPORT_PLT
+
+config SAMPLE_SUPPORT_FAS_VEHICLE_A
+    bool "R550 FAS vehicle A transmitter (UART-controlled)"
+    depends on AT_SUPPORT_PLT
+
+config SAMPLE_SUPPORT_FAS_VEHICLE_B
+    bool "R550 FAS vehicle B transmitter (UART-controlled)"
+    depends on AT_SUPPORT_PLT

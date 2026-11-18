@@ -10,6 +10,44 @@ main{max-width:1920px;padding:22px 26px 18px;margin:auto;display:grid;grid-templ
 aside>section{flex-shrink:0}.status-card h2{color:#fff}.status-card .progress{display:block;height:auto;background:transparent;overflow:visible;border-radius:0}.status-card .telemetry strong{color:#fff}
 
 .loc-help{margin-top:9px;font-size:10px;color:var(--muted)}.loc-help summary{cursor:pointer;color:var(--muted);padding:0;line-height:1.7}.loc-help .hint{margin:7px 0 0}.connection-status.offline-mode i{background:#d5a24c}
+.legend .charger-shape{background:#354558;border-top:2px solid #b9c6d4}
+.legend .track{background:#087f89}
+.small-badge.attention{background:#fff1d7;color:#795117}
 @media(max-height:850px) and (min-width:901px){header{height:72px}main{padding:15px 18px;gap:17px}aside{max-height:calc(100vh - 104px);gap:10px}.status-card{padding:13px 15px}.status-card h2{font-size:21px;margin:6px 0}.progress{margin:6px 0 9px}.telemetry{padding-top:9px}.localization,.mission-controls,.points-section{padding:12px 14px}.section-kicker{margin-bottom:6px}.localization>p{margin:7px 0 8px}.mission-controls>.primary{padding:9px}.check{margin-bottom:9px}.canvas-wrap{min-height:340px;height:calc(100vh - 270px)}.map-header{padding:13px 16px}.map-header p{font-size:9px}.legend{padding:10px 16px}.workspace{gap:12px}}
 
 .collection-controls{padding:15px 16px}.collection-controls>label{display:block;font-size:10px;color:var(--muted);margin:8px 0}.collection-controls .form-select,.collection-controls .form-control{width:100%;font-size:11px;margin-top:5px;padding:7px 9px;background-color:var(--field);color:var(--ink);border-color:var(--line)}.collection-controls>.hint{margin:8px 0;overflow-wrap:anywhere}.collection-controls .loc-help{margin:9px 0}.collection-controls>button{font-size:11px;padding:8px}.collection-controls #collection-export{margin-top:8px}
+
+[data-vehicle-link][aria-disabled=true]{color:var(--muted);text-decoration:none;cursor:default}
+
+header{height:62px}
+.status-card h2{margin:0 0 7px}
+.status-card .telemetry{margin-top:10px}
+.localization .two-buttons,.mission-controls>.section-title{margin-top:10px}
+.mission-controls>.section-title{margin-top:0;margin-bottom:8px}
+.task-buttons{display:grid;grid-template-columns:1fr 1fr 1.35fr;gap:6px;margin-top:7px}
+.task-buttons button{padding:7px 4px;font-size:11px;white-space:nowrap}
+.task-buttons .icon{width:14px;height:14px}
+.task-options{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:9px}
+.task-options .check{margin:0}
+#endurance-status{margin:8px 0 0}
+.collection-controls{padding:12px 16px}
+.feature-group>summary,.feature-subgroup>summary{cursor:pointer;color:var(--ink)}
+.feature-group>summary{display:flex;gap:7px;align-items:center;list-style:none}
+.feature-group>summary::before{content:'›';font-size:17px;line-height:1;color:var(--muted)}
+.feature-group[open]>summary::before{transform:rotate(90deg)}
+.feature-group>summary .small-badge{margin-left:auto;max-width:80%;text-align:right}
+.feature-fields{margin-top:11px}
+.feature-fields>label,.feature-subgroup label{display:block;font-size:11px;color:var(--muted);margin:0 0 9px}
+.feature-fields>.check{display:flex;align-items:center;margin:9px 0}
+.feature-fields>button,.feature-subgroup>button{font-size:11px;padding:7px}
+.feature-fields>.hint{margin:7px 0 0;overflow-wrap:anywhere}
+.feature-subgroup{border-top:1px solid var(--line);margin-top:9px;padding-top:8px}
+.feature-subgroup>summary{font-size:11px}
+.feature-subgroup[open]>summary{margin-bottom:8px}
+.feature-subgroup>a{display:block;margin-top:7px;font-size:11px}
+.feature-subgroup .two-buttons{margin-bottom:9px}
+.point-tools .file-actions{align-items:end;margin-top:8px}
+.point-tools .file-actions>label{margin:0}
+.point-tools input,.point-tools .file-actions>button{font-size:11px}
+.point-tools #recover-points{margin-top:8px}
+.points-section .empty{margin-top:9px;padding:10px}

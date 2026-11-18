@@ -11,11 +11,28 @@
 #include "sle_errcode.h"
 #include "app_init.h"
 
+#if defined(CONFIG_SAMPLE_SUPPORT_FAS_VEHICLE_A) || defined(CONFIG_SAMPLE_SUPPORT_FAS_VEHICLE_B)
+#define FAS_VEHICLE_TX
+#include "at.h"
+#include "tcxo.h"
+#if defined(CONFIG_SAMPLE_SUPPORT_FAS_VEHICLE_A)
+#define FAS_ROLE "A"
+#define FAS_SUFFIX 0xA1
+#else
+#define FAS_ROLE "B"
+#define FAS_SUFFIX 0xB1
+#endif
+#define BEACON_ADDR_LAST FAS_SUFFIX
+#define SLE_RSSI_SCAN_DEVICE_NAME "R550_FAS_" FAS_ROLE
+#else
+#define BEACON_ADDR_LAST 0x01
+#define SLE_RSSI_SCAN_DEVICE_NAME "R550_BC01"
+#endif
+
 #define SLE_RSSI_SCAN_ADV_LOG          "[sle rssi scan adv]"
 #define SLE_RSSI_SCAN_ADV_HANDLE       1
-#define SLE_RSSI_SCAN_ADV_INTERVAL     0x0320U /* 100 ms: interval unit is 125 us */
+#define SLE_RSSI_SCAN_ADV_INTERVAL     0x0028U /* 5 ms: 40 units of 125 us */
 #define SLE_RSSI_SCAN_ADV_DATA_MAX_LEN 32U
-#define SLE_RSSI_SCAN_DEVICE_NAME      "R550_BC01"
 #define SLE_RSSI_SCAN_ADV_HEADER_LEN   2U
 
 enum {
@@ -51,13 +68,13 @@ static uint16_t sle_rssi_scan_build_adv_data(uint8_t *data, uint16_t capacity)
     return (uint16_t)(index + name_len);
 }
 
-static errcode_t sle_rssi_scan_configure_and_start_advertising(void)
+static errcode_t sle_rssi_scan_configure(void)
 {
     sle_announce_param_t param = {0};
     sle_announce_data_t announce_data = {0};
     uint8_t data[SLE_RSSI_SCAN_ADV_DATA_MAX_LEN] = {0};
     uint8_t empty_seek_rsp_data = 0;
-    const uint8_t local_addr[SLE_ADDR_LEN] = {0x52, 0x35, 0x35, 0x30, 0x00, 0x01};
+    const uint8_t local_addr[SLE_ADDR_LEN] = {0x52, 0x35, 0x35, 0x30, 0x00, BEACON_ADDR_LAST};
     errcode_t ret;
 
     param.announce_handle = SLE_RSSI_SCAN_ADV_HANDLE;
@@ -87,29 +104,110 @@ static errcode_t sle_rssi_scan_configure_and_start_advertising(void)
     announce_data.announce_data = data;
     announce_data.seek_rsp_data_len = 0;
     announce_data.seek_rsp_data = &empty_seek_rsp_data;
-    ret = sle_set_announce_data(SLE_RSSI_SCAN_ADV_HANDLE, &announce_data);
-    if (ret != ERRCODE_SLE_SUCCESS) {
-        osal_printk("%s set announce data failed: 0x%x\r\n", SLE_RSSI_SCAN_ADV_LOG, ret);
-        return ret;
-    }
+    return sle_set_announce_data(SLE_RSSI_SCAN_ADV_HANDLE, &announce_data);
+}
 
-    ret = sle_start_announce(SLE_RSSI_SCAN_ADV_HANDLE);
-    osal_printk("%s non-connectable announcement start, name=%s, status=0x%x\r\n",
-                SLE_RSSI_SCAN_ADV_LOG, SLE_RSSI_SCAN_DEVICE_NAME, ret);
+static errcode_t start_announce(void)
+{
+    errcode_t ret = sle_start_announce(SLE_RSSI_SCAN_ADV_HANDLE);
+    osal_printk("%s non-connectable announcement start, name=%s, interval_us=%u, status=0x%x\r\n",
+                SLE_RSSI_SCAN_ADV_LOG, SLE_RSSI_SCAN_DEVICE_NAME, SLE_RSSI_SCAN_ADV_INTERVAL * 125U, ret);
     return ret;
 }
+
+#ifdef FAS_VEHICLE_TX
+#define FAS_TX_LEASE_US 5000000U
+static volatile bool g_ready;
+static volatile bool g_enabled;
+static volatile bool g_requested;
+static bool g_lease;
+static uint32_t g_last_renewal;
+
+static at_ret_t fas_hello(void)
+{
+    uapi_at_print("+FASHELLO:1,%s,52:35:35:30:00:%02x,%u,%u\r\n",
+                  FAS_ROLE, FAS_SUFFIX, g_ready ? 1U : 0U, g_enabled ? 1U : 0U);
+    return AT_RET_OK;
+}
+
+static at_ret_t fas_on(void)
+{
+    if (!g_ready) {
+        return AT_RET_CHANNEL_NOT_INIT;
+    }
+    osal_kthread_lock();
+    g_last_renewal = (uint32_t)uapi_tcxo_get_us();
+    g_lease = true;
+    osal_kthread_unlock();
+    return AT_RET_OK;
+}
+
+static at_ret_t fas_off(void)
+{
+    osal_kthread_lock();
+    g_lease = false;
+    osal_kthread_unlock();
+    return AT_RET_OK;
+}
+
+static const at_cmd_entry_t g_commands[] = {
+    {.name = "FASHELLO", .cmd_id = 0x7180, .cmd = fas_hello},
+    {.name = "FASON", .cmd_id = 0x7181, .cmd = fas_on},
+    {.name = "FASOFF", .cmd_id = 0x7182, .cmd = fas_off},
+};
+
+static void announce_disable(uint32_t announce_id, errcode_t status)
+{
+    (void)announce_id;
+    if (status == ERRCODE_SLE_SUCCESS) {
+        g_enabled = false;
+    } else {
+        g_requested = true;
+    }
+}
+
+static void maintain_air_window(void)
+{
+    osal_kthread_lock();
+    bool wanted = g_lease && (uint32_t)((uint32_t)uapi_tcxo_get_us() - g_last_renewal) < FAS_TX_LEASE_US;
+    if (!wanted) {
+        g_lease = false;
+    }
+    osal_kthread_unlock();
+    if (g_ready && wanted != g_requested) {
+        g_requested = wanted;
+        errcode_t status = wanted ? start_announce() : sle_stop_announce(SLE_RSSI_SCAN_ADV_HANDLE);
+        if (status != ERRCODE_SLE_SUCCESS) {
+            g_requested = !wanted;
+        }
+    }
+}
+#endif
 
 static void sle_rssi_scan_announce_enable_cb(uint32_t announce_id, errcode_t status)
 {
     osal_printk("%s announcement enabled, id=%u, status=0x%x\r\n",
                 SLE_RSSI_SCAN_ADV_LOG, (unsigned int)announce_id, status);
+#ifdef FAS_VEHICLE_TX
+    g_enabled = status == ERRCODE_SLE_SUCCESS;
+    if (!g_enabled) {
+        g_requested = false;
+    }
+#endif
 }
 
 static void sle_rssi_scan_sle_enable_cb(errcode_t status)
 {
     osal_printk("%s SLE enabled, status=0x%x\r\n", SLE_RSSI_SCAN_ADV_LOG, status);
     if (status == ERRCODE_SLE_SUCCESS) {
-        (void)sle_rssi_scan_configure_and_start_advertising();
+        errcode_t config_status = sle_rssi_scan_configure();
+#ifdef FAS_VEHICLE_TX
+        g_ready = config_status == ERRCODE_SLE_SUCCESS;
+#else
+        if (config_status == ERRCODE_SLE_SUCCESS) {
+            (void)start_announce();
+        }
+#endif
     }
 }
 
@@ -120,6 +218,9 @@ errcode_t sle_rssi_scan_advertiser_init(void)
 
     callbacks.sle_enable_cb = sle_rssi_scan_sle_enable_cb;
     callbacks.announce_enable_cb = sle_rssi_scan_announce_enable_cb;
+#ifdef FAS_VEHICLE_TX
+    callbacks.announce_disable_cb = announce_disable;
+#endif
     ret = sle_announce_seek_register_callbacks(&callbacks);
     if (ret != ERRCODE_SLE_SUCCESS) {
         osal_printk("%s register callbacks failed: 0x%x\r\n", SLE_RSSI_SCAN_ADV_LOG, ret);
@@ -133,7 +234,26 @@ errcode_t sle_rssi_scan_advertiser_init(void)
     return ret;
 }
 
-static void *fixed_beacon_task(const char *arg) { (void)arg;osal_msleep(1200);sle_rssi_scan_advertiser_init();return NULL; }
+static void *fixed_beacon_task(const char *arg)
+{
+    (void)arg;
+    osal_msleep(1200);
+#ifdef FAS_VEHICLE_TX
+    if (uapi_at_cmd_table_register(g_commands, sizeof(g_commands)/sizeof(g_commands[0]), sizeof(uint32_t)) != 0) {
+        return NULL;
+    }
+#endif
+    if (sle_rssi_scan_advertiser_init() != ERRCODE_SLE_SUCCESS) {
+        return NULL;
+    }
+#ifdef FAS_VEHICLE_TX
+    for (;;) {
+        maintain_air_window();
+        osal_msleep(50);
+    }
+#endif
+    return NULL;
+}
 static void fixed_beacon_start(void) {
  osal_kthread_lock();osal_task *t=osal_kthread_create((osal_kthread_handler)fixed_beacon_task,0,"BeaconTx",0x1400);
  if(t!=NULL) { osal_kthread_set_priority(t,26); }

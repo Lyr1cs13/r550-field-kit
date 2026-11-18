@@ -1,5 +1,6 @@
 """Exercise the real bridge update with fake publishers; never creates a ROS node."""
 import importlib.util
+from collections import deque
 from pathlib import Path
 import sys
 import threading
@@ -19,7 +20,8 @@ class BridgeContactTests(unittest.TestCase):
             s,ir,motion=self.fixture();now=time.monotonic();stamp=time.time();cancels=[]
             s.docking_since=None;s.stationary_since=now-1;s.joint_terminal=True;s.precision_arrival=True
             s.arrival={'final_position_tolerance':.05};s.active='point'
-            op={'status':'heading','started':now,'timeout':30.,'goal':{'x':0.,'y':0.,'yaw':0.},
+            op={'status':'heading','heading_controller':'PointHeading','heading_budget':1.,
+                'started':now,'timeout':30.,'goal':{'x':0.,'y':0.,'yaw':0.},
                 'yaw_tolerance':.05235987756,'handle':SimpleNamespace(cancel_goal_async=lambda:cancels.append(True))}
             s.ops={'point':op}
             transform=SimpleNamespace(translation=SimpleNamespace(x=distance,y=0.),
@@ -36,21 +38,28 @@ class BridgeContactTests(unittest.TestCase):
         from ros_backend import RosBackend
         from charge_confirmation import ChargeConfirmation,NativeDockingWatchdog
         from geometry_msgs.msg import Twist
+        from motion_health import LocalizationGuard
         now=time.monotonic();ir=[];motion=[]
         def missing(*args):raise RuntimeError('No transform needed in this test')
         s=SimpleNamespace(lock=threading.RLock(),update_laser=lambda:None,
+            localization_guard=LocalizationGuard(),covariance=[.001]*3,scan_agreement=.9,scan_known_count=100,
+            oem_lease=SimpleNamespace(publish=lambda message:None),
+            survey_route_tick=lambda op:None,detect_wheel_slip=lambda now:None,
             charging=False,last_charge=now,current=.18,voltage=11.8,
             last_numeric={'current':now,'voltage':now},last_wheel=now,stationary_since=None,
             charge_confirmation=ChargeConfirmation(),native_docking_watchdog=NativeDockingWatchdog(),
             last_scan=now,last_ir=now,ir_count=3,pose=None,dock_pose=[0.,0.,0.],wheel_distance=0.,
             native_docking_stage="native_capture",charge_motion_since=None,
-            tf=SimpleNamespace(lookup_transform=missing),initial_request=None,active=None,
+            tf=SimpleNamespace(lookup_transform=missing),initial_request=None,active=None,track=deque(),
             docking_since=now-1,docking_ir_lost_since=None,
             ir=SimpleNamespace(publish=lambda m:ir.append(m.data)),
             cmd=SimpleNamespace(publish=lambda m:motion.append((m.linear.x,m.angular.z))),
             update_dock_localization=lambda now:None)
         s.native_docking_watchdog.reset(now,0.)
         s.update_oem_docking=lambda stamp,current:RosBackend.update_oem_docking(s,stamp,current)
+        s.heading_needs_settle=lambda op:RosBackend.heading_needs_settle(s,op)
+        s.settle_waypoint_heading=lambda op:RosBackend.settle_waypoint_heading(s,op)
+        s.should_brake_heading=lambda op,now:False
         s.zero_motion=lambda:s.cmd.publish(Twist())
         s.set_oem_ir=lambda enabled,now:RosBackend.set_oem_ir(s,enabled,now)
         return s,ir,motion

@@ -27,8 +27,8 @@ class PortableSceneTests(unittest.TestCase):
         self.root=Path(self.tmp.name);(self.root/'scenes').mkdir();(self.root/'demo/assets').mkdir(parents=True)
         self.previous=scene.ROOT;scene.ROOT=self.root;self.addCleanup(setattr,scene,'ROOT',self.previous)
         source=self.root/'source';source.mkdir()
-        shutil.copy2(HERE/'assets/WHEELTEC.pgm',source/'map.pgm')
-        value=yaml.safe_load((HERE/'assets/map.yaml').read_text());value['image']='map.pgm';value['origin']=[100.,200.,0.]
+        shutil.copy2(ROOT/'scenes/demo-room/WHEELTEC.pgm',source/'map.pgm')
+        value=yaml.safe_load((ROOT/'scenes/demo-room/map.yaml').read_text());value['image']='map.pgm';value['origin']=[100.,200.,0.]
         self.map=source/'map.yaml';self.map.write_text(yaml.safe_dump(value))
 
     def test_import_activate_uses_new_geometry_and_unset_dock(self):
@@ -63,7 +63,7 @@ class PortableSceneTests(unittest.TestCase):
         with self.assertRaises(ValueError):new.validate(102.25,202.25)
 
     def test_no_dock_return_until_scene_calibration(self):
-        g=MapGrid(HERE/'assets');backend=ControlledBackend();backend.dock_calibrated=False
+        g=MapGrid(ROOT/'scenes/demo-room');backend=ControlledBackend();backend.dock_calibrated=False
         m=Mission(g,backend,self.root/'mission');self.addCleanup(m.collection.close)
         with self.assertRaisesRegex(ValueError,'标定'):m.return_to_dock()
         self.assertEqual(backend.calls,[])

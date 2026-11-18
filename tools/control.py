@@ -2,12 +2,15 @@
 """Small command-line client for the same controls as the browser panel."""
 import argparse
 import json
+import os
 import urllib.request
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['status','stop','pause','resume','confirm','initial_dock','return','start']);p.add_argument('--host',default='127.0.0.1');a=p.parse_args()
-    base=f'http://{a.host}:8890'
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['status','stop','pause','resume','confirm','initial_dock','return','start']);p.add_argument('--host',default='127.0.0.1')
+    p.add_argument('--port',type=int,default=os.environ.get('R550_PANEL_PORT',8890))
+    a=p.parse_args()
+    base=f'http://{a.host}:{a.port}'
     s=json.load(urllib.request.urlopen(base+'/api/state',timeout=4))
     if a.action!='status':
         req=urllib.request.Request(base+'/api/command',data=json.dumps({'action':a.action}).encode(),headers={'Content-Type':'application/json','X-Control-Token':s['control_token']},method='POST')

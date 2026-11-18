@@ -14,8 +14,8 @@ class SurveyPathTests(unittest.TestCase):
   for path,end in [([[0,0],[1,1]],[1,1]),([[0,0],[.02,0]],[.2,0])]:
    with self.assertRaises(ValueError):checked_path(g,path,end)
  def test_saved_parallel_route_clearance_and_hazard(self):
-  demo=Path(__file__).resolve().parents[1];r=json.loads((demo/'assets/survey_route.json').read_text(encoding='utf-8'));p=r['points'][0]
-  path=checked_path(MapGrid(demo/'assets'),p['survey_path'],[p['x'],p['y']])
+  demo=Path(__file__).resolve().parents[1];r=json.loads((demo.parent/'scenes/demo-room/survey_route.json').read_text(encoding='utf-8'));p=r['points'][0]
+  path=checked_path(MapGrid(demo.parent/'scenes/demo-room'),p['survey_path'],[p['x'],p['y']])
   self.assertEqual(len(r['points']),2)
   self.assertLess(math.dist(path[-1],[4.8,0]),.03)
   self.assertTrue(any(abs(y+7.5)<.01 and 1<x<3 for x,y in path))

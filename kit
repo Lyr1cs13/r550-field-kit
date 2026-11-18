@@ -3,12 +3,18 @@ set -eo pipefail
 export R550_KIT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$R550_KIT_ROOT"
 export R550_MAPPING_STATE="$R550_KIT_ROOT/state/mapping"
+[[ ! -f state/runtime.env ]] || source state/runtime.env
+session_prefix=${R550_SCREEN_PREFIX:-r550}
 command=${1:-help}; shift || true
 ros_env() {
   source /opt/ros/humble/setup.bash
   source "$HOME/wheeltec_ros2/install/setup.bash"
   [[ ! -f "$R550_KIT_ROOT/vendor_nav2_overlay/install/setup.bash" ]] || source "$R550_KIT_ROOT/vendor_nav2_overlay/install/setup.bash"
-  [[ ! -f "$HOME/.config/wheeltec_ros/network.sh" ]] || source "$HOME/.config/wheeltec_ros/network.sh"
+  if [[ -f "$R550_KIT_ROOT/state/network.sh" ]]; then
+    source "$R550_KIT_ROOT/state/network.sh"
+  elif [[ -f "$HOME/.config/wheeltec_ros/network.sh" ]]; then
+    source "$HOME/.config/wheeltec_ros/network.sh"
+  fi
 }
 case "$command" in
   setup) exec bash tools/install.sh "$@" ;;
@@ -18,6 +24,7 @@ case "$command" in
   test) exec python3 -m unittest discover -s demo/tests ;;
   postprocess) exec python3 tools/postprocess_heatmap.py "$@" ;;
   doctor) if [[ "${1:-}" != --offline ]]; then ros_env; fi; exec python3 tools/doctor.py "$@" ;;
+  site) ros_env; exec bash tools/start_site.sh ;;
   nav)
     ros_env
     [[ -f state/active_scene.json ]] || { echo '先导入并启用新场景：./kit scene new ...；./kit scene use ...'; exit 1; }
@@ -30,20 +37,22 @@ case "$command" in
     case "$mode" in
       new)
         [[ "${1:-}" == --at-dock ]] || { echo '车尾贴合新桩、车头朝场内后运行：./kit mapping new --at-dock [--auto]'; exit 1; }
+        [[ ! -f state/site-mapping/owns-robot ]] || { echo '请先在新场地页面退出建图'; exit 1; }
         if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|demo/server.py' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
         python3 tools/mapping_state.py
         automatic=false; [[ "${2:-}" != --auto ]] || automatic=true
         mkdir -p state/logs
-        screen -dmS r550_mapping bash -c 'exec ros2 launch "$1/rrt_mapping/mapping.launch.py" automatic:="$2" > "$1/state/logs/mapping.log" 2>&1' _ "$R550_KIT_ROOT" "$automatic"
+        screen -dmS "${session_prefix}_mapping" bash -c 'exec ros2 launch "$1/rrt_mapping/mapping.launch.py" automatic:="$2" > "$1/state/logs/mapping.log" 2>&1' _ "$R550_KIT_ROOT" "$automatic"
         echo '建图已启动；在电脑上运行 ./kit view。自动模式选四角、第五点后执行 ./kit explore resume。' ;;
       resume)
         [[ -n "${1:-}" ]] || { echo './kit mapping resume maps/checkpoint_xxx'; exit 1; }
+        [[ ! -f state/site-mapping/owns-robot ]] || { echo '请先在新场地页面退出建图'; exit 1; }
         if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|demo/server.py' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
         checkpoint=$(realpath "$1");mkdir -p state/logs
         [[ -f "$checkpoint/manifest.json" ]] || { echo '缺少检查点 manifest.json'; exit 1; }
         mkdir -p state/mapping
         for f in dock_start.json threshold_avoid.json threshold_keepout.yaml threshold_keepout.pgm; do [[ ! -f "$checkpoint/$f" ]] || cp "$checkpoint/$f" state/mapping/; done
-        screen -dmS r550_mapping bash -c 'exec ros2 launch "$1/rrt_mapping/mapping.launch.py" automatic:=true checkpoint:="$2" > "$1/state/logs/mapping.log" 2>&1' _ "$R550_KIT_ROOT" "$checkpoint"
+        screen -dmS "${session_prefix}_mapping" bash -c 'exec ros2 launch "$1/rrt_mapping/mapping.launch.py" automatic:=true checkpoint:="$2" > "$1/state/logs/mapping.log" 2>&1' _ "$R550_KIT_ROOT" "$checkpoint"
         echo '已恢复检查点，默认暂停。核对红点与墙线后重新选四角和第五点，再继续探索。' ;;
       save) exec python3 rrt_mapping/session_checkpoint.py save "$@" ;;
       pause) exec python3 rrt_mapping/session_checkpoint.py pause ;;
@@ -61,7 +70,7 @@ case "$command" in
     ros_env
     python3 tools/control.py stop 2>/dev/null || true
     python3 tools/hold.py
-    for session in r550_nav r550_ui r550_mapping; do screen -S "$session" -p 0 -X stuff $'\003' 2>/dev/null || true; done
+    for suffix in nav ui mapping motion_gate scan_filter; do screen -S "${session_prefix}_$suffix" -p 0 -X stuff $'\003' 2>/dev/null || true; done
     echo '已请求停车并关闭本工程会话。' ;;
-  *) printf '%s\n' './kit setup robot|viewer' './kit network --interface NIC --peer IP [--domain 20]' './kit doctor | preview | view | teleop' './kit mapping new --at-dock [--auto] | resume CHECKPOINT | save' './kit explore pause|resume|return' './kit scene new|use|dock|keepout|survey|list' './kit nav | api status|initial_dock|confirm|return' './kit servo-probe [--device PORT]' './kit c5-collector --help | c5-config URL' './kit hold | stop | test' ;;
+  *) printf '%s\n' './kit setup robot|viewer' './kit network --interface NIC --peer IP [--domain 20]' './kit doctor | preview | view | teleop' './kit mapping new --at-dock [--auto] | resume CHECKPOINT | save' './kit explore pause|resume|return' './kit scene new|use|dock|keepout|survey|list' './kit site | nav | api status|initial_dock|confirm|return' './kit servo-probe [--device PORT]' './kit c5-collector --help | c5-config URL' './kit hold | stop | test' ;;
 esac

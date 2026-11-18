@@ -103,10 +103,40 @@ class DemoTests(unittest.TestCase):
         self.backend.confirmed=True;m.start();self.backend.ready=False;m.tick()
         self.assertEqual(m.phase,'canceling');self.assertEqual(self.backend.ops[m.operation]['status'],'canceling')
 
+    def test_sensor_recovery_waits_for_cancel_and_stability_then_same_point(self):
+        m=self.mission;m.start();old=m.operation
+        self.backend.ready=False;m.tick()
+        self.clock.advance(10);m.tick();self.assertEqual(len(self.backend.calls),1)
+        self.backend.ops[old]['status']='canceled';m.tick()
+        self.assertEqual(m.phase,'paused_navigation')
+        self.backend.ready=True;m.tick();self.clock.advance(2.9);m.tick()
+        self.assertEqual(len(self.backend.calls),1)
+        self.clock.advance(.2);m.tick()
+        self.assertEqual(self.backend.calls[-1][0]['id'],'a')
+        self.assertEqual(m.index,0)
+
+    def test_low_battery_resume_preserves_pending_point_and_stop_revokes(self):
+        from endurance import Endurance
+        m=self.mission
+        m.endurance=Endurance(dict(enabled=True,low_voltage=10.,resume_voltage=12.,low_hold_seconds=20.,charge_hold_seconds=120.))
+        m.start();self.backend.voltage=9.9;m.tick();self.clock.advance(21);m.tick()
+        self.assertTrue(m.endurance.resuming)
+        self.assertEqual(m.index,0);self.assertEqual(m.phase,'canceling')
+        checkpoint=json.loads((Path(self.directory.name)/'mission_checkpoint.json').read_text(encoding='utf-8'))
+        self.assertEqual(checkpoint['run'][checkpoint['index']]['id'],'a')
+        self.backend.ops[m.operation]['status']='canceled';m.tick()
+        self.assertEqual(m.phase,'returning')
+        m.stop();self.assertFalse(m.endurance.resuming)
+        self.assertFalse((Path(self.directory.name)/'mission_checkpoint.json').exists())
+
     def test_failed_contact_retries_the_return_flow_once(self):
         m=self.mission;self.backend.pose=[.6,0.,0.];self.backend.ir=3
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.9}
         m.phase='docking';m._fail('对接超时，未收到充电反馈，已停止')
         m.tick();self.clock.advance(3);m.tick()
+        self.assertFalse(self.backend.docking_started)
+        self.clock.advance(5.1);m.tick()
         self.assertEqual(m.dock_retry_count,1);self.assertEqual(m.phase,'docking')
         m._fail('对接超时，未收到充电反馈，已停止');self.clock.advance(10);m.tick()
         self.assertEqual(m.phase,'failed');self.assertFalse(m.dock_retry_pending)
@@ -115,6 +145,48 @@ class DemoTests(unittest.TestCase):
         m=self.mission;m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
         self.backend.charging=True;m.tick()
         self.assertEqual(m.phase,'docked');self.assertFalse(self.backend.docking_started)
+
+    def test_transient_charge_signal_disarms_retry_even_when_it_drops(self):
+        m=self.mission
+        raw=False
+        self.backend.pose=[.6,0.,0.];self.backend.ir=3
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'charge_contact_live':raw,
+            'charge_telemetry_fresh':True,'scan_map_agreement':.9,'charging_stable':self.backend.charging}
+        m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
+        m.tick();self.clock.advance(5.)
+        raw=True;m.tick()
+        raw=False;self.clock.advance(4.);m.tick()
+        self.assertFalse(self.backend.docking_started)
+        self.assertFalse(m.dock_retry_pending)
+        self.backend.charging=True;m.tick()
+        self.assertEqual(m.phase,'docked')
+
+    def test_unpowered_seated_pose_cannot_launch_automatic_retry(self):
+        m=self.mission;self.backend.pose=[-.09,.02,0.];self.backend.ir=3
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.93}
+        m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
+        m.tick();self.clock.advance(8.1);m.tick()
+        self.assertFalse(m.dock_retry_pending)
+        self.assertEqual(self.backend.calls,[])
+        self.assertFalse(self.backend.docking_started)
+
+    def test_late_contact_while_return_goal_is_in_flight_waits_for_cancel(self):
+        m=self.mission;raw=False
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'charge_contact_live':raw,'charging_stable':self.backend.charging}
+        m.return_to_dock();active=m.operation
+        m.return_to_dock()
+        self.assertEqual(self.backend.calls[-1][1],'return')
+        raw=True;m.tick()
+        self.assertEqual(m.phase,'canceling')
+        self.assertEqual(m.pending,'dock_contact')
+        self.backend.charging=True
+        self.backend.ops[active]['status']='canceled';m.tick()
+        self.assertEqual(m.phase,'docked')
+        self.assertFalse(self.backend.docking_started)
+        self.assertEqual(len(self.backend.calls),1)
 
     def test_charge_confirmation_after_retry_budget_does_not_remain_failed(self):
         m=self.mission;m.phase='docking';m.dock_retry_count=1
@@ -232,6 +304,8 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.mission.phase,'docking')
         stable[0]=True;self.mission.tick();self.assertEqual(self.mission.phase,'docked')
         stable[0]=False;self.backend.charging=False;self.mission.tick();self.clock.advance(2.1);self.mission.tick()
+        self.assertEqual(self.mission.phase,'docked')
+        self.clock.advance(6.);self.mission.tick()
         self.assertEqual(self.mission.phase,'idle');self.assertIn('接触已中断',self.mission.message)
 
 

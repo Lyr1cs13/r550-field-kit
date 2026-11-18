@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>巡航管理</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#edf2f6;color:#183345;font:15px system-ui,sans-serif;display:flex;flex-direction:column;height:100dvh}
+header{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:12px 22px;background:#163345;color:#f8fbfd}
+h1{font-size:20px;margin:0 8px 0 0}
+nav{display:flex;gap:8px}
+button{cursor:pointer;background:#25495d;color:white;text-align:left;border:1px solid #456477;border-radius:7px;padding:8px 14px;font:inherit}
+button[aria-pressed="true"]{background:#e4f5f1;color:#153f45;border-color:#e4f5f1}
+button span{margin-left:7px;font-size:12px}
+button:disabled{cursor:default;opacity:.55}
+#mode{white-space:nowrap}
+#status{font-size:13px;margin:0;min-width:12em}
+#error{margin:0;font-size:13px;color:#ffd0b3}
+iframe{width:100%;border:0;flex:1}
+</style>
+<header>
+  <h1>巡航管理</h1>
+  <nav aria-label="车辆选择">
+    <button aria-pressed="true" data-index="0">一号车 <span>检测中</span></button>
+    <button aria-pressed="false" data-index="1">二号车 <span>检测中</span></button>
+  </nav>
+  <button id="mode" disabled>启用双车联动</button>
+  <button id="site" disabled>新场地建图 ↗</button>
+  <p id="status" aria-live="polite">正在检查车辆在线状态</p>
+  <p id="error" role="alert" hidden></p>
+</header>
+<iframe title="一号车" src="http://127.0.0.1:PORT_A/"></iframe>
+<iframe title="二号车" src="http://127.0.0.1:PORT_B/" hidden></iframe>
+<script>
+const buttons=[...document.querySelectorAll('nav button')];
+const views=[...document.querySelectorAll('iframe')];
+const statusLine=document.getElementById('status');
+const modeButton=document.getElementById('mode');
+const siteButton=document.getElementById('site');
+const errorLine=document.getElementById('error');
+let selected=0, lastOnline=[], state, changing=false;
+
+function select(index){
+  selected=index;
+  buttons.forEach((item,i)=>{
+    item.setAttribute('aria-pressed',String(index===i));
+    views[i].hidden=index!==i;
+  });
+  if(state)renderSite();
+}
+buttons.forEach((button,index)=>button.onclick=()=>select(index));
+function renderSite(){
+  siteButton.disabled=state.paired||!state.site_available?.[selected];
+  siteButton.title=state.paired?'先切回单车模式':state.site_available?.[selected]?'':'此车尚未配置场地面板';
+}
+siteButton.onclick=()=>window.open('/new-site/'+(selected+1),'_blank','noopener');
+
+function render(){
+  const online=state.vehicles.map(car=>car.connected);
+  if((!lastOnline.length||lastOnline[selected])&&!online[selected]&&online.some(Boolean)){
+    select(online.indexOf(true));
+  }
+  lastOnline=online;
+  const count=online.filter(Boolean).length;
+  statusLine.textContent=state.paired?(state.reason||'双车联动 · 两车各自在本车区域内运行'):
+    count===2?'单车模式 · 可切换车辆':count===1?'单车模式 · '+(online[0]?'一号车':'二号车')+'可用':'等待车辆连接';
+  modeButton.textContent=state.paired?'切回单车模式':'启用双车联动';
+  modeButton.disabled=changing||(state.paired?!state.can_leave:!!state.pair_reason);
+  modeButton.title=state.paired?(state.can_leave?'':'两车停稳后切换'):state.pair_reason;
+  renderSite();
+  state.vehicles.forEach((car,i)=>{
+    buttons[i].querySelector('span').textContent=car.connected?
+      (car.charging&&car.localized?'在线 · 充电中':car.localized?'在线 · 已定位':'在线 · 待定位'):'离线';
+    buttons[i].title=car.readiness;
+  });
+}
+modeButton.onclick=async()=>{
+  if(!state||changing)return;
+  changing=true;errorLine.hidden=true;render();
+  try{
+    const response=await fetch('/api/fleet/mode',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Control-Token':state.control_token},
+      body:JSON.stringify({paired:!state.paired})});
+    const result=await response.json();
+    if(!response.ok)throw new Error(result.error);
+    state=result;
+  }catch(error){errorLine.textContent=error.message;errorLine.hidden=false;}
+  finally{changing=false;render();}
+};
+async function refresh(){
+  try {
+    if(!changing){
+      const response=await fetch('/api/fleet',{cache:'no-store'});
+      if(!response.ok)throw new Error();
+      const result=await response.json();
+      if(!changing){state=result;render();}
+    }
+  } catch (_) { statusLine.textContent='管理面板连接中断';modeButton.disabled=true; }
+  setTimeout(refresh,850);
+}
+refresh();
+</script>
+</html>

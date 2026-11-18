@@ -1,0 +1,8 @@
+# Configure on each car for its battery, charger and return route.
+enabled: false
+repeat_only: true
+low_voltage: 10.0
+resume_voltage: null
+low_hold_seconds: 20.0
+charge_hold_seconds: 120.0
+min_charge_seconds: 0.0

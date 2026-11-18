@@ -1,53 +1,263 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const phaseNames = {collecting:'等待采集完成',paused_collection:'采集等待已暂停',canceling_collection:'正在取消采集',idle:'等待开始',departing:'驶离充电桩',settling_departure:'离桩等待停稳',paused_departure:'离桩已暂停',paused_settling_departure:'停稳确认已暂停',settling:'等待停稳',settling_return:'桩前等待停稳',paused_settling:'停稳确认已暂停',paused_settling_return:'停稳确认已暂停',navigating:'正在导航',dwelling:'定点停留',returning:'正在回充',docking:'红外对接',docked:'已在桩上充电',completed:'巡航完成',failed:'任务停止',canceling:'正在停车',paused_navigation:'导航已暂停',paused_return:'回程已暂停',paused_dwell:'停留已暂停',paused_dock:'对接已暂停'};
+const phaseNames = {disconnected:'实车离线',collecting:'等待采集完成',paused_collection:'采集等待已暂停',canceling_collection:'正在取消采集',idle:'等待开始',departing:'驶离充电桩',settling_departure:'离桩等待停稳',paused_departure:'离桩已暂停',paused_settling_departure:'停稳确认已暂停',settling:'等待停稳',settling_return:'桩前等待停稳',paused_settling:'停稳确认已暂停',paused_settling_return:'停稳确认已暂停',navigating:'正在导航',dwelling:'定点停留',returning:'正在回充',docking:'红外对接',docked:'已在桩上充电',completed:'巡航完成',failed:'任务停止',canceling:'正在停车',paused_navigation:'导航已暂停',paused_return:'回程已暂停',paused_dwell:'停留已暂停',paused_dock:'对接已暂停'};
+const collectionNames={ws63:'WS63 旧版',broadcast:'WS63 沿途',broadcast_station:'WS63 定点',servo_car_v2:'WS63 旋转定点'};
 let requestCount = 0;
 let collectionDirty=false;
+let autoReturnBeforePair;
+let imageMapId = null;
 let state, selected = null, mode = 'pan', busy = false, pointsKey = '', zoom = 1, panX = 0, panY = 0, gesture, hover, fitted = false;
 const canvas = $('map'), ctx = canvas.getContext('2d'), image = new Image();
-image.src = '/map.png';image.onload = () => { if(state) fit(false); };
+image.onload = () => { if (state) fitted=fit(false); };
+image.onerror = () => { imageMapId = null; fitted = false; };
+const vehicleLinks = [...document.querySelectorAll('[data-vehicle-link]')].map(link => [link, link.getAttribute('href')]);
+
+function syncMapImage() {
+ const mapId = state.map.map_id || '';
+ if (imageMapId === mapId) return;
+ fitted = false;
+ imageMapId = mapId;
+ image.src = '/map.png?map_id='+encodeURIComponent(mapId);
+}
 const esc = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const quiet = () => state && ['idle','completed','failed','docked'].includes(state.phase);
+const quiet = () => state && state.vehicle_connected !== false && ['idle','completed','failed','docked'].includes(state.phase);
 function toast(text){ $('toast').textContent = text;$('toast').classList.add('show');clearTimeout(toast.timer);toast.timer = setTimeout(() => $('toast').classList.remove('show'), 4200); }
-async function command(data){ if(busy && data.action!=='stop') return;requestCount++;busy = true;try{ const res = await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':state.control_token},body:JSON.stringify(data)});const result = await res.json();if(!res.ok) throw new Error(result.error);state = {...result,control_token:state.control_token};render(); }catch(e){toast(e.message);}finally{busy=--requestCount>0;} }
-async function poll(){try{const res=await fetch('/api/state');state=await res.json();render();if(!fitted && image.complete){fit(false);fitted=true;}}catch(e){$('message').textContent='页面连接中断，无法读取当前状态';['start','return','confirm'].forEach(k=>$(k).disabled=true);}finally{setTimeout(poll,250);} }
-function setMode(value){mode=value;canvas.className=value;['pan-tool','add-tool','pose-tool'].forEach(k=>$(k).classList.toggle('active',k.startsWith(value)));$('map-tip').textContent=value==='pan'?'滚轮缩放 · 拖动平移 · 点击点位选中':value==='add'?'在白色走廊按下并拖动，设置点位与到达朝向':value==='move'?'在新的白色空地按下并拖动，移动选中的点位':'在实车位置按下，沿车头方向拖出箭头';}
+async function command(data) {
+ if (!state || state.vehicle_connected === false) return false;
+ if (busy && data.action !== 'stop') return false;
+ const token = state.control_token;
+ requestCount++;
+ busy = true;
+ try {
+  const res = await fetch('/api/command', {
+   method:'POST', headers:{'Content-Type':'application/json','X-Control-Token':token},
+   body:JSON.stringify(data)
+  });
+  const result = await res.json();
+  if (!res.ok) throw new Error(result.error);
+  if (state.control_token === token) {
+   state = {...result, control_token:token, vehicle_connected:state.vehicle_connected,
+    fleet_control:state.fleet_control,fleet_paired:state.fleet_paired,fleet_number:state.fleet_number,
+    fleet_peer:state.fleet_peer,fleet_docks:state.fleet_docks,fleet_zones:state.fleet_zones,site_url:state.site_url};
+   render();
+  }
+  return true;
+ } catch (e) { toast(e.message);return false; }
+ finally { busy = --requestCount > 0; }
+}
+async function poll(){try{const res=await fetch('/api/state');state=await res.json();render();if(!fitted)fitted=fit(false);}catch(e){$('message').textContent='页面连接中断';$('message').hidden=false;['start','return','confirm'].forEach(k=>$(k).disabled=true);}finally{setTimeout(poll,250);} }
+function setMode(value){
+ mode=value;canvas.className=value;
+ ['pan-tool','add-tool','pose-tool'].forEach(k=>$(k).classList.toggle('active',k.startsWith(value)));
+ $('map-tip').hidden=value==='pan';
+ $('map-tip').textContent={add:'点击加点，拖动设朝向',move:'点击新位置，拖动改朝向',pose:'从实车位置拖出车头方向'}[value]||'';
+}
 function screen(x,y){const m=state.map;return [panX+(m.max_y-y)/m.resolution*zoom,panY+(m.max_x-x)/m.resolution*zoom];}
 function world(x,y){const m=state.map;return [m.max_x-(y-panY)/zoom*m.resolution,m.max_y-(x-panX)/zoom*m.resolution];}
-function fit(full){if(!state || !image.complete)return;const m=state.map,north=state.points.length>0&&state.points.every(p=>p.id.startsWith('north-')),b=full?[m.origin[0],m.max_x,m.origin[1],m.max_y]:north?[-.5,5.5,-8.2,1.0]:m.focus_bounds;const a=[(m.max_y-b[3])/m.resolution,(m.max_x-b[1])/m.resolution],z=[(m.max_y-b[2])/m.resolution,(m.max_x-b[0])/m.resolution];zoom=Math.min((canvas.clientWidth-40)/(z[0]-a[0]),(canvas.clientHeight-55)/(z[1]-a[1]));panX=(canvas.clientWidth-(z[0]-a[0])*zoom)/2-a[0]*zoom;panY=(canvas.clientHeight-(z[1]-a[1])*zoom)/2-a[1]*zoom;draw();}
+// Top view in metres. EC130 dimensions come from the vendor's dock STEP model.
+const chassis={length:.265,width:.207};
+const charger={caseDepth:.080,width:.192,contactDepth:.011,contactWidth:.134};
+function bodyScreen([x,y,yaw],forward,lateral){
+ const cos=Math.cos(yaw),sin=Math.sin(yaw);
+ return screen(x+cos*forward-sin*lateral,y+sin*forward+cos*lateral);
+}
+function drawBody(pose,back,front,width,fill,stroke){
+ const half=width/2;
+ const corners=[[back,-half],[front,-half],[front,half],[back,half]];
+ ctx.beginPath();
+ corners.forEach(([forward,lateral],index)=>{
+  const point=bodyScreen(pose,forward,lateral);
+  if(index===0)ctx.moveTo(...point);
+  else ctx.lineTo(...point);
+ });
+ ctx.closePath();
+ ctx.fillStyle=fill;
+ ctx.fill();
+ if(stroke){
+  ctx.lineWidth=1;
+  ctx.strokeStyle=stroke;
+  ctx.stroke();
+ }
+}
+function mapLabel(label,x,y){
+ ctx.font='11px Microsoft YaHei, sans-serif';
+ ctx.lineWidth=3;
+ ctx.strokeStyle='#142431';
+ ctx.fillStyle='#fff';
+ ctx.strokeText(label,x,y);
+ ctx.fillText(label,x,y);
+}
+function drawCharger(pose,number){
+ // The saved pose is the seated vehicle centre. The charger lies behind its rear bumper.
+ const contact=-chassis.length/2;
+ const casing=contact-charger.contactDepth;
+ drawBody(pose,casing-charger.caseDepth,casing,charger.width,'#354558','#e5edf3');
+ drawBody(pose,casing,contact,charger.contactWidth,'#e5edf3');
+ const [x,y]=bodyScreen(pose,casing-charger.caseDepth/2,0);
+ const radius=charger.width/2*zoom/state.map.resolution;
+ mapLabel(number?number+'号充电桩':'充电桩',x+radius+5,y+4);
+}
+function drawChassis(pose,color,number){
+ const half=chassis.length/2;
+ drawBody(pose,-half,half,chassis.width,color,'#183649');
+ // The triangle marks the nose and rotates with the body.
+ ctx.beginPath();
+ ctx.moveTo(...bodyScreen(pose,half*.75,0));
+ ctx.lineTo(...bodyScreen(pose,-half*.25,.043));
+ ctx.lineTo(...bodyScreen(pose,-half*.25,-.043));
+ ctx.closePath();
+ ctx.fillStyle='#173447';
+ ctx.fill();
+ if(number){
+  const [x,y]=bodyScreen(pose,0,0);
+  const yaw=pose[2];
+  const top=(Math.abs(Math.cos(yaw))*chassis.length+Math.abs(Math.sin(yaw))*chassis.width)/2;
+  mapLabel(number+'号车',x+4,y-top*zoom/state.map.resolution-5);
+ }
+}
+function fit(full){
+ const w=canvas.clientWidth,h=canvas.clientHeight;
+ if(!state||!image.complete||!image.naturalWidth||w<=40||h<=55)return false;
+ const m=state.map,north=state.points.length>0&&state.points.every(p=>p.id.startsWith('north-'));
+ const b=full?[m.origin[0],m.max_x,m.origin[1],m.max_y]:north?[-.5,5.5,-8.2,1.0]:m.focus_bounds;
+ const a=[(m.max_y-b[3])/m.resolution,(m.max_x-b[1])/m.resolution],z=[(m.max_y-b[2])/m.resolution,(m.max_x-b[0])/m.resolution];
+ zoom=Math.min((w-40)/(z[0]-a[0]),(h-55)/(z[1]-a[1]));
+ panX=(w-(z[0]-a[0])*zoom)/2-a[0]*zoom;panY=(h-(z[1]-a[1])*zoom)/2-a[1]*zoom;
+ draw();return true;
+}
 function arrow(x,y,yaw,color,size=23){const p=screen(x,y),dx=-Math.sin(yaw),dy=-Math.cos(yaw);ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(...p);ctx.lineTo(p[0]+dx*size,p[1]+dy*size);ctx.stroke();ctx.beginPath();ctx.moveTo(p[0]+dx*size,p[1]+dy*size);ctx.lineTo(p[0]+dx*(size-7)-dy*4,p[1]+dy*(size-7)+dx*4);ctx.lineTo(p[0]+dx*(size-7)+dy*4,p[1]+dy*(size-7)-dx*4);ctx.fill();}
-function draw(){if(!state)return;const ratio=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(canvas.width!==Math.round(w*ratio)||canvas.height!==Math.round(h*ratio)){canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);}ctx.setTransform(ratio,0,0,ratio,0,0);ctx.fillStyle='#142431';ctx.fillRect(0,0,w,h);ctx.imageSmoothingEnabled=false;if(image.complete)ctx.drawImage(image,panX,panY,image.width*zoom,image.height*zoom);
+function draw(){if(!state)return;const ratio=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(canvas.width!==Math.round(w*ratio)||canvas.height!==Math.round(h*ratio)){canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);}ctx.setTransform(ratio,0,0,ratio,0,0);ctx.fillStyle='#142431';ctx.fillRect(0,0,w,h);ctx.imageSmoothingEnabled=false;if(image.complete && image.naturalWidth)ctx.drawImage(image,panX,panY,image.width*zoom,image.height*zoom);
  const preview=state.survey_route_preview||[];if(preview.length){ctx.strokeStyle="#e9a23b";ctx.lineWidth=2;ctx.setLineDash([7,5]);ctx.beginPath();preview.forEach((p,i)=>{const v=screen(...p);i?ctx.lineTo(...v):ctx.moveTo(...v);});ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#ffda9b";ctx.font="12px Microsoft YaHei";ctx.fillText("橙色虚线：回桩路线示意（含折返），实际由 Nav2 避障",16,54);}
  const path=state.health.path||[];if(path.length){ctx.strokeStyle='#5d9be9';ctx.lineWidth=2;ctx.beginPath();path.forEach((p,i)=>{const s=screen(...p);i?ctx.lineTo(...s):ctx.moveTo(...s);});ctx.stroke();}
+ const track=state.health.track||[];if(track.length>1){ctx.strokeStyle='#087f89';ctx.lineWidth=2;ctx.beginPath();track.forEach((p,i)=>{const s=screen(...p);i?ctx.lineTo(...s):ctx.moveTo(...s);});ctx.stroke();}
  ctx.fillStyle='#f45555';(state.health.laser||[]).forEach(p=>{const s=screen(...p);ctx.fillRect(s[0]-1,s[1]-1,2,2);});
- const dock=state.dock,pd=screen(dock[0],dock[1]);ctx.fillStyle='#087f89';ctx.strokeStyle='#e4ffff';ctx.lineWidth=2;ctx.fillRect(pd[0]-7,pd[1]-7,14,14);ctx.strokeRect(pd[0]-7,pd[1]-7,14,14);ctx.font='11px Microsoft YaHei';ctx.fillStyle='#fff';ctx.fillText('充电桩',pd[0]+12,pd[1]+4);
+ for(const {number,bounds} of state.fleet_zones||[]){
+  const [left,top]=screen(bounds[1],bounds[3]),[right,bottom]=screen(bounds[0],bounds[2]);
+  ctx.strokeStyle=number===state.fleet_number?'#087f89':'#8055bf';ctx.lineWidth=2;
+  ctx.setLineDash([6,5]);ctx.strokeRect(left,top,right-left,bottom-top);ctx.setLineDash([]);
+ }
+ const docks=state.fleet_docks||(state.dock&&state.health.dock_calibrated!==false?[{pose:state.dock}]:[]);
+ for(const {pose,number} of docks)drawCharger(pose,number);
  state.points.forEach((p,i)=>{const s=screen(p.x,p.y);ctx.fillStyle=p.id===selected?'#13a6aa':'#fff';ctx.strokeStyle=p.enabled?'#087f89':'#96a5ab';ctx.lineWidth=p.id===selected?3:2;ctx.beginPath();ctx.arc(...s,11,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle=p.id===selected?'#fff':'#087f89';ctx.font='bold 11px Microsoft YaHei';ctx.textAlign='center';ctx.fillText(i+1,s[0],s[1]+4);ctx.textAlign='left';if(!p.id.startsWith("north-loop-"))arrow(p.x,p.y,p.yaw,p.enabled?'#087f89':'#96a5ab',30);});
- const r=state.health.pose;if(r){const p=screen(r[0],r[1]);ctx.fillStyle='#08c7cf';ctx.strokeStyle='#073b43';ctx.lineWidth=2;ctx.beginPath();ctx.arc(...p,7,0,Math.PI*2);ctx.fill();ctx.stroke();arrow(...r,'#05dee5',29);}
+ const cars=[[state.health.pose,'#08c7cf',state.fleet_number],[state.fleet_peer,'#a16eff',3-state.fleet_number]];
+ cars.forEach(([pose,color,number])=>{
+  if(pose)drawChassis(pose,color,number);
+ });
  if(gesture && mode!=='pan'){const p=world(gesture.x,gesture.y),end=world(gesture.nowX,gesture.nowY),angle=Math.atan2(end[1]-p[1],end[0]-p[0]);arrow(...p,angle,'#edb545',35);}
 }
-function render(){const h=state.health,locked=!quiet();$('mode').textContent=h.mode==='offline'?'离线演练':'实车控制';$('mode').className='badge '+h.mode;$('offline-banner').hidden=h.mode!=='offline';$('phase').textContent=phaseNames[state.phase]||state.phase;$('message').textContent=state.message;$('voltage').textContent=h.voltage==null?'—':h.voltage.toFixed(2)+' V';$('charging').textContent=h.charging==null?'未知':h.charging?'充电中':'未充电';$('charge-current').textContent=h.current==null?'':h.current.toFixed(2)+' A';$('remaining').textContent=state.remaining==null?'—':Math.ceil(state.remaining)+' 秒';$('progress').textContent=state.run.length?'本轮点位 '+Math.min(state.index+1,state.run.length)+' / '+state.run.length:'任务尚未启动';$('readiness').textContent=h.dock_localization?.status==='applying'?'充电停稳，正在自动校准桩位定位…':h.readiness;$('loc-badge').textContent=h.localization_confirmed?(h.dock_localization?.status==='confirmed'?'桩位已校准':'已确认'):'未确认';$('loc-badge').className='small-badge'+(h.localization_confirmed?' confirmed':'');$('map-version').textContent=state.map.version+' · 5 cm / 格 · 地图 +X 向上';$('point-count').textContent=state.points.length;$('empty-points').hidden=state.points.length>0;
- $('start').disabled=locked||!h.ready||!h.localization_confirmed||!state.points.some(p=>p.enabled);$('confirm').disabled=locked||!h.ready;$('initial-dock').disabled=locked;$('pause').disabled=!['navigating','returning','departing','dwelling','collecting','docking','settling','settling_return','settling_departure'].includes(state.phase);$('resume').disabled=!state.phase.startsWith('paused_')||!h.ready||!h.localization_confirmed;$('return').disabled=state.phase==='canceling'||(!h.charging&&(!h.ready||!h.localization_confirmed));$('add-point').disabled=locked;$('auto-return').disabled=locked;
+function renderVehicleConnection(disconnected) {
+ $('vehicle-offline').hidden = !disconnected;
+ $('points-empty-title').textContent = disconnected ? '点位离线' : '暂无导航点';
+ if (disconnected) {
+  collectionDirty = false;
+  if (mode !== 'pan') { gesture = null; setMode('pan'); }
+ }
+ ['stop','add-tool','pose-tool','collection-export','export','import','anchor-notes','anchor-height']
+  .forEach(id => { $(id).disabled = disconnected; });
+ for (const [link, href] of vehicleLinks) {
+  if (disconnected && link.hasAttribute('href')) {
+   link.removeAttribute('href');
+   link.setAttribute('aria-disabled','true');
+  } else if (!disconnected && !link.hasAttribute('href')) {
+   link.setAttribute('href',href);
+   link.removeAttribute('aria-disabled');
+  }
+ }
+}
+
+function render(){
+ syncMapImage();
+ const h=state.health,disconnected=state.vehicle_connected===false,locked=!quiet();
+ const fleetActive=state.fleet_paired??h.fleet?.active??!!h.fleet;
+ const fleetBlock=state.fleet_control??(fleetActive?(h.fleet?.motion_reason||(!h.fleet?.leased?'等待双车面板确认运行许可':'')):'');
+ renderVehicleConnection(disconnected);
+ $('fleet-open').hidden=window.location.hostname!=='127.0.0.1'||window.location.port!=='8891';
+ const browserUrl=new URL(location.href),local=['127.0.0.1','localhost','[::1]'].includes(browserUrl.hostname);
+ browserUrl.port=8896;browserUrl.pathname='/';browserUrl.search=browserUrl.hash='';
+ const siteUrl=state.site_url||(!local&&h.mode==='robot'?browserUrl.href:'');
+ $('site-open').hidden=!siteUrl||!!state.fleet_number;
+ if(siteUrl)$('site-open').href=siteUrl;
+ $('fleet-wait').hidden=!fleetBlock;
+ $('fleet-wait').textContent=fleetBlock;
+ $('vehicle-title').textContent=state.fleet_number===1?'一号车':state.fleet_number===2?'二号车':'机器人巡航';
+ $('offline-banner').hidden=h.mode!=='offline';
+ $('map-live').textContent=disconnected?'已保存':'演练';
+ $('map-live').hidden=!disconnected&&h.mode!=='offline';
+ const dockStatus=h.dock_localization?.status;
+ const calibrating=dockStatus==='applying';
+ const dockReview=h.charging_stable&&['alignment_required','attention'].includes(dockStatus);
+ $('phase').textContent=state.phase==='idle'&&h.charging_stable?'桩上充电':phaseNames[state.phase]||state.phase;
+ $('message').textContent=state.message;
+ $('message').hidden=disconnected||!state.message||state.message==='请添加导航点，核对定位后开始'||
+  (h.charging_stable&&state.message.includes('已按保存的充电桩位自动校准定位'));
+ $('voltage').textContent=h.voltage==null?'—':h.voltage.toFixed(2)+' V';
+ $('charging').textContent=h.charging==null?'—':h.charging?'充电中':'未充电';
+ $('charge-current').textContent=h.charging&&h.current!=null?h.current.toFixed(2)+' A':'';
+ $('remaining').textContent=state.remaining==null?'—':Math.ceil(state.remaining)+' 秒';
+ $('progress').hidden=disconnected||!state.run.length;
+ $('progress').textContent='点位 '+Math.min(state.index+1,state.run.length)+' / '+state.run.length;
+ $('readiness').hidden=disconnected||(!calibrating&&h.ready);
+ $('readiness').textContent=calibrating?'正在校准桩位…':h.readiness;
+ $('loc-badge').textContent=dockReview?'桩位待复核':h.localization_confirmed?(dockStatus==='confirmed'?'桩位已校准':'已定位'):'待定位';
+ $('loc-badge').className='small-badge'+(dockReview?' attention':h.localization_confirmed?' confirmed':'');
+ $('map-version').textContent=Number((state.map.resolution*100).toFixed(3))+' cm / 格';
+ $('map-version').title=state.map.version;
+ $('point-count').textContent=disconnected?'—':state.points.length;
+ $('empty-points').hidden=state.points.length>0;
+ $('start').disabled=locked||!h.ready||!h.localization_confirmed||!state.points.some(p=>p.enabled);$('confirm').disabled=locked||!h.ready;$('initial-dock').disabled=locked;$('pause').disabled=!['navigating','returning','departing','dwelling','collecting','docking','settling','settling_return','settling_departure'].includes(state.phase);$('resume').disabled=!state.phase.startsWith('paused_')||!h.ready||!h.localization_confirmed;$('return').disabled=state.phase==='canceling'||(!h.charging&&(!h.ready||!h.localization_confirmed));$('add-point').disabled=locked;$('apply-heading').disabled=locked;$('recover-points').disabled=locked||!state.checkpoint_available;$('shared-heading').disabled=locked;$('auto-return').disabled=locked;
  const c=state.collection||{mode:'timed',stage:'disabled'}, c5=state.c5||{};
+ const repeatMode=['timed','broadcast_station'].includes(c.mode)&&!c5.enabled;
+ $('repeat').disabled=locked||!repeatMode;
+ if(locked)$('repeat').checked=!!state.repeat;
+ else if(!repeatMode)$('repeat').checked=false;
+ $('endurance-status').hidden=!state.recharge_resume_pending&&!state.recharge_resume_enabled;
+ $('endurance-status').textContent=state.recharge_resume_pending?'充电后续采':
+  state.recharge_resume_repeat_only?'循环时自动回充续采':'低电量回充续采已启用';
+ if(!disconnected&&state.repeat&&state.run.length)$('progress').textContent='第 '+state.lap+' 轮 · '+$('progress').textContent;
  if(!collectionDirty){$('collection-mode').value=c.mode;$('collection-device').value=c.device||'auto';$('collection-c5').checked=!!c5.enabled;}
+ const selectedCollection=$('collection-mode').value, wantsC5=$('collection-c5').checked;
+ const activeCollection=c.mode!=='timed'||!!c5.enabled;
+ $('collection-summary').textContent=disconnected?'离线':collectionDirty?'待应用':
+  [collectionNames[c.mode],c5.enabled?'C5 CSI':null].filter(Boolean).join(' + ')||'关闭';
+ $('collection-summary').classList.toggle('confirmed',!disconnected&&activeCollection&&!collectionDirty);
+ $('serial-field').hidden=selectedCollection==='timed';
+ $('c5-field').hidden=!['timed','servo_car_v2'].includes(selectedCollection);
  $('collection-ports').innerHTML=(c.ports||[]).map(p=>'<option value="'+esc(p)+'"></option>').join('');
- $('collection-mode').disabled=$('collection-device').disabled=$('collection-apply').disabled=locked||h.mode==='offline'||!!c5.active;
- $('collection-c5').disabled=$('collection-mode').disabled||!['timed','servo_car_v2'].includes($('collection-mode').value);
+ $('collection-mode').disabled=$('collection-device').disabled=locked||h.mode==='offline'||!!c5.active;
+ $('collection-c5').disabled=$('collection-mode').disabled||$('c5-field').hidden;
+ $('collection-apply').disabled=$('collection-mode').disabled||(!collectionDirty&&!activeCollection);
+ $('collection-apply').textContent=!collectionDirty&&activeCollection?'重新连接':
+  activeCollection?(selectedCollection==='timed'&&!wantsC5?'关闭采集':'应用设置'):'启用采集';
+ $('collection-apply').classList.toggle('primary',collectionDirty);
  $('c5-status').hidden=!c5.enabled;
  $('c5-status').textContent=c5Status(c5);
- $('collection-status').textContent=c.mode==='timed'?'定时模式，无需连接 WS63':c.error?'WS63：'+c.error:c.stage==='sampling'?'采集中 · 已用 '+Math.floor(c.elapsed||0)+' 秒'+(c.scan!=null?' · scan '+c.scan:''):c.connected?'串口就绪 · '+c.stage+' · '+(c.device_resolved||''):'WS63：'+c.stage;
+ $('collection-status').hidden=disconnected||(!collectionDirty&&c.mode==='timed'&&!c.motion_blocked);
+ $('collection-status').textContent=c.mode==='timed'?'':c.error?'WS63：'+c.error:c.stage==='sampling'?'采集中 · '+Math.floor(c.elapsed||0)+' 秒':c.connected?'WS63 串口已连接':'WS63 串口未连接';
  ['survey-load','survey-restore','anchor-save'].forEach(k=>$(k).disabled=locked);
  const loopReady=!state.points.some(p=>p.id.startsWith("north-loop-"))||c.profile==="moving_loop_demo";
  const c5Ready=!c5.active&&(!c5.enabled||['ready','done','canceled'].includes(c5.stage));
- const collectionReady=loopReady&&!collectionDirty&&!c.motion_blocked&&c5Ready&&(c.mode!=='broadcast'||c.beacon_recent)&&(!['ws63','broadcast','servo_car_v2'].includes(c.mode)||(c.connected&&['ready','done'].includes(c.stage)));
+ const broadcastMode=['broadcast','broadcast_station'].includes(c.mode);
+ const radioReady=c.connected&&(['ready','done'].includes(c.stage)||(c.mode==='broadcast_station'&&(c.stage==='canceled'||c.retryable)));
+ const collectionReady=loopReady&&!collectionDirty&&!c.motion_blocked&&c5Ready&&(!broadcastMode||c.beacon_recent)&&(!['ws63','broadcast','broadcast_station','servo_car_v2'].includes(c.mode)||radioReady);
  $('return').disabled=$('return').disabled||c.motion_blocked||!!c5.active||(c5.enabled&&['collecting','paused_collection'].includes(state.phase));
- if(c.mode==='timed'&&c5.enabled)$('collection-status').textContent='每站等待 C5 保存完成后离站';
  if(c.mode==='broadcast'&&!collectionDirty)$('collection-status').textContent=c.error?'WS63：'+c.error:c.connected?(c.beacon_recent?'基站1 '+c.last_rssi+' dBm · 沿途有效 '+(c.samples||0)+' 条 · '+(c.measured_points||0)+' 个热力格' :'Client 已连接，等待固定基站广播'):'广播 Client：'+c.stage;
+ if(c.mode==='broadcast_station'&&!collectionDirty)$('collection-status').textContent=c.error?'WS63：'+c.error:c.connected?(c.beacon_recent?'基站 1 '+c.last_rssi+' dBm · 本站 '+(c.samples||0)+' 条 · 已完成 '+(c.measured_points||0)+' 站次':'接收板已连接，等待固定基站广播'):'广播接收端：'+c.stage;
  if(c.mode==='servo_car_v2')$('collection-status').textContent=servoStatus(c);
  else if(c.motion_blocked)$('collection-status').textContent='有未放行的旋转轮次。请切到旋转定点模式恢复连接。';
- if(collectionDirty)$('collection-status').textContent='设置尚未应用，请点“应用 / 重新连接”';
- $('start').disabled=$('start').disabled||!collectionReady;
- renderPoints(locked);document.querySelectorAll('#points .go').forEach(b=>b.disabled=locked||!h.ready||!h.localization_confirmed||!collectionReady);$('events').innerHTML=state.events.slice(0,6).map(e=>'<div class="activity-item"><span class="activity-time">'+esc(e.time)+'</span><span>'+esc(e.text)+'</span></div>').join('')||'<div class="hint" style="padding-top:15px">任务开始、到达、停留结束和回充反馈会显示在这里。</div>';document.dispatchEvent(new CustomEvent('cruise-state',{detail:state}));draw();}
-function renderPoints(locked){const key=JSON.stringify(state.points)+selected+locked;if(pointsKey===key || (!locked && $('points').contains(document.activeElement) && document.activeElement.tagName==='INPUT'))return;pointsKey=key;$('points').innerHTML=state.points.map((p,i)=>'<div class="point-card '+(selected===p.id?'selected':'')+'" data-id="'+esc(p.id)+'"><div class="point-head"><span class="point-index">'+(i+1)+'</span><input class="point-name" aria-label="点位名称" data-field="name" value="'+esc(p.name)+'" '+(locked?'disabled':'')+'><input class="point-check" aria-label="加入巡航" type="checkbox" data-field="enabled" '+(p.enabled?'checked ':'')+(locked?'disabled':'')+'></div><div class="point-position">x '+p.x.toFixed(2)+' m · y '+p.y.toFixed(2)+' m</div><div class="point-fields"><label>停留（秒）<input type="number" data-field="wait" min="0" max="3600" step="1" value="'+p.wait+'" '+(locked?'disabled':'')+'></label><label>到达朝向（度）<input type="number" data-field="yaw" min="-180" max="180" step="1" value="'+Math.round(p.yaw*180/Math.PI)+'" '+(locked?'disabled':'')+'></label></div><div class="point-actions"><button data-action="up" '+(locked||i===0?'disabled':'')+'>↑</button><button data-action="down" '+(locked||i===state.points.length-1?'disabled':'')+'>↓</button><button data-action="move" '+(locked?'disabled':'')+'>地图移动</button><button data-action="delete" '+(locked?'disabled':'')+'>删除</button><button class="go" data-action="go" '+(locked||!state.health.ready||!state.health.localization_confirmed?'disabled':'')+'>前往 ↗</button></div></div>').join('');}
+ if(collectionDirty)$('collection-status').textContent='设置尚未应用';
+ if(fleetActive){
+  autoReturnBeforePair??=$('auto-return').checked;
+  $('auto-return').checked=false;$('auto-return').disabled=true;
+ }else if(autoReturnBeforePair!==undefined){
+  $('auto-return').checked=autoReturnBeforePair;autoReturnBeforePair=undefined;
+ }
+ $('initial-dock').disabled=$('initial-dock').disabled||h.dock_calibrated===false;
+ $('return').disabled=$('return').disabled||fleetActive||!!fleetBlock||h.dock_calibrated===false;
+ $('resume').disabled=$('resume').disabled||!!fleetBlock;
+ $('start').disabled=$('start').disabled||!collectionReady||!!fleetBlock;
+ $('recover-points').hidden=!state.checkpoint_available;
+ renderPoints(locked);document.querySelectorAll('#points .go').forEach(b=>b.disabled=locked||!h.ready||!h.localization_confirmed||!collectionReady||!!fleetBlock);$('events').innerHTML=state.events.slice(0,6).map(e=>'<div class="activity-item"><span class="activity-time">'+esc(e.time)+'</span><span>'+esc(e.text)+'</span></div>').join('')||'<div class="hint">暂无记录</div>';document.dispatchEvent(new CustomEvent('cruise-state',{detail:state}));draw();}
+function renderPoints(locked){const key=JSON.stringify(state.points)+selected+locked;if(pointsKey===key || (!locked && $('points').contains(document.activeElement) && document.activeElement.tagName==='INPUT'))return;pointsKey=key;$('points').innerHTML=state.points.map((p,i)=>'<div class="point-card '+(selected===p.id?'selected':'')+'" data-id="'+esc(p.id)+'"><div class="point-head"><span class="point-index">'+(i+1)+'</span><input class="point-name" aria-label="点位名称" data-field="name" value="'+esc(p.name)+'" '+(locked?'disabled':'')+'><input class="point-check" aria-label="加入巡航" type="checkbox" data-field="enabled" '+(p.enabled?'checked ':'')+(locked?'disabled':'')+'></div><div class="point-position">x '+p.x.toFixed(2)+' m · y '+p.y.toFixed(2)+' m</div><div class="point-fields"><label>停留（秒）<input type="number" data-field="wait" min="0" max="3600" step="1" value="'+p.wait+'" '+(locked?'disabled':'')+'></label><label>到达朝向（度）<input type="number" data-field="yaw" min="-180" max="180" step="0.1" value="'+Number((p.yaw*180/Math.PI).toFixed(1))+'" '+(locked?'disabled':'')+'></label></div><div class="point-actions"><button data-action="up" '+(locked||i===0?'disabled':'')+'>↑</button><button data-action="down" '+(locked||i===state.points.length-1?'disabled':'')+'>↓</button><button data-action="move" '+(locked?'disabled':'')+'>地图移动</button><button data-action="delete" '+(locked?'disabled':'')+'>删除</button><button class="go" data-action="go" '+(locked||!state.health.ready||!state.health.localization_confirmed?'disabled':'')+'>前往 ↗</button></div></div>').join('');}
 $('points').addEventListener('click',e=>{const card=e.target.closest('.point-card');if(!card)return;selected=card.dataset.id;draw();const action=e.target.dataset.action;if(!action){pointsKey='';return;}const points=structuredClone(state.points),i=points.findIndex(p=>p.id===selected);if(action==='go')command({action:'go',id:selected});else if(action==='move')setMode('move');else if(action==='delete')command({action:'save_points',points:points.filter(p=>p.id!==selected)});else{const j=action==='up'?i-1:i+1;[points[i],points[j]]=[points[j],points[i]];command({action:'save_points',points});}});
 $('points').addEventListener('change',e=>{const card=e.target.closest('.point-card'),field=e.target.dataset.field;if(!card||!field)return;const points=structuredClone(state.points),p=points.find(p=>p.id===card.dataset.id);p[field]=field==='enabled'?e.target.checked:field==='name'?e.target.value:field==='yaw'?Number(e.target.value)*Math.PI/180:Number(e.target.value);command({action:'save_points',points});});
 function local(e){const b=canvas.getBoundingClientRect();return [e.clientX-b.left,e.clientY-b.top];}
@@ -56,16 +266,24 @@ canvas.addEventListener('pointermove',e=>{if(!state)return;const [x,y]=local(e),
 canvas.addEventListener('pointerup',e=>{if(!gesture)return;const g=gesture;gesture=null;const [x,y]=local(e),distance=Math.hypot(x-g.x,y-g.y);if(mode==='pan'){if(distance<5){const p=state.points.find(v=>{const s=screen(v.x,v.y);return Math.hypot(x-s[0],y-s[1])<16;});selected=p?.id||null;pointsKey='';render();}return;}if(!quiet()){toast('请先停止任务，再修改点位或定位');setMode('pan');return;}const start=world(g.x,g.y),end=world(x,y),angle=distance>8?Math.atan2(end[1]-start[1],end[0]-start[0]):state.health.pose?.[2]||0;if(mode==='pose'){command({action:'initial_pose',pose:[...start,angle]});setMode('pan');return;}const points=structuredClone(state.points);if(mode==='move'){const p=points.find(p=>p.id===selected);if(!p)return;p.x=start[0];p.y=start[1];if(distance>8)p.yaw=angle;}else{const p={id:(Date.now().toString(36)+Math.random().toString(36).slice(2,12)),name:'点位 '+(points.length+1),x:start[0],y:start[1],yaw:angle,wait:10,enabled:true};points.push(p);selected=p.id;}command({action:'save_points',points});draw();});
 canvas.addEventListener('wheel',e=>{e.preventDefault();const [x,y]=local(e),factor=Math.exp(-e.deltaY*.001);const newZoom=Math.min(18,Math.max(.25,zoom*factor)),ratio=newZoom/zoom;panX=x-(x-panX)*ratio;panY=y-(y-panY)*ratio;zoom=newZoom;draw();},{passive:false});
 $('pan-tool').onclick=()=>setMode('pan');$('add-tool').onclick=$('add-point').onclick=()=>setMode('add');$('pose-tool').onclick=()=>setMode('pose');$('fit').onclick=()=>fit(false);$('full').onclick=()=>fit(true);
-['stop','pause','resume','return','confirm'].forEach(id=>$(id).onclick=()=>command({action:id}));$('initial-dock').onclick=()=>command({action:'initial_dock'});$('start').onclick=()=>command({action:'start',auto_return:$('auto-return').checked});
+['stop','pause','resume','return','confirm'].forEach(id=>$(id).onclick=()=>command({action:id}));$('initial-dock').onclick=()=>command({action:'initial_dock'});$('start').onclick=()=>command({action:'start',auto_return:$('auto-return').checked,repeat:$('repeat').checked});
 $('export').onclick=async()=>{const data=await(await fetch('/api/export')).json();const link=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));link.href=url;link.download='实验室导航点.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};$('import').onclick=()=>$('file').click();$('file').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());command({action:'import',map_id:data.map_id,points:data.points});}catch(err){toast('点位文件无法读取：'+err.message);}e.target.value='';};
-$('collection-device').oninput=$('collection-c5').onchange=()=>{collectionDirty=true;render();};
+function updateCollectionForm(){
+ if(!state)return;
+ const mode=$('collection-mode').value,c=state.collection||{mode:'timed',device:'auto'};
+ const device=$('collection-device').value.trim()||'auto';
+ collectionDirty=mode!==c.mode||$('collection-c5').checked!==!!state.c5?.enabled||
+  (mode!=='timed'&&device!==(c.device||'auto'));
+ render();
+}
+$('collection-device').oninput=$('collection-c5').onchange=updateCollectionForm;
 $('collection-mode').onchange=()=>{
  if(!['timed','servo_car_v2'].includes($('collection-mode').value))$('collection-c5').checked=false;
- collectionDirty=true;render();
+ updateCollectionForm();
 };
-$('collection-apply').onclick=()=>{
+$('collection-apply').onclick=async()=>{
  const data={action:'collection_config',mode:$('collection-mode').value,device:$('collection-device').value.trim()||'auto',c5:$('collection-c5').checked};
- collectionDirty=false;command(data);
+ if(await command(data)){collectionDirty=false;render();}
 };
 $('survey-load').onclick=async()=>{await command({action:'survey_load_north'});fit(false);};
 $('survey-restore').onclick=async()=>{await command({action:'survey_restore_points'});fit(false);};
@@ -102,4 +320,9 @@ $('collection-export').onclick=()=>{
  }
  a.click();
 };
-window.addEventListener('resize',draw);window.addEventListener('keydown',e=>{if(e.key==='Escape' && state)command({action:'stop'});});poll();
+new ResizeObserver(()=>{if(!fitted)fitted=fit(false);else draw();}).observe(canvas);
+window.addEventListener('keydown',e=>{if(e.key==='Escape' && state)command({action:'stop'});});poll();
+
+$('apply-heading').onclick=()=>{const degrees=Number($('shared-heading').value);if(!Number.isFinite(degrees)||degrees < -180||degrees > 180){toast('请输入-180～180度的朝向');return;}command({action:'save_points',points:state.points.map(p=>({...p,yaw:degrees*Math.PI/180}))});};
+
+$('recover-points').onclick=()=>command({action:'recover_points'});

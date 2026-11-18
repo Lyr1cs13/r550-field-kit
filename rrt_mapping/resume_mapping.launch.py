@@ -16,6 +16,7 @@ def setup(context):
     if not value:
         value = json.loads((here.parent / 'maps/latest_checkpoint.json').read_text())['directory']
     checkpoint = Path(value).expanduser().resolve()
+    panel = LaunchConfiguration('panel').perform(context).lower() == 'true'
     manifest = json.loads((checkpoint / 'manifest.json').read_text())
     for name, expected in manifest['sha256'].items():
         if hashlib.sha256((checkpoint / name).read_bytes()).hexdigest() != expected:
@@ -37,11 +38,13 @@ def setup(context):
             # M10P scans arrive faster than the factory 10 Hz EKF TF.
             # Keep enough native filter slots to wait for matching TF.
             'scan_queue_size': 10,
-        }], remappings=[('odom', 'odom_combined')]))
+            **({'map_update_interval':1.,'minimum_travel_distance':.12,'minimum_travel_heading':.18} if panel else {}),
+        }], remappings=[('odom', 'odom_combined')]+([('/tf','/site_slam_tf')] if panel else [])))
     # No motion is requested. The first native scan establishes map->odom;
     # mapping then pauses until a human verifies alignment and starts a region.
-    actions.append(TimerAction(period=3.0, actions=[ExecuteProcess(
-        cmd=['python3', str(here / 'session_checkpoint.py'), 'pause'], output='screen')]))
+    if not panel:
+        actions.append(TimerAction(period=3.0, actions=[ExecuteProcess(
+            cmd=['python3', str(here / 'session_checkpoint.py'), 'pause'], output='screen')]))
     if LaunchConfiguration('with_navigation').perform(context).lower() == 'true':
         actions.append(TimerAction(period=6.0, actions=[IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(here / 'rrt_mapping.launch.py')))]))
@@ -53,5 +56,6 @@ def generate_launch_description():
         DeclareLaunchArgument('checkpoint', default_value=''),
         DeclareLaunchArgument('with_hardware', default_value='true'),
         DeclareLaunchArgument('with_navigation', default_value='true'),
+        DeclareLaunchArgument('panel', default_value='false'),
         OpaqueFunction(function=setup),
     ])

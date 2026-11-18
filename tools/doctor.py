@@ -11,12 +11,14 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--offline',action='store_true');a=p.parse_args();errors=[]
+    p=argparse.ArgumentParser();p.add_argument('--offline',action='store_true');p.add_argument('--navigation',action='store_true');a=p.parse_args();errors=[]
     for package in ('yaml','serial','numpy','PIL'):
         ok=importlib.util.find_spec(package) is not None;print(('OK  ' if ok else '缺少 ')+package)
         if not ok:errors.append(package)
     if not a.offline:
-        for package in ('turn_on_wheeltec_robot','wheeltec_nav2','wheeltec_slam_toolbox','wheeltec_robot_rrt','wheeltec_rrt_msg','slam_toolbox','nav2_controller','nav2_rotation_shim_controller'):
+        packages=('turn_on_wheeltec_robot','wheeltec_nav2','nav2_controller','nav2_rotation_shim_controller','nav2_collision_monitor','nav2_mppi_controller','nav2_regulated_pure_pursuit_controller','nav2_planner','nav2_velocity_smoother')
+        if not a.navigation:packages+=('wheeltec_slam_toolbox','wheeltec_robot_rrt','wheeltec_rrt_msg','slam_toolbox')
+        for package in packages:
             try:ok=subprocess.run(['ros2','pkg','prefix',package],capture_output=True,timeout=6).returncode==0
             except FileNotFoundError:ok=False
             print(('OK  ' if ok else '缺少 ')+package)

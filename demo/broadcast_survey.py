@@ -28,7 +28,7 @@ class BroadcastSurvey:
     minimum_samples=40
     maximum_seconds=20.
 
-    def __init__(self,directory,grid,device,factory=None,clock=time.monotonic,autostart=True):
+    def __init__(self,directory,grid,device,factory=None,clock=time.monotonic,autostart=True,moving_demo=False):
         self.directory=Path(directory)/'broadcast';self.directory.mkdir(parents=True,exist_ok=True)
         self.scene=settings(grid);self.bounds=self.scene['bounds'];self.bin_origin=self.scene['bin_origin']
         self.grid=grid;self.device=device;self.factory=factory;self.clock=clock
@@ -38,8 +38,8 @@ class BroadcastSurvey:
         self.last_packet=0;self.last_status=0;self.drops=0;self.invalid=0;self.hello=False
         self.status={'connected':False,'stage':'connecting','error':None,'visit':None,'samples':0}
         self.worker=None
-        self.moving_demo=False;self.drive_active=False;self.drive_requested=False;self.bins={};self.saved_at=0;self.inherit_session=None
-        self.reconnects=0;self.epoch=0;self.last_report_us=None;self.report_times=deque(maxlen=200);self.device_clock=DeviceClock()
+        self.moving_demo=moving_demo;self.drive_active=False;self.drive_requested=False;self.bins={};self.saved_at=0;self.inherit_session=None
+        self.reconnects=0;self.epoch=0;self.last_report_us=None;self.report_times=deque();self.device_clock=DeviceClock()
         if autostart:
             self.worker=threading.Thread(target=self._worker,name='broadcast-uart',daemon=True);self.worker.start()
 
@@ -97,9 +97,10 @@ class BroadcastSurvey:
                 'region':dict(zip(('x_min','x_max','y_min','y_max'),self.bounds)), 'display_bounds':self.scene['display_bounds'], 'bin_origin':self.bin_origin,
                 'target_points':points,'created_utc':datetime.now(timezone.utc).isoformat(),
                 'minimum_seconds':self.minimum_seconds,'minimum_samples':self.minimum_samples,
-                'maximum_seconds':self.maximum_seconds,'fixed_tx_power_setting_dbm':0}
+                'maximum_seconds':self.maximum_seconds,'fixed_tx_power_setting_dbm':0,
+                'configured_tx_interval_ms':self.scene.get('nominal_tx_interval_ms')}
             manifest.update(profile='moving_loop_demo' if self.moving_demo else 'stationary',
-                            spatial_bin_m=.1,heading_policy='as driven; mixed orientations' if self.moving_demo else 'north')
+                            spatial_bin_m=.1,heading_policy='as driven; mixed orientations' if self.moving_demo else 'target point yaw')
             (folder/'session.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
             self.raw_file=(folder/'raw.csv').open('w',newline='',encoding='utf-8')
             self.csv=csv.writer(self.raw_file)
@@ -132,8 +133,8 @@ class BroadcastSurvey:
             if not self.session or not self.status['connected']:raise ValueError('广播采集会话未就绪')
             if self.clock()-self.last_packet>2.5:raise ValueError('固定基站广播已丢失，不能开始该点')
             self.visit={'id':uuid.uuid4().hex,'target':dict(target),'pose':list(pose),
-                        'started':self.clock(),'rssi':[],'poses':[],'drop_start':self.drops}
-            self.status.update(stage='sampling',samples=0,elapsed=0,visit=self.visit['id'],error=None)
+                        'started':self.clock(),'rssi':[],'poses':[],'times_us':[],'drop_start':self.drops}
+            self.status.update(stage='sampling',samples=0,elapsed=0,visit=self.visit['id'],error=None,retryable=False)
 
     def cancel(self):
         with self.lock:
@@ -149,10 +150,15 @@ class BroadcastSurvey:
         with (self.folder/'events.jsonl').open('a',encoding='utf-8') as f:
             f.write(json.dumps({'event':event,'utc':datetime.now(timezone.utc).isoformat(),**fields},ensure_ascii=False)+'\n')
 
-    def _error(self,message):
+    def _error(self,message,*,retryable=False,keep_connection=False):
         self.drive_active=False
-        self.status.update(stage='error',error=message,connected=False)
-        self._event('error',detail=message)
+        self.status.update(stage='error',error=message,retryable=retryable,
+                           connected=keep_connection and self.status['connected'])
+        self._event('error',detail=message,visit_id=self.visit['id'] if self.visit else None)
+        if retryable and self.visit:
+            self.visit=None
+            self.status['visit']=None
+            if self.raw_file:self.raw_file.flush()
 
     def handle_line(self,line,received_at=None):
         now=self.clock() if received_at is None else received_at
@@ -160,8 +166,8 @@ class BroadcastSurvey:
         if line.startswith('+BCSTATUS:'):
             us,_,drops,invalid=map(int,line.split(':')[1].split(','))
             if self.last_us is not None and us<self.last_us:
-                if self.moving_demo:self._radio_epoch('WS63 reboot detected')
-                else:self._error('WS63 已重启，当前会话作废；重新连接后重新采集');return
+                if not self.moving_demo:self._error('WS63 已重启，重新采集当前点',retryable=True,keep_connection=True)
+                self._radio_epoch('WS63 reboot detected')
             self.device_clock.observe(us/1e6,now)
             self.last_us=us;self.last_status=now;self.drops=drops;self.invalid=invalid;return
         if not line.startswith('+BCRSSI:'):return
@@ -169,12 +175,16 @@ class BroadcastSurvey:
         if anchor!=1 or not -127<=rssi<=20:raise ValueError('广播数据字段越界')
         # STATUS can follow buffered reports; sequence is authoritative for RX reset detection.
         if self.last_seq and seq<=self.last_seq:
-            if self.moving_demo and self.last_report_us is not None and us<self.last_report_us:self._radio_epoch('RX sequence and device clock restarted')
+            if self.last_report_us is not None and us<self.last_report_us:
+                if not self.moving_demo:self._error('接收端时钟已重启，重新采集当前点',retryable=True,keep_connection=True)
+                self._radio_epoch('RX sequence and device clock restarted')
             elif self.moving_demo:
                 self._event('duplicate_report_discarded',sequence=seq);return
             else:self._error('广播接收序号回退或重复，停止本会话以避免跨重启混合');return
         self.last_seq=seq;self.last_packet=now;self.last_rssi=rssi;self.drops=drops
         self.last_report_us=us;self.report_times.append(now)
+        while self.report_times and now-self.report_times[0]>=5.:
+            self.report_times.popleft()
         candidate=now-us/1e6;self.offset=candidate if self.offset is None else min(candidate,self.offset)
         aligned=self.device_clock.map_time(us/1e6)
         received=us/1e6+self.offset if aligned is None else min(now,aligned);delay=now-received
@@ -201,8 +211,9 @@ class BroadcastSurvey:
             elif not contains(self.bounds,pose):reason='outside_region'
             else:
                 accepted=True;reason='stationary';v['rssi'].append(rssi);v['poses'].append(list(pose))
+                v['times_us'].append(us)
             self.status.update(samples=len(v['rssi']),elapsed=round(age,1))
-        if self.raw_file:
+        if self.raw_file and (self.moving_demo or (v and received>=v['started'])):
             self.csv.writerow([datetime.now(timezone.utc).isoformat(),self.session,v['id'] if v else '',
                 v['target']['id'] if v else '',now,us,seq,anchor,rssi,drops,
                 *(pose if pose else ['','','']),bool(h and h['stationary']),accepted,reason,round(delay,5),self.epoch])
@@ -215,21 +226,31 @@ class BroadcastSurvey:
         if self.status['stage']!='sampling' or not self.visit:return
         v=self.visit;age=now-v['started']
         if now-self.last_packet>5.:
-            self._error('5 秒未收到基站广播，本点未完成');return
+            self._error('5 秒未收到基站广播，等待信号恢复后重采',retryable=True,keep_connection=True);return
         if self.drops>v['drop_start']:
-            self._error('采集期间 WS63 接收队列溢出，本点未完成');return
-        if age>=self.minimum_seconds+1 and len(v['rssi'])>=self.minimum_samples:
+            self._error('采集期间 WS63 接收队列溢出，重新采集当前点',retryable=True,keep_connection=True);return
+        window=max(self.minimum_seconds+1,float(v['target'].get('wait',0)))
+        if age>=window and len(v['rssi'])>=self.minimum_samples:
             xs=[p[0] for p in v['poses']];ys=[p[1] for p in v['poses']]
+            intervals=sorted((b-a)/1000 for a,b in zip(v['times_us'],v['times_us'][1:]) if b>a)
             p={'point_id':v['target']['id'],'visit_id':v['id'],'x':statistics.mean(xs),
                'y':statistics.mean(ys),'yaw':v['pose'][2],'target':v['target'],
                'median':statistics.median(v['rssi']),'mean':statistics.mean(v['rssi']),
                'std':statistics.pstdev(v['rssi']),'min':min(v['rssi']),'max':max(v['rssi']),
-               'n':len(v['rssi']),'duration':age,'anchor_id':1}
+               'n':len(v['rssi']),'duration':age,'anchor_id':1,
+               'mean_interval_ms':statistics.mean(intervals) if intervals else None,
+               'median_interval_ms':statistics.median(intervals) if intervals else None,
+               'p95_interval_ms':intervals[math.ceil(.95*len(intervals))-1] if intervals else None}
+            self.raw_file.flush();os.fsync(self.raw_file.fileno())
+            summary=self.folder/'points.json'
+            temporary=summary.with_suffix('.tmp')
+            temporary.write_text(json.dumps([*self.points,p],ensure_ascii=False,indent=2),encoding='utf-8')
+            temporary.replace(summary)
             self.points.append(p)
-            (self.folder/'points.json').write_text(json.dumps(self.points,ensure_ascii=False,indent=2),encoding='utf-8')
-            self._event('complete',**p);self.raw_file.flush();os.fsync(self.raw_file.fileno())
+            self._event('complete',**p)
             self.status.update(stage='done');self.visit=None
-        elif age>=self.maximum_seconds:self._error('20 秒内有效停稳样本不足 40，未以时间到冒充采集完成')
+        elif age>=max(self.maximum_seconds,window+5):
+            self._error('当前站有效停稳样本不足 40，重新采集',retryable=True,keep_connection=True)
 
     def _pose_motion_bad(self,h):
         previous=[p for p in self.history if .06<=h['t']-p['t']<=.5 and p['pose']]
@@ -286,6 +307,7 @@ class BroadcastSurvey:
         try:
             with self.lock:
                 self.buffer.clear();self.hello=False;self.last_status=0;self.last_packet=0
+                if self.last_seq and not self.moving_demo:self._radio_epoch('station UART reconnect')
             if self.factory is None:
                 from collection import ws63_ports
                 import serial
@@ -313,7 +335,7 @@ class BroadcastSurvey:
                         self.handle_line(raw.decode('ascii',errors='replace').strip(),received_at=received_at)
                     if not self.hello and self.clock()>deadline:raise ValueError('接收板握手失败，请烧录本次广播 Client 固件')
                     if self.hello and not self.status['connected'] and self.status['stage'] in ('connecting','reconnecting'):
-                        self.status.update(connected=True,stage='ready',device_resolved=device,error=None)
+                        self.status.update(connected=True,stage='ready',device_resolved=device,error=None,retryable=False)
                         if self.moving_demo and self.drive_requested:self.drive_active=True
                     if self.status['connected'] and self.clock()-(self.last_status or (deadline-6))>4:
                         raise ValueError('WS63 心跳丢失，已停止采集')
@@ -321,7 +343,7 @@ class BroadcastSurvey:
                     if self.raw_file and self.clock()-self.last_flush>1:
                         self.raw_file.flush();self.last_flush=self.clock()
         except Exception as exc:
-            with self.lock:self._error(str(exc))
+            with self.lock:self._error(str(exc),retryable=True)
         finally:
             if self.stream:self.stream.close()
             self.stream=None
@@ -341,9 +363,7 @@ class BroadcastSurvey:
                 for p in self.folder.rglob('*'):
                     if p.is_file():z.write(p,p.relative_to(self.folder).as_posix())
                 z.writestr('heatmap.html',html_report(self.data(),self.grid.png()))
-                f=io.StringIO();w=csv.writer(f);w.writerow(['point_id','x_m','y_m','yaw_rad','median_dbm','std_db','samples'])
-                for p in self.points:w.writerow([p['point_id'],p['x'],p['y'],p['yaw'],p['median'],p['std'],p['n']])
-                z.writestr('summary.csv',f.getvalue())
+                z.writestr('summary.csv',station_summary_csv(self.points))
             return out.getvalue()
 
     def close(self):
@@ -352,6 +372,17 @@ class BroadcastSurvey:
         with self.lock:
             if self.moving_demo:self._save_drive()
             if self.raw_file:self.raw_file.flush();self.raw_file.close();self.raw_file=None
+
+
+def station_summary_csv(points):
+    output=io.StringIO()
+    writer=csv.writer(output)
+    interval_fields=('mean_interval_ms','median_interval_ms','p95_interval_ms')
+    writer.writerow(['point_id','x_m','y_m','yaw_rad','median_dbm','std_db','samples',*interval_fields])
+    for p in points:
+        writer.writerow([p['point_id'],p['x'],p['y'],p['yaw'],p['median'],p['std'],p['n'],
+                         *(p.get(field) for field in interval_fields)])
+    return output.getvalue()
 
 
 def saved_data(directory,grid):
@@ -376,7 +407,5 @@ def export_saved(directory,grid):
         for p in root.rglob('*'):
             if p.is_file():z.write(p,p.relative_to(root).as_posix())
         z.writestr('heatmap.html',html_report(data,grid.png()))
-        f=io.StringIO();w=csv.writer(f);w.writerow(['point_id','x_m','y_m','yaw_rad','median_dbm','std_db','samples'])
-        for p in data['points']:w.writerow([p['point_id'],p['x'],p['y'],p['yaw'],p['median'],p['std'],p['n']])
-        z.writestr('summary.csv',f.getvalue())
+        z.writestr('summary.csv',station_summary_csv(data['points']))
     return out.getvalue()

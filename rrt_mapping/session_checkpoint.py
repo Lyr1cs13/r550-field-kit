@@ -24,7 +24,7 @@ from tf2_ros import Buffer, TransformListener
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-STATE = ROOT / 'state/mapping'
+STATE = Path(os.environ.get('R550_MAPPING_STATE', ROOT / 'state/mapping'))
 
 
 def call(node, kind, name, request, timeout=10):
@@ -154,9 +154,10 @@ def save(node, output):
         'mapping_paused': True,
     }
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-    (ROOT/'maps').mkdir(exist_ok=True)
-    (ROOT / 'maps/latest_checkpoint.json').write_text(
-        json.dumps({'directory': str(output)}, indent=2))
+    if STATE == ROOT / 'state/mapping':
+        (ROOT/'maps').mkdir(exist_ok=True)
+        (ROOT / 'maps/latest_checkpoint.json').write_text(
+            json.dumps({'directory': str(output)}, indent=2))
     print(json.dumps(manifest, indent=2))
 
 

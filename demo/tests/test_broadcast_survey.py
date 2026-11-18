@@ -28,7 +28,7 @@ class Clock:
 
 class BroadcastTests(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):cls.grid=MapGrid(Path(__file__).resolve().parents[1]/'assets')
+    def setUpClass(cls):cls.grid=MapGrid(Path(__file__).resolve().parents[2]/'scenes/demo-room')
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.clock=Clock();self.b=BroadcastSurvey(Path(self.tmp.name)/'collection',self.grid,'fake',clock=self.clock,autostart=False)
@@ -54,6 +54,17 @@ class BroadcastTests(unittest.TestCase):
         self.b.visit=None;self.b.status['stage']='ready'
         for _ in range(80):self.sample(health={**self.h,'stationary':False})
         self.assertEqual(self.b.points,[])
+        self.b.raw_file.flush()
+        self.assertEqual(len((self.b.folder/'raw.csv').read_text().splitlines()),1)
+
+    def test_station_does_not_thin_five_millisecond_reports(self):
+        self.b.begin({**self.p,'wait':8.},self.h)
+        for _ in range(1620):self.sample(delta=.005)
+        result=self.b.points[0]
+        self.assertGreater(result['n'],1380)
+        self.assertAlmostEqual(result['mean_interval_ms'],5.,places=2)
+        self.assertEqual(result['p95_interval_ms'],5.)
+        self.assertGreater(self.b.snapshot()['reports_last_5s'],980)
     def test_weak_packet_count_not_fake_done(self):
         for _ in range(20):self.sample(delta=1.)
         self.assertEqual(self.b.snapshot()['stage'],'error');self.assertEqual(self.b.points,[])
@@ -115,6 +126,53 @@ class BroadcastTests(unittest.TestCase):
         with self.assertRaises(ValueError):m.start()
         self.assertEqual(backend.calls,[])
 
+    def test_station_loop_restarts_full_window_after_signal_loss_and_between_points(self):
+        m,backend=self.mission();m.collection.config['mode']='broadcast_station';m.start(repeat=True)
+        backend.ops[m.operation]['status']='succeeded';m.tick();m.tick()
+        first=self.b.visit['id']
+        for _ in range(13):self.sample()
+        self.clock.t+=5.1;self.b.check_window();m.tick()
+        self.assertEqual(m.index,0);self.assertEqual(len(backend.calls),1)
+        self.assertIsNone(self.b.visit);self.assertTrue(self.b.snapshot()['retryable'])
+        self.sample();m.tick()
+        self.assertNotEqual(self.b.visit['id'],first)
+        for _ in range(80):self.sample()
+        m.tick();self.assertEqual(m.index,1)
+        backend.ops[m.operation]['status']='succeeded';m.tick();m.tick()
+        self.assertEqual(self.b.snapshot()['stage'],'sampling')
+        self.assertEqual(len(self.b.points),1)
+        for _ in range(80):self.sample()
+        m.tick()
+        self.assertEqual((m.lap,m.index,m.phase),(2,0,'navigating'))
+        self.assertEqual([p['point_id'] for p in self.b.points],['p','p2'])
+        self.assertEqual(len({p['visit_id'] for p in self.b.points}),2)
+        m.stop()
+        self.assertFalse(m.repeat)
+
+    def test_lost_station_signal_can_recharge_without_skipping_incomplete_point(self):
+        from endurance import Endurance
+        m,backend=self.mission();m.collection.config['mode']='broadcast_station'
+        original=backend.snapshot
+        backend.snapshot=lambda:{**original(),'charging_stable':backend.charging}
+        m.endurance=Endurance(dict(enabled=True,low_voltage=10.,resume_voltage=12.,low_hold_seconds=2.,charge_hold_seconds=3.))
+        m.start(repeat=True)
+        backend.ops[m.operation]['status']='succeeded';m.tick();m.tick()
+        backend.voltage=9.8;m.tick();self.clock.t+=5.1;self.b.check_window();m.tick()
+        self.assertEqual((m.lap,m.index,m.phase),(1,0,'returning'))
+        self.assertTrue(m.endurance.resuming);self.assertEqual(self.b.points,[])
+        saved=json.loads((m.directory/'mission_checkpoint.json').read_text())
+        self.assertEqual(saved['index'],0);self.assertTrue(saved['repeat'])
+        backend.ops[m.operation]['status']='succeeded';m.tick()
+        self.assertEqual(m.phase,'docking')
+        backend.voltage=12.3;backend.charging=True;m.tick()
+        self.clock.t+=3.1;m.tick()
+        self.assertEqual(m.phase,'docked')
+        self.assertIn('WS63',m.message)
+        self.sample();m.tick()
+        self.assertEqual((m.phase,m.lap,m.index),('departing',1,0))
+        backend.charging=False;backend.ops[m.operation]['status']='succeeded';m.tick()
+        self.assertEqual((m.phase,m.index),('navigating',0))
+
     def test_moving_loop_collects_without_dwell_and_records_actual_positions(self):
         self.b.moving_demo=True;self.b.prepare([self.p])
         for i in range(90):self.sample(health={**self.h,'stationary':False,'survey_active':True,'pose':[.35,-1.4-i*.005,0.]})
@@ -157,7 +215,7 @@ class BroadcastTests(unittest.TestCase):
     def test_default_panel_loads_loop_preview_and_blocks_wrong_mode(self):
         from server import App
         from mock_backend import MockBackend
-        dock=json.loads((Path(__file__).resolve().parents[1]/'assets/dock_start.json').read_text(encoding='utf-8'))
+        dock=json.loads((Path(__file__).resolve().parents[2]/'scenes/demo-room/dock_start.json').read_text(encoding='utf-8'))
         backend=MockBackend(self.grid,dock);backend.confirm_localization()
         app=App(self.grid,backend,self.tmp.name);self.addCleanup(app.mission.collection.close)
         state=app.command({'action':'survey_load_north'})
@@ -233,7 +291,7 @@ class StreamTests(unittest.TestCase):
         def factory(*args,**kwargs):
             device=Stream(len(devices));devices.append(device);return device
         with tempfile.TemporaryDirectory() as folder:
-            grid=MapGrid(Path(__file__).resolve().parents[1]/'assets');b=BroadcastSurvey(folder,grid,'fake',factory=factory)
+            grid=MapGrid(Path(__file__).resolve().parents[2]/'scenes/demo-room');b=BroadcastSurvey(folder,grid,'fake',factory=factory)
             try:
                 deadline=time.monotonic()+5
                 while time.monotonic()<deadline:
@@ -245,7 +303,7 @@ class StreamTests(unittest.TestCase):
 
     def test_configuration_queued_is_not_ready_to_depart(self):
         with tempfile.TemporaryDirectory() as folder:
-            grid=MapGrid(Path(__file__).resolve().parents[1]/'assets');c=Collection(folder,grid)
+            grid=MapGrid(Path(__file__).resolve().parents[2]/'scenes/demo-room');c=Collection(folder,grid)
             try:
                 c.config={'mode':'broadcast','device':'auto'}
                 with self.assertRaises(ValueError):c.prepare([])
@@ -265,7 +323,7 @@ class StreamTests(unittest.TestCase):
             def flush(self):pass
             def close(self):self.closed=True
         with tempfile.TemporaryDirectory() as folder:
-            stream=Stream();grid=MapGrid(Path(__file__).resolve().parents[1]/'assets')
+            stream=Stream();grid=MapGrid(Path(__file__).resolve().parents[2]/'scenes/demo-room')
             b=BroadcastSurvey(folder,grid,'fake',factory=lambda *a,**k:stream)
             try:
                 deadline=time.monotonic()+3

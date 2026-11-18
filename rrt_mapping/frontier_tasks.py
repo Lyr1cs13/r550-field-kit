@@ -21,22 +21,23 @@ from rcl_interfaces.srv import SetParametersAtomically
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Twist, PointStamped, PolygonStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
-from nav2_msgs.action import NavigateToPose, ComputePathToPose
+from nav2_msgs.action import FollowPath, NavigateToPose, ComputePathToPose
 from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.action import ActionClient
 from std_msgs.msg import Bool, Float32, UInt8, Int8, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
-from wheeltec_rrt_msg.msg import PointArray
 
 
 class FrontierTasks(Node):
-    def __init__(self):
-        super().__init__('rrt_frontier_tasks')
+    def __init__(self, *, state=None, context=None):
+        super().__init__('site_mapping_control' if state is not None else 'rrt_frontier_tasks',context=context)
+        self.panel = state is not None
         self.declare_parameter('low_voltage_return', 10.0)
         self.declare_parameter('restore_session', False)
-        self.declare_parameter('start_paused', False)
-        self.nav = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self.declare_parameter('start_paused', state is not None)
+        self.nav = (ActionClient(self,FollowPath,'/follow_path') if self.panel else
+                    ActionClient(self,NavigateToPose,'/navigate_to_pose'))
         self.plan = ActionClient(self, ComputePathToPose, '/compute_path_to_pose')
         self.speed_client = self.create_client(SetParametersAtomically, '/controller_server/set_parameters_atomically')
         self.speed_limit, self.speed_pending = 0.12, False
@@ -45,12 +46,14 @@ class FrontierTasks(Node):
             '/global_costmap/clear_entirely_global_costmap')]
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
-        self.cmd = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.cmd = self.create_publisher(Twist, '/guard_cmd_vel' if state is not None else '/cmd_vel', 1)
         self.ir = self.create_publisher(Int8, '/robot_recharge_flag', 10)
         self.status = self.create_publisher(String, '/rrt_task_status', 10)
-        self.create_subscription(PoseStamped, '/assigned_frontier_goal', self.proposal, 10)
-        self.create_subscription(PointArray, '/filtered_goal_points', self.frontiers, 10)
-        self.create_subscription(PointStamped, '/clicked_point', self.clicked, 10)
+        if state is None:
+            from wheeltec_rrt_msg.msg import PointArray
+            self.create_subscription(PoseStamped, '/assigned_frontier_goal', self.proposal, 10)
+            self.create_subscription(PointArray, '/filtered_goal_points', self.frontiers, 10)
+            self.create_subscription(PointStamped, '/clicked_point', self.clicked, 10)
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.costmap, 1)
         self.create_subscription(PolygonStamped, '/local_costmap/published_footprint',
                                  lambda m: setattr(self, 'footprint', m), 1)
@@ -58,9 +61,10 @@ class FrontierTasks(Node):
         self.create_subscription(UInt8, '/robot_red_flag', lambda m:(setattr(self,'red',int(m.data)),self.got('ir',int(m.data))), qos_profile_sensor_data)
         self.create_subscription(Float32, '/PowerVoltage', lambda m: setattr(self, 'voltage', float(m.data)), qos_profile_sensor_data)
         self.create_service(Trigger, '/rrt_pause', lambda r, s: self.command('pause', s))
-        self.create_service(Trigger, '/rrt_resume', lambda r, s: self.command('explore', s))
-        self.create_service(Trigger, '/rrt_return_to_dock', lambda r, s: self.command('return', s))
-        self.create_service(Trigger, '/rrt_return_via_corridors', self.return_via_corridors)
+        if state is None:
+            self.create_service(Trigger, '/rrt_resume', lambda r, s: self.command('explore', s))
+            self.create_service(Trigger, '/rrt_return_to_dock', lambda r, s: self.command('return', s))
+            self.create_service(Trigger, '/rrt_return_via_corridors', self.return_via_corridors)
         self.mode, self.phase = 'explore', 'waiting_for_five_points'
         self.active = None
         self.busy = False
@@ -84,8 +88,9 @@ class FrontierTasks(Node):
         self.docking_since = 0.0
         self.successes, self.failures = 0, 0
         self.last_log = None
-        self.home = json.loads((Path(__file__).resolve().parent.parent/'state/mapping/dock_start.json').read_text())
-        self.output = Path(__file__).resolve().parent.parent/'state/mapping/task_status.json'
+        directory = state if state is not None else Path(__file__).resolve().parent.parent/'state/mapping'
+        self.home = json.loads((directory/'dock_start.json').read_text())
+        self.output = directory/'task_status.json'
         # Restore task state only when restarting this adapter in the same live
         # SLAM session. Never apply an old boundary to a newly started map.
         if self.get_parameter('restore_session').value:
@@ -396,7 +401,7 @@ class FrontierTasks(Node):
         low_voltage = self.get_parameter('low_voltage_return').value
         if self.voltage is not None and self.voltage < low_voltage and not self.charging:
             self.low_since = self.low_since or now
-            if now-self.low_since > 20 and self.mode == 'explore':
+            if now-self.low_since > 20 and self.mode == 'explore' and not self.panel:
                 self.command('return', Trigger.Response())
                 self.get_logger().warn(f'Voltage below {low_voltage:.1f} V for 20 s: requesting dock return.')
         else:

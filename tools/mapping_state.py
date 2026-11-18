@@ -8,9 +8,10 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 
 
-def prepare():
-    state=ROOT/'state/mapping'
-    if state.exists():shutil.move(str(state),str(ROOT/'state'/time.strftime('mapping_before_%Y%m%d_%H%M%S')))
+def prepare(state=None):
+    if state is None:
+        state=ROOT/'state/mapping'
+        if state.exists():shutil.move(str(state),str(ROOT/'state'/time.strftime('mapping_before_%Y%m%d_%H%M%S')))
     state.mkdir(parents=True)
     dock={'calibrated':True,'robot_pose':{'x':0.,'y':0.,'yaw':0.},'charger_approach':{'p_x':.6,'p_y':0.,'orien_z':-.1305261922,'orien_w':.9914448614},'departure_distance':.3}
     (state/'dock_start.json').write_text(json.dumps(dock,indent=2))

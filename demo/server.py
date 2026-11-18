@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import traceback
+from urllib.parse import parse_qs
 
 from map_grid import MapGrid
 from mission import Mission, QUIET
@@ -25,16 +26,36 @@ class App:
         self.loop_proposal=json.loads(cache.read_text(encoding='utf-8')) if cache.exists() else None
         if self.loop_proposal and self.loop_proposal.get('map_id')!=grid.map_id:self.loop_proposal=None
         self.parallel_proposal=None;self.probe_proposal=None
+        self.fas = None
+        fas_file = HERE.parent/'state/fas_robot.json'
+        if hasattr(backend,'preview_route') and (fas_file.exists() or fas_file.with_name('fas_robot_claim.json').exists()):
+            from fas_car import FasCar
+            self.fas = FasCar(backend,self.mission,fas_file)
 
     def view_state(self):
         state=self.mission.state();proposal=self.loop_proposal
         if proposal and len(proposal['points'])==len(state['points']) and all(a['id']==b['id'] and a['x']==b['x'] and a['y']==b['y'] for a,b in zip(proposal['points'],state['points'])):
             state['survey_route_preview']=proposal.get('preview_path',[])
+        if self.fas is not None:
+            state['fas'] = self.fas.state()
         return state
 
     def command(self, data):
         action = data['action'];m = self.mission
         with m.lock:
+            if ((action in {'go','start','resume','return','return_via','retreat','fleet_mode'} or action.startswith('fas_')) and
+                    (HERE.parent/'state/site-mapping/owns-robot').exists()):
+                raise ValueError('新场地页面正在接管车辆')
+            if action.startswith('fas_'):
+                if self.fas is None:
+                    raise ValueError('此车未配置双车射频实验')
+                result = self.fas.command(action,data)
+                return {'fas':self.fas.state(),**result}
+            if self.fas is not None and self.fas.lease.owner:
+                if action == 'stop':
+                    self.fas.operator_stop()
+                    return self.view_state()
+                raise ValueError('车辆由双车射频实验接管，可在此停车')
             if action == 'collection_config':
                 m.configure_collection(data['mode'], str(data.get('device','auto')), data.get('c5', False))
             elif action == 'survey_load_north':
@@ -61,10 +82,24 @@ class App:
                 m.event('已记录固定基站摆放说明；移动基站后请开始新的采集任务')
             elif action == 'save_points':
                 m.save_points(data['points'])
+            elif action == 'fleet_mode':
+                if m.phase not in QUIET or m.endurance.resuming or m.dock_retry_pending:
+                    raise ValueError('请先结束当前任务，再切换运行模式')
+                active=data.get('active')
+                switch=getattr(self.backend,'set_fleet_mode',None)
+                if type(active) is not bool or not switch:
+                    raise ValueError('运行模式无效或车端未配置双车运行区')
+                switch(active)
+            elif action == 'fleet_lease':
+                renew=getattr(self.backend,'renew_fleet_lease',None)
+                if not renew:raise ValueError('当前入口不支持双车运行许可')
+                renew()
+            elif action == 'recover_points':
+                m.load_checkpoint()
             elif action == 'go':
                 m.start(data['id'])
             elif action == 'start':
-                m.start(auto_return=data.get('auto_return', True),start_from=data.get('start_from',0))
+                m.start(auto_return=data.get('auto_return', True),start_from=data.get('start_from',0),repeat=data.get('repeat',False))
             elif action == 'survey_inherit':
                 identity=str(data.get('session',''))
                 if m.phase not in QUIET or not m.collection.broadcast or not m.collection.broadcast.moving_demo:raise ValueError('先停稳并连接广播采集板')
@@ -81,12 +116,21 @@ class App:
                 m.resume()
             elif action == 'stop':
                 m.stop()
+            elif action == 'retreat' and callable(getattr(m.backend,'retreat',None)):
+                m.retreat()
             elif action == 'return':
                 m.event('用户点击主动回充')
                 m.return_to_dock()
+            elif action == 'return_via' and callable(getattr(m.backend,'retreat',None)):
+                if m.phase not in QUIET:
+                    raise ValueError('请在停稳后重新规划返程')
+                via=m.validate_points([{**data['point'],'name':'走廊中线','wait':0.}])[0]
+                m.return_to_dock(via={**via,'return_via':True})
             elif action in ('initial_pose','initial_dock'):
                 if m.phase not in QUIET:
                     raise ValueError('先停止任务，再修改定位')
+                if action=='initial_dock' and not getattr(self.backend,'dock_calibrated',True):
+                    raise ValueError('此车桩位未标定，请按现场位置设置定位')
                 pose = self.backend.dock_pose if action == 'initial_dock' else [float(v) for v in data['pose']]
                 if len(pose) != 3 or not all(math.isfinite(v) for v in pose):
                     raise ValueError('定位数据无效')
@@ -108,7 +152,10 @@ class App:
     def tick(self):
         while self.running:
             try:
-                self.mission.tick()
+                with self.mission.lock:
+                    if self.fas is not None:
+                        self.fas.tick()
+                    self.mission.tick()
             except Exception as e:
                 traceback.print_exc()
                 with self.mission.lock:
@@ -116,7 +163,7 @@ class App:
             time.sleep(.05)
 
 
-def handler(app):
+def handler(app, desktop=None):
     class Handler(BaseHTTPRequestHandler):
         def respond(self, data, code=200, content='application/json; charset=utf-8'):
             if isinstance(data, (dict,list)):
@@ -125,10 +172,39 @@ def handler(app):
             self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)))
             self.end_headers();self.wfile.write(data)
 
+        def valid_desktop_host(self):
+            if desktop is None:
+                return True
+            port = self.server.server_port
+            if self.headers.get('Host') in (f'127.0.0.1:{port}', f'localhost:{port}'):
+                return True
+            self.respond({'error': '请从本机地址打开巡航面板'}, 421)
+            return False
+
         def do_GET(self):
+            if not self.valid_desktop_host():
+                return
             path = self.path.split('?',1)[0]
             if path == '/api/state':
-                state = app.view_state();state['control_token'] = app.token;self.respond(state)
+                if desktop:
+                    self.respond(desktop.view_state())
+                else:
+                    state = app.view_state();state['control_token'] = app.token;self.respond(state)
+            elif path == '/map.png':
+                query = parse_qs(self.path.partition('?')[2])
+                image = desktop.map_image(query.get('map_id', [None])[0]) if desktop else app.image
+                if image is None:
+                    self.respond({'error': '地图版本已更新'}, 404)
+                else:
+                    self.respond(image, content='image/png')
+            elif path in ('/','/app.js','/style.css','/ui.js','/vendor/tabler.min.css','/vendor/icons.svg'):
+                name = 'index.html' if path == '/' else path[1:]
+                content = ('text/css; charset=utf-8' if name.endswith('.css') else
+                           'text/javascript; charset=utf-8' if name.endswith('.js') else
+                           'image/svg+xml' if name.endswith('.svg') else 'text/html; charset=utf-8')
+                self.respond((HERE/'web'/name).read_bytes(),content=content)
+            elif desktop:
+                self.respond(*desktop.live_get(path))
             elif path == '/api/collection/export':
                 self.respond(app.mission.collection.export(),content='application/x-ndjson; charset=utf-8')
             elif path == '/api/collection/bundle':
@@ -163,21 +239,16 @@ def handler(app):
                 self.respond(html_report().encode('utf-8'),content='text/html; charset=utf-8')
             elif path == '/api/export':
                 self.respond({'schema':1,'map_id':app.grid.map_id,'points':app.mission.state()['points']})
-            elif path == '/map.png':
-                self.respond(app.image,content='image/png')
-            elif path in ('/','/app.js','/style.css','/ui.js','/vendor/tabler.min.css','/vendor/icons.svg'):
-                name = 'index.html' if path == '/' else path[1:]
-                content = ('text/css; charset=utf-8' if name.endswith('.css') else
-                           'text/javascript; charset=utf-8' if name.endswith('.js') else
-                           'image/svg+xml' if name.endswith('.svg') else 'text/html; charset=utf-8')
-                self.respond((HERE/'web'/name).read_bytes(),content=content)
             else:
                 self.respond({'error':'不存在的页面'},404)
 
         def do_POST(self):
+            if not self.valid_desktop_host():
+                return
             if self.path != '/api/command':
                 self.respond({'error':'不存在的接口'},404);return
-            if not secrets.compare_digest(self.headers.get('X-Control-Token',''),app.token):
+            token = self.headers.get('X-Control-Token', '')
+            if desktop is None and not secrets.compare_digest(token, app.token):
                 self.respond({'error':'页面控制会话失效，请刷新页面'},403);return
             try:
                 length = int(self.headers.get('Content-Length','0'))
@@ -185,7 +256,11 @@ def handler(app):
                     raise ValueError('请求过大或为空')
                 def invalid(value):
                     raise ValueError('不能使用无穷或非数值坐标')
-                data = json.loads(self.rfile.read(length).decode('utf-8'),parse_constant=invalid)
+                body = self.rfile.read(length)
+                if desktop:
+                    self.respond(*desktop.command(body, token))
+                    return
+                data = json.loads(body.decode('utf-8'),parse_constant=invalid)
                 self.respond(app.command(data))
             except (ValueError,KeyError,TypeError) as e:
                 self.respond({'error':str(e)},400)

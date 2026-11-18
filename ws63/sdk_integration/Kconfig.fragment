@@ -4,7 +4,7 @@ osource "application/samples/bt/sle/beacon_survey/Kconfig"
 # Outside the choice:
 config SUPPORT_SLE_PERIPHERAL
     bool
-    default y if SAMPLE_SUPPORT_BEACON_SURVEY_TX
+    default y if SAMPLE_SUPPORT_BEACON_SURVEY_TX || SAMPLE_SUPPORT_FAS_VEHICLE_A || SAMPLE_SUPPORT_FAS_VEHICLE_B
 config SUPPORT_SLE_CENTRAL
     bool
     default y if SAMPLE_SUPPORT_BEACON_SURVEY_RX

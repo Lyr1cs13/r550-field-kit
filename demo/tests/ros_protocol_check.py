@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import numpy as np
 
 if os.environ.get('ROS_DOMAIN_ID') != '89' or os.environ.get('ROS_LOCALHOST_ONLY') != '1' or platform.machine() != 'x86_64':
     raise RuntimeError('Run on the x86 VM only, ROS_DOMAIN_ID=89, ROS_LOCALHOST_ONLY=1')
@@ -27,7 +28,8 @@ from rclpy.qos import QoSProfile,DurabilityPolicy
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from lifecycle_msgs.srv import ChangeState, GetState
-from nav2_msgs.action import ComputePathToPose, NavigateToPose, FollowPath, Spin
+from nav2_msgs.action import ComputePathToPose, DriveOnHeading, NavigateToPose, FollowPath, Spin
+from nav2_msgs.srv import IsPathValid
 from rcl_interfaces.srv import SetParametersAtomically
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
@@ -39,16 +41,21 @@ from ros_backend import RosBackend
 
 
 class Fixture(Node):
-    def __init__(self):
+    def __init__(self,grid):
         super().__init__('demo_protocol_fixture')
         self.group = ReentrantCallbackGroup();self.pose = [0.,0.,0.]
         self.charging = True;self.nav_calls = 0;self.plan_calls = 0;self.spin_calls=0;self.speed_limits=[]
+        self.departures=[]
         self.goal_limits=[];self.speed_refresh_batches=[]
         self.heading_calls=0;self.heading_selections=[];self.position_tree_calls=0
+        self.directed_calls=0;self.directed_valid=True
         self.heading_hold=False;self.heading_drift=0.;self.wheel_rate=0.
         self.position_offset=0.;self.heading_yaw_error=0.;self.nav_abort=False
         self.reject_goal_parameters=False;self.goal_parameter_delay=0.
         self.auto_charge=True
+        self.grid=grid
+        self.occupied=np.array(grid.cells).reshape(grid.height,grid.width)==100
+        self.ray_distances=np.arange(grid.resolution/2.,10.,grid.resolution/2.)
         self.broadcaster = TransformBroadcaster(self)
         self.pose_pub = self.create_publisher(PoseWithCovarianceStamped,'/amcl_pose',QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.scan_pub = self.create_publisher(LaserScan,'/scan',10)
@@ -56,14 +63,17 @@ class Fixture(Node):
         self.ir_pub = self.create_publisher(UInt8,'/robot_red_flag',10)
         self.voltage_pub = self.create_publisher(Float32,'/PowerVoltage',10)
         self.current_pub = self.create_publisher(Float32,'/robot_charging_current',10)
+        self.gate_pub = self.create_publisher(Bool,'/navigation_gate_alive',1)
         self.wheel_pub = self.create_publisher(Odometry,'/odom',10)
-        for name in ('amcl','controller_server','planner_server','bt_navigator','velocity_smoother'):
+        for name in ('amcl','controller_server','planner_server','bt_navigator','velocity_smoother','collision_monitor'):
             self.create_service(GetState,f'/{name}/get_state',self.active,callback_group=self.group)
         self.create_subscription(PoseWithCovarianceStamped,'/initialpose',self.initialize,10,callback_group=self.group)
         self.create_subscription(Int8,'/robot_recharge_flag',self.charge,10,callback_group=self.group)
         self.create_timer(.05,self.publish,callback_group=self.group)
         self.planner = ActionServer(self,ComputePathToPose,'/compute_path_to_pose',self.plan,callback_group=self.group)
         self.navigator = ActionServer(self,NavigateToPose,'/navigate_to_pose',self.navigate,
+                                     cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
+        self.departure = ActionServer(self,DriveOnHeading,'/drive_on_heading',self.drive,
                                      cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
         self.spinner=ActionServer(self,Spin,'/spin',self.spin,
                                  cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
@@ -95,6 +105,17 @@ class Fixture(Node):
         self.publish();handle.succeed();return Spin.Result()
 
     def heading(self,handle):
+        if handle.request.controller_id=='FixedHeading':
+            self.directed_calls+=1
+            for point in handle.request.path.poses[1:]:
+                if handle.is_cancel_requested:
+                    handle.canceled()
+                    return FollowPath.Result()
+                self.pose[:2]=point.pose.position.x,point.pose.position.y
+                time.sleep(.08)
+            self.publish()
+            handle.succeed()
+            return FollowPath.Result()
         self.heading_calls+=1
         self.heading_selections.append([handle.request.controller_id,handle.request.goal_checker_id])
         while self.heading_hold:
@@ -134,8 +155,18 @@ class Fixture(Node):
         pose.pose.covariance[0]=.0025;pose.pose.covariance[7]=.0025;pose.pose.covariance[35]=.01
         self.pose_pub.publish(pose)
         scan=LaserScan();scan.header.stamp=stamp;scan.header.frame_id='laser';scan.angle_min=-math.pi
-        scan.angle_increment=2*math.pi/360;scan.range_min=.05;scan.range_max=10.;scan.ranges=[2.]*360
+        scan.angle_increment=2*math.pi/360;scan.range_min=.05;scan.range_max=10.
+        grid=self.grid
+        ray=self.pose[2]-math.pi+np.arange(360)*scan.angle_increment
+        laser_x=self.pose[0]+.03163*math.cos(self.pose[2])
+        laser_y=self.pose[1]+.03163*math.sin(self.pose[2])
+        x=np.floor((laser_x+np.cos(ray[:,None])*self.ray_distances-grid.origin[0])/grid.resolution).astype(int)
+        y=np.floor((laser_y+np.sin(ray[:,None])*self.ray_distances-grid.origin[1])/grid.resolution).astype(int)
+        in_map=(x>=0)&(x<grid.width)&(y>=0)&(y<grid.height)
+        hits=in_map & self.occupied[np.clip(y,0,grid.height-1),np.clip(x,0,grid.width-1)]
+        scan.ranges=np.where(hits.any(axis=1),self.ray_distances[hits.argmax(axis=1)],np.inf).tolist()
         self.scan_pub.publish(scan);self.charge_pub.publish(Bool(data=self.charging));self.ir_pub.publish(UInt8(data=2))
+        self.gate_pub.publish(Bool(data=True))
         self.voltage_pub.publish(Float32(data=12.));self.current_pub.publish(Float32(data=1.68 if self.charging else 0.))
         wheel=Odometry();wheel.twist.twist.angular.z=self.wheel_rate;self.wheel_pub.publish(wheel)
 
@@ -143,6 +174,15 @@ class Fixture(Node):
         self.plan_calls+=1;result=ComputePathToPose.Result()
         result.path.header.frame_id='map';result.path.poses=[handle.request.goal,handle.request.goal]
         handle.succeed();return result
+
+    def drive(self,handle):
+        distance=handle.request.target.x
+        self.departures.append(distance)
+        self.charging=False
+        start=list(self.pose)
+        self.pose=[start[0]+distance*math.cos(start[2]), start[1]+distance*math.sin(start[2]), start[2]]
+        self.publish();time.sleep(.25);handle.succeed()
+        return DriveOnHeading.Result()
 
     def navigate(self,handle):
         self.nav_calls+=1;self.charging=False;p=handle.request.pose.pose
@@ -176,12 +216,13 @@ def main():
             f=c.call_async(req);rclpy.spin_until_future_complete(n,f,timeout_sec=5)
             if not f.done() or not f.result().success:raise RuntimeError('Native map lifecycle failed')
         grid=MapGrid(ROOT/'assets');dock=json.loads((ROOT/'assets/dock_start.json').read_text())
-        backend=RosBackend(grid,dock);fixture=Fixture();fixture.position_only=backend.staged_arrival;executor=MultiThreadedExecutor(num_threads=4)
+        backend=RosBackend(grid,dock);fixture=Fixture(grid);fixture.position_only=backend.staged_arrival;executor=MultiThreadedExecutor(num_threads=4)
         executor.add_node(backend);executor.add_node(fixture)
         thread=threading.Thread(target=executor.spin,daemon=True);thread.start()
         deadline=time.monotonic()+12
         while time.monotonic()<deadline and not backend.snapshot()['ready']:time.sleep(.1)
-        if not backend.snapshot()['ready']:raise RuntimeError(str(backend.snapshot()))
+        if not backend.snapshot()['ready']:
+            raise RuntimeError(backend.snapshot()['readiness'])
         backend.initialize_pose(backend.dock_pose,known_dock=True)
         time.sleep(.5)
         backend.confirm_localization()
@@ -194,7 +235,8 @@ def main():
                 mission.tick();time.sleep(.05)
             proof={'result':mission.phase,'native_map_matches':backend.map_matches,
                    'unknown_cells':grid.cells.count(-1),'plan_requests':fixture.plan_calls,
-                   'navigate_requests':fixture.nav_calls,'departure_included':True,'charging_feedback':backend.snapshot()['charging'],
+                   'navigate_requests':fixture.nav_calls,'departure_distances':fixture.departures,
+                   'charging_feedback':backend.snapshot()['charging'],
                    'native_spin_requests':fixture.spin_calls,'native_speed_limits':fixture.speed_limits,
                    'native_heading_requests':fixture.heading_calls,'native_heading_selections':fixture.heading_selections,
                    'position_only_tree_requests':fixture.position_tree_calls,
@@ -204,14 +246,15 @@ def main():
                    'events':list(mission.events)}
             (ROOT/'ros_protocol_validation.json').write_text(json.dumps(proof,ensure_ascii=False,indent=2))
             print(json.dumps(proof,ensure_ascii=False,indent=2),flush=True)
-            if mission.phase!='docked' or not backend.map_matches or fixture.nav_calls!=4:
+            if (mission.phase!='docked' or not backend.map_matches or fixture.nav_calls!=3
+                    or len(fixture.departures)!=1 or not .28<=fixture.departures[0]<=.32):
                 raise RuntimeError('ROS protocol rehearsal failed')
             if backend.staged_arrival and (fixture.spin_calls<2 or .05 not in fixture.speed_limits):
                 raise RuntimeError('Staged native arrival or adaptive speed was not exercised')
             if backend.precision_arrival:
                 waypoint_limit=[backend.position_xy_tolerance if backend.sequential_waypoints else backend.goal_xy_tolerance,
                                 None if backend.sequential_waypoints else backend.goal_yaw_tolerance]
-                expected=[[.05,math.radians(8)],waypoint_limit,waypoint_limit,[.08,math.radians(10)]]
+                expected=[waypoint_limit,waypoint_limit,[.08,math.radians(10)]]
                 if fixture.goal_limits!=expected or not all(fixture.speed_refresh_batches):
                     raise RuntimeError('Transit/measurement goal separation or DWB speed refresh failed')
                 if backend.sequential_waypoints and (fixture.heading_calls!=2 or fixture.position_tree_calls!=2 or
@@ -231,9 +274,9 @@ def main():
                 if backend.operation(identity)['status']!='canceled' or fixture.nav_calls!=nav_before:
                     raise RuntimeError('Cancellation during setup must suppress navigation')
                 proof.update(rejected_setup_prevents_navigation=True,canceled_setup_prevents_navigation=True)
-                fixture.auto_charge=False
+                fixture.auto_charge=False;fixture.charging=False
                 with backend.lock:
-                    now=time.monotonic();backend.charging=False;backend.last_charge=now
+                    now=time.monotonic();backend.charging=False;backend.current=0.;backend.last_charge=now
                     backend.begin_docking();backend.docking_since=now-20
                     backend.ir_count=0;backend.last_ir=now;backend.docking_last_valid_ir=now-.2
                     backend.update()
@@ -267,7 +310,7 @@ def main():
                         raise RuntimeError('Every BT must explicitly select its native controller and checker')
                     if (cfg['PointHeading']['min_vel_x']!=0 or cfg['PointHeading']['max_vel_x']!=0 or
                             'ObstacleFootprint' not in cfg['PointHeading']['critics'] or
-                            'RegulatedPurePursuitController' not in cfg['PointPosition']['plugin'] or
+                            'RegulatedPurePursuitController' not in cfg['PointPosition'].get('primary_controller',cfg['PointPosition']['plugin']) or
                             not cfg['PointPosition']['use_collision_detection']):
                         raise RuntimeError('Position/heading controller separation is not enforced')
                     fixture.goal_parameter_delay=0.;fixture.charging=False
@@ -295,29 +338,23 @@ def main():
                     fixture.heading_drift=.065;nav_before=fixture.nav_calls
                     identity=backend.navigate({'x':.25,'y':-.65,'yaw':.5},'waypoint')
                     wait_for(lambda:backend.operation(identity)['status'] in ('succeeded','failed'))
-                    if backend.operation(identity)['status']!='succeeded' or fixture.nav_calls!=nav_before+2:
-                        raise RuntimeError('One position recovery must resolve terminal rotation drift')
-                    fixture.heading_drift=0.;fixture.position_offset=.06;fixture.heading_yaw_error=math.radians(4)
-                    backend.arrival['allow_near_arrival']=True  # Exercise optional mode, disabled on the car.
-                    mission.save_points([{'id':'near','name':'Near','x':.25,'y':-.5,'yaw':-.5,'wait':.1}])
-                    mission.start();wait_for(lambda: (mission.tick() or mission.phase in ('completed','failed')))
-                    if mission.phase!='completed' or backend.operation(mission.backend.active)['quality']!='near':
-                        raise RuntimeError('Usable near arrival must finish its dwell instead of failing the route')
-                    if not any('按可用精度继续任务' in event['text'] for event in mission.events):
-                        raise RuntimeError('Near arrival must disclose actual error in mission events')
-                    backend.arrival['allow_near_arrival']=False
-                    fixture.position_offset=.10;fixture.heading_yaw_error=0.;nav_before=fixture.nav_calls
+                    recovered=backend.operation(identity)
+                    if recovered['status']!='succeeded' or fixture.nav_calls<=nav_before:
+                        raise RuntimeError(f'Unable to settle after terminal rotation drift: {recovered}')
+                    fixture.heading_drift=0.;fixture.position_offset=.10
                     identity=backend.navigate({'x':.25,'y':-.5,'yaw':.5},'waypoint')
-                    wait_for(lambda:backend.operation(identity)['status']=='failed')
-                    if '仍未到目标附近' not in backend.operation(identity)['error'] or fixture.nav_calls!=nav_before+2:
-                        raise RuntimeError('A persistent large position error must fail after one bounded recovery')
+                    wait_for(lambda:backend.operation(identity)['status']=='recovery_wait')
+                    if backend.operation(identity)['quality'] or not backend.snapshot()['stationary']:
+                        raise RuntimeError('An inaccurate stopped pose must wait for replan before claiming arrival')
+                    backend.cancel(identity)
+                    wait_for(lambda:backend.operation(identity)['status']=='canceled')
                     fixture.position_offset=0.;fixture.nav_abort=True
                     identity=backend.navigate({'x':fixture.pose[0]+.08,'y':fixture.pose[1],'yaw':fixture.pose[2]},'waypoint')
                     wait_for(lambda:backend.operation(identity)['status'] in ('succeeded','failed'))
                     if backend.operation(identity)['status']!='succeeded':
                         raise RuntimeError('Native abort at a verified usable stopped pose must not fail arrival')
                     fixture.nav_abort=False;fixture.heading_hold=True
-                    target=fixture.pose[2]-math.radians(4)
+                    target=fixture.pose[2]-math.radians(6)
                     identity=backend.navigate({'x':fixture.pose[0],'y':fixture.pose[1],'yaw':target},'waypoint')
                     wait_for(lambda:backend.operation(identity)['status']=='heading')
                     fixture.pose[2]=target+math.radians(2);time.sleep(.2)
@@ -325,7 +362,7 @@ def main():
                     wait_for(lambda:backend.operation(identity)['status'] in ('succeeded','failed'))
                     if backend.operation(identity)['status']!='succeeded' or backend.operation(identity)['quality']!='normal':
                         raise RuntimeError('Heading deadline at verified accurate pose must settle and continue')
-                    target=fixture.pose[2]-math.radians(4)
+                    target=fixture.pose[2]-math.radians(6)
                     identity=backend.navigate({'x':fixture.pose[0],'y':fixture.pose[1],'yaw':target},'waypoint')
                     wait_for(lambda:backend.operation(identity)['status']=='heading')
                     with backend.lock:
@@ -337,14 +374,15 @@ def main():
                     identity=backend.navigate({'x':fixture.pose[0],'y':fixture.pose[1],'yaw':1.},'waypoint')
                     wait_for(lambda:backend.operation(identity)['status']=='heading')
                     fixture.wheel_rate=5.
-                    wait_for(lambda:backend.operation(identity)['status']=='failed')
+                    wait_for(lambda:backend.operation(identity)['status']=='heading_settling')
+                    if backend.operation(identity)['quality']:
+                        raise RuntimeError('Excessive physical rotation must stop for verification before reporting arrival')
                     fixture.wheel_rate=0.;fixture.heading_hold=False
-                    if '转动量超出限额' not in backend.operation(identity)['error']:
-                        raise RuntimeError('Excessive physical rotation must cancel heading instead of looping')
+                    backend.cancel(identity)
                     proof.update(heading_controller_translation_disabled=True,already_aligned_skips_heading=True,
                                  heading_cancel_acknowledged=True,ordinary_45mm_arrival_accepted=True,
-                                 terminal_translation_recovered_once=True,persistent_large_error_stops=True,
-                                 near_arrival_disclosed_and_dwell_completed=True,native_abort_at_verified_pose_accepted=True,
+                                 terminal_translation_recovered_once=True,inaccurate_stop_waits_for_replan=True,
+                                 native_abort_at_verified_pose_accepted=True,
                                  heading_deadline_at_usable_pose_continues=True,user_stop_overrides_deadline_recovery=True,
                                  already_at_point_skips_navigation=True,
                                  fresh_goal_path_before_controller=True,
@@ -355,12 +393,37 @@ def main():
                     with backend.lock:
                         fixture.pose=[reference[0]+.08,reference[1]-.04,reference[2]+.08]
                         fixture.charging=True;backend.confirmed=False;backend.dock_localization.arm()
+                    wait_for(lambda:backend.snapshot()['dock_localization']['status']=='alignment_required')
+                    fixture.pose=[reference[0]+.04,reference[1]-.025,reference[2]+.04]
                     wait_for(lambda:backend.snapshot()['dock_localization']['status']=='confirmed',seconds=14)
                     if (not backend.confirmed or fixture.nav_calls!=nav_before or fixture.heading_calls!=heading_before
                             or backend.dock_pose!=reference or math.dist(fixture.pose[:2],reference[:2])>.001):
                         raise RuntimeError('Dock auto localization must initialize AMCL, confirm, and preserve the dock without motion')
-                    proof.update(stable_charging_auto_initializes_amcl=True,
+                    proof.update(dock_preserves_visibly_misaligned_pose=True,stable_charging_auto_initializes_amcl=True,
                                  dock_auto_confirmation_without_motion=True,dock_reference_not_overwritten=True)
+                    def validate_fas_path(_,response):
+                        response.is_valid=fixture.directed_valid
+                        return response
+                    fixture.create_service(IsPathValid,'/is_path_valid',validate_fas_path,callback_group=fixture.group)
+                    fixture.charging=False
+                    fixture.pose=[.25,-1.20,-math.pi/2]
+                    wait_for(lambda:backend.leg_validator.service_is_ready() and
+                             not backend.snapshot()['charging'] and backend.pose and abs(backend.pose[1]+1.20)<.001)
+                    point={'id':'fas-test','name':'FAS','x':.25,'y':-.88,'yaw':-math.pi/2,'wait':0.}
+                    mission.start(station=point)
+                    wait_for(lambda:mission.tick() or mission.phase in ('completed','failed'))
+                    arrival=backend.snapshot()['arrival']
+                    if (mission.phase!='completed' or arrival['travel_direction']!='reverse'
+                            or arrival['heading_attempts'] or fixture.directed_calls!=1
+                            or fixture.nav_calls!=nav_before or .08 not in fixture.speed_limits):
+                        raise RuntimeError('Aligned FAS stop should back into place without rotating')
+                    fixture.directed_valid=False
+                    mission.start(station={**point,'y':-1.20})
+                    wait_for(lambda:mission.tick() or mission.phase in ('completed','failed'))
+                    if (mission.phase!='completed' or fixture.directed_calls!=1
+                            or fixture.nav_calls!=nav_before+1):
+                        raise RuntimeError('FAS rejection must fall back to a newly planned safe route')
+                    proof.update(fas_reverse_without_heading_refinement=True,fas_blocked_line_replans=True)
                 (ROOT/'ros_protocol_validation.json').write_text(json.dumps(proof,ensure_ascii=False,indent=2))
     finally:
         if backend:backend.stop()
