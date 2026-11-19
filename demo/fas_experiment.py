@@ -1,4 +1,5 @@
 """Ordered two-vehicle RSSI search and durable state for the fixed base host."""
+from collections import Counter, deque
 from dataclasses import dataclass
 import hashlib
 from itertools import permutations
@@ -11,6 +12,8 @@ from statistics import median
 import time
 import uuid
 
+from arrival_policy import FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE
+
 
 PROTOCOL = 'FAS_PAIR_1'
 CARS = ('A', 'B')
@@ -18,7 +21,16 @@ BANDS = ('sle', 'c5')
 MIN_DELTA_DB = 6.0
 STATE_COUNT = 4096
 MIN_STATION_SEPARATION = .95
-LOCALIZATION_PAD = .50
+LOCALIZATION_PAD = .60
+EXCLUSIVE_LOCALIZATION_PAD = .90
+PARKED_PEER_CLEARANCE = .60
+MAX_FLEET_SIGMA = .13
+MIN_SCAN_AGREEMENT = .80
+RECOVERY_STATE = -3
+
+
+class RecoveryWait(ValueError):
+    """The run can continue when the missing operating condition recovers."""
 
 
 def canonical(obj):
@@ -88,6 +100,15 @@ class Stations:
 
         return sorted((pair for pair in self.pairs if pair not in tested), key=rank)
 
+    def motion_ranked(self, positions, last_pair, visits):
+        def rank(pair):
+            distance = sum(abs(self.order[dest]-self.order[origin]) for dest,origin in zip(pair,positions))
+            repeated = sum(visits[dest] for dest in pair)
+            stationary = sum(dest==origin for dest,origin in zip(pair,positions))
+            return (distance + 1.6*repeated + .65*stationary, pair)
+
+        return sorted((pair for pair in self.pairs if pair!=last_pair), key=rank)
+
 
 def sample_box(path, pad=LOCALIZATION_PAD):
     xs, ys = zip(*[point[:2] for point in path])
@@ -99,7 +120,97 @@ def boxes_apart(first, second, gap=.10):
                first[2]-second[3], second[2]-first[3]) >= gap
 
 
-def move_batches(starts, ends, paths, *, exclusive=False):
+def parallel_bounds(paths):
+    """Reserve room for replanning on each side of a verified divider."""
+    planned = {car:sample_box(paths[car]) for car in CARS}
+    gap, edge, lead, follow = max((planned[b][axis]-planned[a][axis+1],axis,a,b)
+                                  for axis in (0,2) for a,b in (CARS,CARS[::-1]))
+    if gap<.10:
+        return None
+    split = (planned[lead][edge+1]+planned[follow][edge])/2
+    bounds = {car:list(sample_box(paths[car],pad=EXCLUSIVE_LOCALIZATION_PAD)) for car in CARS}
+    bounds[lead][edge+1] = min(bounds[lead][edge+1],split-.05)
+    bounds[follow][edge] = max(bounds[follow][edge],split+.05)
+    return bounds
+
+
+def position_sigma(health):
+    cov = health.get('localization_covariance')
+    if not cov or len(cov)<2 or any(v is None or not math.isfinite(v) or v<0 for v in cov[:2]):
+        return None
+    return math.sqrt(max(cov[:2]))
+
+
+def scan_confirmed(health):
+    score=health.get('scan_map_agreement') or 0.
+    window=health.get('scan_window_agreement',score)
+    return (health.get('scan_structure_verified') is True
+            or (window is not None and window>=MIN_SCAN_AGREEMENT))
+
+
+class ScanEvidence:
+    """Brief independent scan evidence, invalidated by stale data or a pose jump."""
+    def __init__(self):
+        self.frames=deque(maxlen=6)
+
+    def add(self, stamp, score, verified, sensor_pose):
+        if not self.frames or stamp>self.frames[-1][0]:
+            self.frames.append((stamp,score,verified,sensor_pose))
+
+    def latest(self, now):
+        recent=[row for row in self.frames if -.03<=now-row[0]<=.80]
+        if len(recent)<3 or now-recent[-1][0]>.38:
+            return None,False
+        current=recent[-1][3]
+        linked=[row for row in recent if math.dist(row[3][:2],current[:2])<=.075
+                and yaw_error(row[3][2],current[2])<=math.radians(6)]
+        if len(linked)<3:
+            return None,False
+        matches=[row for row in linked if row[2] and now-row[0]<=.65]
+        score=median(row[1] for row in linked)
+        return score,len(matches)>=2 and now-matches[-1][0]<=.40
+
+
+def fleet_pose_ready(health):
+    age, sigma = health.get('pose_age_s'), position_sigma(health)
+    return bool(health.get('ready') and health.get('localization_confirmed') and health.get('pose')
+                and age is not None and 0.<=age<=.45 and sigma is not None and sigma<=MAX_FLEET_SIGMA
+                and scan_confirmed(health) and not health.get('fas_localization_active'))
+
+
+def stopped_station_arrival(health):
+    """Keep a completed physical stop observable after its motion lease ends."""
+    arrival=health.get('arrival') or {}
+    age=health.get('pose_age_s')
+    position,heading=(arrival.get(key) for key in ('position_error','yaw_error_deg'))
+    return bool(health.get('stationary') and health.get('ready') and health.get('localization_confirmed')
+                and age is not None and 0.<=age<=.45 and arrival.get('kind')=='waypoint'
+                and arrival.get('status') in ('position_settling','heading_settling','succeeded')
+                and position is not None and 0.<=position<=FAS_STATION_POSITION_TOLERANCE
+                and heading is not None and 0.<=heading<=math.degrees(FAS_STATION_YAW_TOLERANCE))
+
+
+def peer_clearance(first_sigma, second_sigma, *, moving_together=False):
+    minimum = .70 if moving_together else PARKED_PEER_CLEARANCE
+    return max(minimum, .38+2*(first_sigma+second_sigma))
+
+
+def clear_of_parked_peer(path, peer, clearance=PARKED_PEER_CLEARANCE):
+    points = [point[:2] for point in path]
+    if not points or any(math.dist(point,peer[:2]) < clearance for point in points):
+        return False
+    px,py = peer[:2]
+    for (ax,ay),(bx,by) in zip(points,points[1:]):
+        dx,dy = bx-ax,by-ay
+        squared = dx*dx+dy*dy
+        if squared:
+            fraction = max(0.,min(1.,((px-ax)*dx+(py-ay)*dy)/squared))
+            if math.hypot(ax+fraction*dx-px,ay+fraction*dy-py) < clearance:
+                return False
+    return True
+
+
+def move_batches(starts, ends, paths, *, exclusive=False, clearance=PARKED_PEER_CLEARANCE):
     """Reserve the full planned corridor, including the stationary peer's footprint.
 
     Each returned step uses independent onboard bounds before movement starts.
@@ -113,11 +224,11 @@ def move_batches(starts, ends, paths, *, exclusive=False):
     for lead, follow in (CARS, CARS[::-1]):
         if lead not in move:
             continue
-        if not boxes_apart(move[lead], sample_box([starts[follow]])):
+        if not clear_of_parked_peer(paths[lead], starts[follow], clearance):
             continue
         if follow not in move:
             return ((lead,),)
-        if boxes_apart(move[follow], sample_box([ends[lead]])):
+        if clear_of_parked_peer(paths[follow], ends[lead], clearance):
             return ((lead,), (follow,))
     return None
 
@@ -254,9 +365,27 @@ class Journal:
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO states VALUES (-1,'charging',?)",(canonical(cars),))
 
+    def set_activity(self, stage, message):
+        with self.connection:
+            self.connection.execute("INSERT OR REPLACE INTO states VALUES (?,?,?)",
+                                    (RECOVERY_STATE,stage,canonical({'message':message})))
+
+    def motion_completed(self):
+        return self.connection.execute("SELECT COUNT(*) FROM states WHERE state_id>=0 AND status='arrived'").fetchone()[0]
+
+    def queue_charge_check(self):
+        with self.connection:
+            if self.state(-2) is None:
+                self.complete(-2,'charge_check',{'cars':list(CARS)})
+                self.connection.execute("INSERT OR REPLACE INTO states VALUES (-1,'charging',?)",(canonical(CARS),))
+
     def tested(self, state):
         return {(r['a'],r['b']) for r in self.connection.execute(
             "SELECT a,b FROM trials WHERE state_id=? AND status IN ('pass','miss')", (state,))}
+
+    def motion_failures(self, state):
+        failed=self.connection.execute("SELECT a,b FROM trials WHERE state_id=? AND status='invalid'",(state,))
+        return Counter((row['a'],row['b']) for row in failed)
 
     def prior_winners(self):
         rows = self.connection.execute("SELECT a,b,COUNT(*) AS n FROM trials WHERE status='pass' GROUP BY a,b")
@@ -288,12 +417,69 @@ class Journal:
             self.connection.execute("UPDATE trials SET status='invalid',receipt=?,completed_utc=? WHERE id=? AND status='pending'",
                                     (canonical({'reason':reason,'receipt':receipt}),time.time(),trial['id']))
 
+    def finish_motion(self, trial, poses):
+        with self.connection:
+            changed=self.connection.execute(
+                "UPDATE trials SET status='arrived',receipt=?,completed_utc=? WHERE id=? AND status='pending'",
+                (canonical(poses),time.time(),trial['id'])).rowcount
+            if changed!=1:
+                raise ValueError('当前行驶轮次已结束')
+            self.complete(trial['state_id'],'arrived',
+                          {'trial_id':trial['id'],'pair':[trial['a'],trial['b']],'poses':poses})
+
     def complete(self, state, status, details):
         self.connection.execute('INSERT INTO states VALUES (?,?,?)', (state,status,canonical(details)))
 
     def report(self):
         return [{'state_id':r['state_id'],'status':r['status'],**json.loads(r['details'])}
                 for r in self.connection.execute('SELECT * FROM states WHERE state_id>=0 ORDER BY state_id')]
+
+
+def position_rounds(journal, stations, driver, *, start, count, max_pairs, recharge_after=None, order_pairs=None):
+    """Rehearse the real trips and charge policy without any RF results."""
+    completed=journal.report()
+    visits=Counter(point for row in completed for point in row['pair'])
+    last_pair=tuple(completed[-1]['pair']) if completed else None
+    for number in range(start,start+count):
+        if journal.state(number):
+            continue
+        if recharge_after is not None and len(completed)>=recharge_after:
+            journal.queue_charge_check()
+        driver.service_energy()
+        pending=journal.pending()
+        if pending is not None and pending['state_id']!=number:
+            raise ValueError('还有未完成的位置对，请沿用原轮次范围继续')
+        candidates=stations.motion_ranked(driver.positions(),last_pair,visits)
+        candidates.sort(key=journal.motion_failures(number).__getitem__)
+        if order_pairs is not None:
+            candidates=order_pairs(candidates,max_pairs)
+        tried=set()
+        if pending is not None:
+            candidates.insert(0,(pending['a'],pending['b']))
+        for pair in candidates:
+            if pair in tried:
+                continue
+            if len(tried)>=max_pairs:
+                break
+            tried.add(pair)
+            if pending is None:
+                trial_id=uuid.uuid4().hex
+                journal.start(pair,number,{'trial_id':trial_id,'purpose':'motion_only','pair':pair})
+                pending=journal.pending()
+            print(f'轮次 {number+1}，一号车 {pair[0]}，二号车 {pair[1]}',flush=True)
+            poses=driver.place(pair)
+            if poses is not None:
+                journal.finish_motion(pending,poses)
+                completed.append({'pair':pair})
+                visits.update(pair)
+                last_pair=pair
+                print(f'轮次 {number+1} 两车已停稳',flush=True)
+                break
+            journal.abandon(pending,'未找到能让两车到站的安全路线')
+            pending=None
+            print(f'轮次 {number+1} 保留，复核下一组位置',flush=True)
+        if not journal.state(number):
+            raise RecoveryWait(f'第 {number+1} 组暂无可安全完成的位置对')
 
 
 def search(journal, stations, c5_codes, links, receivers, driver, *, start=0, count=STATE_COUNT,

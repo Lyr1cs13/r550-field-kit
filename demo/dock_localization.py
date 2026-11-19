@@ -1,6 +1,12 @@
 """One stationary AMCL initialization per verified charging visit. No motion."""
 import math
 
+from directed_route import dock_offset
+
+DOCK_MATCH_RADIUS = .14
+SCAN_FIT_TIMEOUT = 60.
+AMCL_VERIFY_TIMEOUT = 15.
+
 
 def localization_inputs_ready(now, *, map_matches, mapping, last_scan, lifecycle):
     # Nav2 costmaps can wait for map->base TF during configuration. AMCL must
@@ -9,6 +15,20 @@ def localization_inputs_ready(now, *, map_matches, mapping, last_scan, lifecycle
             and all(lifecycle.get(name,(0,0))[0] == 3
                     and now-lifecycle[name][1] < 8
                     for name in ('amcl','map_server')))
+
+
+def in_dock_capture(pose, reference):
+    if not pose or not all(math.isfinite(v) for v in pose):
+        return False
+    along,side = dock_offset(pose,reference)
+    angle = math.remainder(pose[2]-reference[2],2*math.pi)
+    return abs(along)<=.28 and abs(side)<=DOCK_MATCH_RADIUS and abs(angle)<=math.radians(5)
+
+
+def matches_dock(pose, reference):
+    return (bool(pose) and all(math.isfinite(v) for v in pose)
+            and math.dist(pose[:2],reference[:2])<=DOCK_MATCH_RADIUS
+            and abs(math.remainder(pose[2]-reference[2],2*math.pi))<=math.radians(10))
 
 
 class DockLocalization:
@@ -35,7 +55,7 @@ class DockLocalization:
         self.started = now
 
     def step(self, now, *, charging, stationary, sensors_ready, busy, pose,
-             amcl_updated, pose_request_pending):
+             amcl_updated, pose_request_pending, scan_pending=False, scan_started=False):
         if self.status == 'confirmed' and not charging:
             if self.away_since is None:
                 self.away_since = now
@@ -50,18 +70,19 @@ class DockLocalization:
             self.arm()
             return None
         if self.status in ('waiting','alignment_required') and pose is not None:
-            angle=math.atan2(math.sin(pose[2]-self.reference[2]),math.cos(pose[2]-self.reference[2]))
-            # Electrical contact alone does not establish a mechanically seated
-            # pose. Never erase a visible side/angle error by seeding the dock.
-            if (not all(math.isfinite(v) for v in pose) or
-                    math.dist(pose[:2],self.reference[:2])>.06 or abs(angle)>math.radians(5)):
+            # The search gate admits longitudinal encoder overrun. The fitted
+            # scan and the resulting AMCL pose must still match this dock.
+            if not in_dock_capture(pose,self.reference):
                 self.status='alignment_required';self.stable_since=None
                 return None
             if self.status=='alignment_required':self.status='waiting'
-        eligible = charging and stationary and sensors_ready
+        deadline = SCAN_FIT_TIMEOUT if scan_pending else AMCL_VERIFY_TIMEOUT
+        # Once a verified charging visit triggered a scan, complete pose
+        # verification at rest even if the electrical contact bounces.
+        eligible = stationary and sensors_ready and (charging or (self.status=='applying' and scan_started))
         if not eligible:
             self.stable_since = self.aligned_since = None
-            if self.status == 'applying' and now-self.started > 15:
+            if self.status == 'applying' and now-self.started > deadline:
                 self.status = 'attention'
             return None
         if self.stable_since is None:
@@ -74,15 +95,10 @@ class DockLocalization:
             self.status = 'applying'
             self.started = now
             return 'initialize'
-        if now-self.started > 15:
+        if now-self.started > deadline:
             self.status = 'attention'
             return None
-        aligned = False
-        if pose and all(math.isfinite(v) for v in pose):
-            angle = math.atan2(math.sin(pose[2]-self.reference[2]),
-                               math.cos(pose[2]-self.reference[2]))
-            aligned = math.dist(pose[:2], self.reference[:2]) <= .10 and abs(angle) <= math.radians(10)
-        if pose_request_pending or not amcl_updated or not aligned:
+        if pose_request_pending or not amcl_updated or not matches_dock(pose,self.reference):
             self.aligned_since = None
             return None
         if self.aligned_since is None:

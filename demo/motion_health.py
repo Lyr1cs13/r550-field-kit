@@ -63,8 +63,10 @@ class LocalizationGuard:
         self.reason = ''
         self.recovery_since = None
         self.recovery_pose = None
+        self.anchor = None
+        self.manual_recovery = False
 
-    def recover(self, now, *, stationary, covariance, scan_fraction, scan_count, pose, fresh):
+    def recover(self, now, *, stationary, covariance, scan_fraction, scan_count, pose, fresh, fixed_edges=False):
         """Require a stationary, tight and sustained scan/map solution before release.
 
         Repeated map geometry can still be ambiguous; this cannot prove global truth.
@@ -72,7 +74,7 @@ class LocalizationGuard:
         good=(self.fault and not self.manual_recovery and stationary and fresh and pose is not None and covariance is not None
               and len(covariance)==3 and all(v is not None and math.isfinite(v) and v>=0 for v in covariance)
               and max(covariance[:2])<=.03**2 and covariance[2]<=math.radians(3)**2
-              and scan_count>=80 and scan_fraction is not None and scan_fraction>=.80)
+              and (fixed_edges or (scan_count>=80 and scan_fraction is not None and scan_fraction>=.80)))
         if good and self.anchor is not None:
             angle=math.atan2(math.sin(pose[2]-self.anchor[2]),math.cos(pose[2]-self.anchor[2]))
             good=math.dist(pose[:2],self.anchor[:2])<=.10 and abs(angle)<=math.radians(8)
@@ -88,7 +90,7 @@ class LocalizationGuard:
             self.reset();return True
         return False
 
-    def update(self, now, *, moving, covariance, scan_fraction=None, scan_count=0):
+    def update(self, now, *, moving, covariance, scan_fraction=None, scan_count=0, fixed_edges=False):
         if self.fault:
             return self.fault
         bad = ''
@@ -97,7 +99,7 @@ class LocalizationGuard:
             bad = '定位协方差无效'
         elif covariance is not None and (max(covariance[:2]) > .15**2 or covariance[2] > math.radians(12)**2):
             bad = '定位不确定性过大'
-        elif scan_count >= 40 and scan_fraction is not None and scan_fraction < .35:
+        elif not fixed_edges and scan_count >= 40 and scan_fraction is not None and scan_fraction < .35:
             bad = '雷达与静态地图持续不一致，可能空转或定位漂移'
         self.reason = bad
         if moving and bad:
@@ -117,16 +119,44 @@ class VelocityLease:
         self.command_time = self.permit_time = -math.inf
         self.command = (0., 0., 0.)
         self.permitted = False
+        self.spin_limit = 0.
+        self.spin_time = self.spin_started = self.spin_stamp = -math.inf
 
     def receive_command(self, now, command):
         self.command_time = now
         self.command = tuple(command) if all(math.isfinite(v) for v in command) else (0., 0., 0.)
 
-    def receive_permit(self, now, permitted):
+    def receive_permit(self, now, permitted, ros_stamp=None):
         self.permit_time = now
-        self.permitted = bool(permitted)
+        if not permitted:
+            self.spin_limit = 0.
+            if ros_stamp is not None:
+                self.spin_stamp = max(self.spin_stamp, ros_stamp)
+        elif self.spin_limit and now-self.spin_time > .16:
+            self.spin_limit = 0.
+            self.command_time = -math.inf
+        self.permitted = bool(permitted) and not self.spin_limit
+
+    def receive_spin_limit(self, now, stamp, age, limit):
+        """A separate, expiring permit may only reduce a fresh pure Spin command."""
+        if not (-.05 <= age <= .16 and math.isfinite(stamp) and stamp > self.spin_stamp):
+            return
+        self.spin_stamp = stamp
+        if not math.isfinite(limit) or abs(limit) > .25:
+            limit = 0.
+        if limit:
+            if self.spin_limit * limit <= 0. or now - self.spin_time > .16:
+                self.spin_started = now
+            self.permitted = False
+        self.spin_limit, self.spin_time = limit, now
 
     def output(self, now):
+        if self.spin_limit:
+            vx, vy, wz = self.command
+            if (not 0. <= now-self.spin_time <= .16 or not 0. <= now-self.command_time <= self.timeout
+                    or self.command_time < self.spin_started or abs(vx)+abs(vy) > 1e-6 or wz*self.spin_limit <= 0.):
+                return (0., 0., 0.)
+            return (0., 0., math.copysign(min(abs(wz), abs(self.spin_limit)), wz))
         if (not self.permitted or not 0 <= now-self.permit_time <= self.timeout or
                 not 0 <= now-self.command_time <= self.timeout):
             return (0., 0., 0.)

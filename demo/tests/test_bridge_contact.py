@@ -44,7 +44,7 @@ class BridgeContactTests(unittest.TestCase):
         s=SimpleNamespace(lock=threading.RLock(),update_laser=lambda:None,
             localization_guard=LocalizationGuard(),covariance=[.001]*3,scan_agreement=.9,scan_known_count=100,
             oem_lease=SimpleNamespace(publish=lambda message:None),
-            survey_route_tick=lambda op:None,detect_wheel_slip=lambda now:None,
+            survey_route_tick=lambda op:None,detect_wheel_slip=lambda now,fixed_edges=False:None,
             charging=False,last_charge=now,current=.18,voltage=11.8,
             last_numeric={'current':now,'voltage':now},last_wheel=now,stationary_since=None,
             charge_confirmation=ChargeConfirmation(),native_docking_watchdog=NativeDockingWatchdog(),

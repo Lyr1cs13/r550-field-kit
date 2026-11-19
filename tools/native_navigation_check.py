@@ -7,6 +7,7 @@ Run on ROS2 Humble with the repository overlay sourced.
 """
 import json
 import argparse
+from collections import deque
 import math
 import os
 from pathlib import Path
@@ -14,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import signal
+import threading
 import time
+from types import MethodType, SimpleNamespace
 import yaml
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -31,17 +34,19 @@ def main():
     import rclpy
     from rclpy.action import ActionClient
     from rclpy.parameter import Parameter
-    from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
+    from geometry_msgs.msg import Twist, TwistStamped, TransformStamped, PoseStamped
     from nav_msgs.msg import Odometry, OccupancyGrid, Path as NavPath
-    from nav2_msgs.action import DriveOnHeading, FollowPath, ComputePathToPose
+    from nav2_msgs.action import DriveOnHeading, FollowPath, ComputePathToPose, Spin
     from nav2_msgs.srv import IsPathValid, ManageLifecycleNodes
     from rcl_interfaces.srv import SetParametersAtomically
-    from sensor_msgs.msg import LaserScan
+    from sensor_msgs.msg import Imu, LaserScan
     from std_msgs.msg import Bool, Int8
     from tf2_ros import TransformBroadcaster
     from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
     sys.path.insert(0,str(ROOT/'demo'))
     from directed_route import fas_axis_leg, straight_approach_speed
+    from arrival_policy import FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE
+    from ros_backend import RosBackend
 
     out=ROOT/'state/robustness/native';out.mkdir(parents=True,exist_ok=True)
     (out/'result.json').unlink(missing_ok=True)
@@ -53,6 +58,7 @@ def main():
     controller['controller_plugins']=['FixedHeading'] if args.safety_only else ['FixedHeading','PointPose']
     controller['goal_checker_plugins']=(['point_position_checker'] if args.safety_only else
                                          ['point_position_checker','point_pose_checker'])
+    controller['goal_checker_plugins'].extend(['directed_position_checker','fas_turn_position_checker'])
     controller['goal_checker_plugin']='point_position_checker'
     controller['point_position_checker']['xy_goal_tolerance']=controller['directed_position_checker']['xy_goal_tolerance']
     local=config['local_costmap']['local_costmap']['ros__parameters']
@@ -81,6 +87,7 @@ def main():
     odom=node.create_publisher(Odometry,'/odom',10)
     combined=node.create_publisher(Odometry,'/odom_combined',10)
     scan=node.create_publisher(LaserScan,'/scan',qos_profile_sensor_data)
+    imu=node.create_publisher(Imu,'/imu/data_raw',qos_profile_sensor_data)
     permit=node.create_publisher(Bool,'/navigation_motion_permit',1)
     raw=node.create_publisher(Twist,'/collision_cmd_vel',1)
     oem=node.create_publisher(Bool,'/navigation_oem_active',1)
@@ -95,6 +102,11 @@ def main():
     state=dict(x=0.,y=.012,a=.01,v=0.,w=0.,command=(0.,0.),command_time=0.,obstacle=None,
                sensors=True,allow=True,manual=False,freeze=False,scan_at=0.)
     samples=[];results=[];started=time.monotonic()
+    bridge=None
+    def bridge_sensor(method, message):
+        if bridge is not None:
+            getattr(bridge,method)(message)
+    node.create_subscription(Imu,'/imu/data_raw',lambda m:bridge_sensor('gyro_received',m),qos_profile_sensor_data)
     def received(m):
         state['command']=(m.linear.x,m.angular.z);state['command_time']=time.monotonic()
     node.create_subscription(Twist,'/cmd_vel',received,1)
@@ -110,6 +122,11 @@ def main():
         if not state['freeze']:
             state['x']+=state['v']*math.cos(state['a'])*dt
             state['y']+=state['v']*math.sin(state['a'])*dt
+            # Offset instantaneous centre, expressed in metres in the body frame.
+            # Exact centre displacement for this angular increment, independent of odometry.
+            offset=state.get('turn_offset',0.)
+            state['x']+=offset*(math.cos(state['a'])-math.cos(state['a']+state['w']*dt))
+            state['y']+=offset*(math.sin(state['a'])-math.sin(state['a']+state['w']*dt))
             state['a']+=state['w']*dt
         stamp=node.get_clock().now().to_msg()
         transforms=[]
@@ -121,9 +138,14 @@ def main():
         m=Odometry();m.header.stamp=stamp;m.header.frame_id='odom_combined';m.child_frame_id='base_footprint'
         m.pose.pose.position.x=state['x'];m.pose.pose.position.y=state['y'];m.pose.pose.orientation=transforms[1].transform.rotation
         m.twist.twist.linear.x=state['v'];m.twist.twist.angular.z=state['w'];odom.publish(m);combined.publish(m)
+        if bridge is not None:
+            bridge.wheel_received(m)
         if state['allow'] is not None:permit.publish(Bool(data=state['allow']))
         if state['sensors'] and now-state['scan_at']>.05:
             state['scan_at']=now
+            if bridge is not None:
+                rate=Imu();rate.header.stamp=stamp;rate.angular_velocity.z=state['w']+.004
+                imu.publish(rate)
             s=LaserScan();s.header.stamp=stamp;s.header.frame_id='laser'
             s.angle_min=-math.pi;s.angle_increment=math.pi/180;s.angle_max=math.pi-s.angle_increment
             s.range_min=.02;s.range_max=10.;s.scan_time=.05
@@ -142,6 +164,23 @@ def main():
             s.ranges=[math.nan]*360 if state['sensors']=='invalid' else ranges
             if state['sensors']=='stale':s.header.stamp.sec-=10
             scan.publish(s)
+        if bridge is not None:
+            bridge.pose=[state['x'],state['y'],state['a']]
+            bridge.pose_stamp=time.time();bridge.pose_observed_at=now;bridge.last_scan=state['scan_at']
+            if now-bridge.last_lease>=.05:
+                bridge.last_lease=now
+                bridge.publish_motion_permit()
+            op=bridge.ops[bridge.active]
+            if op['status'] in ('position_settling','heading_settling'):
+                bridge.finish_waypoint_position(op,now)
+            elif op['status'] in ('line_alignment','line_settling'):
+                bridge.update_line_alignment(op,now)
+            elif op['status']=='recovery_wait' and now>=op['retry_at']:
+                bridge.send_arrival_retry(op)
+            elif op['status']=='navigating' and op.get('handle'):
+                distance=math.hypot(state['x']-op['goal']['x'],state['y']-op['goal']['y'])
+                if not bridge.stop_at_waypoint(op,distance,now):
+                    bridge.request_speed(straight_approach_speed(distance,reverse=op['reverse']),'FixedHeading')
         samples.append([now-started,state['x'],state['y'],state['a'],v,w,state['v'],state['w']])
         time.sleep(.012)
     def run_for(seconds):
@@ -154,6 +193,36 @@ def main():
         return future.result()
     client=ActionClient(node,FollowPath,'/follow_path')
     drive=ActionClient(node,DriveOnHeading,'/drive_on_heading')
+    spin=ActionClient(node,Spin,'/spin')
+    leg_validator=node.create_client(IsPathValid,'/is_path_valid')
+    spin_limit=node.create_publisher(TwistStamped,'/navigation_spin_limit',1)
+    nav_zero=node.create_publisher(Twist,'/nav_cmd_vel',1)
+    def station_bridge(goal, blocked_until):
+        sink=SimpleNamespace(publish=lambda msg:None)
+        def check_wall(x,y,clearance):
+            if min(x+2,3-x,y+2,2-y)<=clearance:raise ValueError('Synthetic wall clearance')
+        b=SimpleNamespace(ops={},active=None,lock=threading.RLock(),spin_action=spin,
+            get_clock=node.get_clock,spin_limit_pub=spin_limit,motion_permit=permit,retreat_permit=sink,oem_lease=sink,
+            docking_since=None,fleet_zone=None,localization_guard=SimpleNamespace(reason=''),confirmed=True,
+            gyro=None,rest_gyro=deque(maxlen=24),stationary_since=time.monotonic()-.8,last_wheel=0.,wheel_distance=0.,
+            encoders=None,wheel_yaw_rate=0.,joint_terminal=True,arrival=arrival,goal_xy_tolerance=.10,
+            goal_yaw_tolerance=.25,position_xy_tolerance=.035,turn_approach_radius=.022,track=deque(),
+            sequential_waypoints=True,precision_arrival=True,pose=[state[k] for k in ('x','y','a')],
+            grid=SimpleNamespace(validate=check_wall),dock_localization=SimpleNamespace(arm=lambda:None),
+            leg_validator=leg_validator,controller_parameters=parameters,
+            speed_limits={},speed_update=None,follow=client,get_logger=node.get_logger,plan_coordinates=RosBackend.plan_coordinates,
+            raw_cmd=nav_zero,cmd=raw,last_lease=0.,request_stationary_amcl=lambda now:None)
+        b.snapshot=lambda:dict(ready=time.monotonic()>=blocked_until,stationary=b.stationary_since is not None,
+                               scan_map_agreement=.99,scan_structure_verified=True)
+        for name in ('gyro_received','wheel_received','begin_waypoint_heading','start_fas_spin','spin_accepted',
+                     'spin_done','finish_native_cancellation','settle_waypoint_heading','should_brake_heading',
+                     'navigate','send_fas_line','fas_line','stamped','send_navigation','directed_validated','directed_speed_ready',
+                     'update_line_alignment',
+                     'follow_directed','nav_accepted','nav_done','retry_arrival','send_arrival_retry','request_speed','stop_at_waypoint',
+                     'publish_motion_permit','publish_spin_limit','zero_motion','finish_waypoint_position','complete_waypoint'):
+            setattr(b,name,MethodType(getattr(RosBackend,name),b))
+        b.navigate({**goal,'fas_station':True},'waypoint')
+        return b
     def path_goal(x,heading=0.,terminal=False):
         goal=FollowPath.Goal();goal.controller_id='PointPose' if terminal else 'FixedHeading'
         goal.goal_checker_id='point_pose_checker' if terminal else 'point_position_checker'
@@ -221,6 +290,117 @@ def main():
                     maximum_yaw_change_deg=yaw_drift,min_forward_velocity=min(commands),status=status)
         results.append(record);print(json.dumps(record),flush=True)
         if not passed:raise AssertionError('Reverse tracking must reach the station while holding heading')
+        if not spin.server_is_ready():raise RuntimeError('Spin unavailable; inspect behavior log')
+        initial_pose=(state['x'],state['y'],state['a'])
+        turn=Spin.Goal();turn.target_yaw=.42;turn.time_allowance.sec=8
+        first=len(samples)
+        handle=wait(spin.send_goal_async(turn))
+        if not handle.accepted:raise RuntimeError('Spin rejected')
+        status=wait(handle.get_result_async(),10.).status
+        run_for(.6)
+        turn_error=abs(math.remainder(state['a']-initial_pose[2]-turn.target_yaw,2*math.pi))
+        max_linear=max(abs(row[4]) for row in samples[first:])
+        min_angular=min(row[5] for row in samples[first:])
+        passed=status==4 and turn_error<math.radians(3.) and max_linear<1e-6 and min_angular>=-1e-6
+        record=dict(case='fas_native_spin',passed=passed,max_linear_velocity=max_linear,
+                    heading_error_deg=math.degrees(turn_error),opposite_angular_command=min_angular,status=status)
+        results.append(record);print(json.dumps(record),flush=True)
+        if not passed:raise AssertionError('Spin must rotate in place without reversing direction')
+        state['allow']=None
+        for angle,hold in ((-3.5,0.),(30.,2.2),(90.,0.)):
+            goal={'x':state['x']+.018,'y':state['y'],'yaw':state['a']+math.radians(angle)}
+            if angle==90.:
+                h=state['a']
+                goal.update(x=state['x']+.42*math.cos(h),y=state['y']+.42*math.sin(h))
+            state['allow']=None;state['turn_offset']=.02
+            start_time=time.monotonic()
+            bridge=station_bridge(goal,start_time+hold)
+            identity=bridge.active
+            op=bridge.ops[identity]
+            if angle==90.:
+                while state['v']<.035 and time.monotonic()-start_time<6.:
+                    step()
+                if state['v']<.035:raise AssertionError('Station approach did not start: '+str(op.get('error')))
+                state['obstacle']=(state['x']+.22*math.cos(h),state['y']+.22*math.sin(h))
+                run_for(1.)
+                blocked=len(samples);run_for(.5)
+                if any(abs(r[4])>.005 for r in samples[blocked:]):
+                    raise AssertionError('Station approach did not stop for a new obstacle')
+                state['obstacle']=None
+            while op['heading_attempts']==0 and time.monotonic()-start_time<22.:
+                step()
+            if not op['heading_attempts']:raise AssertionError('Station did not transition to Spin: '+str(op.get('error')))
+            first=len(samples)
+            origin=(state['x'],state['y'])
+            approach_error=math.dist(origin,(goal['x'],goal['y'])) if angle==90. else None
+            spin_start=time.monotonic()
+            while op['status']!='succeeded' and time.monotonic()-spin_start<22.:
+                step()
+            commands=samples[first:]
+            sign=math.copysign(1.,angle)
+            during_hold=[r for r in commands if r[0]+started<start_time+hold-.1]
+            passed=(bridge.active==identity and op['status']=='succeeded' and op['heading_attempts']==1
+                    and (approach_error is None or approach_error<=.03)
+                    and op['final_position_error']<=FAS_STATION_POSITION_TOLERANCE
+                    and op['final_yaw_error_deg']<=math.degrees(FAS_STATION_YAW_TOLERANCE)
+                    and max(abs(r[4]) for r in commands)<1e-6 and min(sign*r[5] for r in commands)>=-1e-6
+                    and any(sign*r[5]>.02 for r in commands)
+                    and all(abs(r[5])<1e-6 for r in during_hold))
+            record=dict(case='station_profile_'+str(angle),passed=passed,attempts=op['heading_attempts'],
+                        yaw_error_deg=op.get('final_yaw_error_deg'),position_error_m=op.get('final_position_error'),
+                        centre_shift_m=math.dist(origin,(state['x'],state['y'])),held_s=hold,
+                        approach_error_m=approach_error,obstacle_wait_resume=approach_error is not None,
+                        max_linear_command=max(abs(r[4]) for r in commands),
+                        turn_and_settle_s=time.monotonic()-spin_start,seconds=time.monotonic()-start_time)
+            results.append(record);print(json.dumps(record),flush=True)
+            bridge.publish_spin_limit(0.);bridge=None
+            if not passed:raise AssertionError('Station did not complete with one signed spin')
+        # The panel uses map +Y for left. Start once at the first station and
+        # carry the measured pose through the side leg and both horizontal legs.
+        state.update(x=.1,y=-.4,a=math.pi/2,v=0.,w=0.,allow=None,turn_offset=.02)
+        run_for(.8)
+        for name,x,y,expected in (('left_heading_side',.42,-.4,'forward'),
+                                  ('left_heading_forward',.42,.05,'forward'),
+                                  ('left_heading_reverse',.42,-.4,'reverse')):
+            goal=dict(x=x,y=y,yaw=math.pi/2)
+            start_time=time.monotonic()
+            bridge=station_bridge(goal,start_time)
+            identity=bridge.active
+            op=bridge.ops[identity]
+            initial=(state['x'],state['y'])
+            dx,dy=x-initial[0],y-initial[1]
+            length=math.hypot(dx,dy)
+            track=[]
+            turn_speed=[]
+            while op['status'] not in ('succeeded','failed','canceled') and time.monotonic()-start_time<45.:
+                turning=op['status']=='spinning'
+                step()
+                row=samples[-1]
+                if abs(row[4])>.005:
+                    track.append((abs((row[1]-initial[0])*dy-(row[2]-initial[1])*dx)/length,row[4]))
+                if turning:
+                    turn_speed.append(abs(row[4]))
+            max_cross=max((t[0] for t in track),default=0.)
+            pure_spin=max(turn_speed,default=0.)
+            sign=-1 if expected=='reverse' else 1
+            passed=(bridge.active==identity and op['status']=='succeeded' and op['travel_direction']==expected
+                    and track and all(sign*v>0. for _,v in track) and op['arrival_retries']==0
+                    and bool(op.get('line_turn_used'))==(name=='left_heading_side')
+                    and op['heading_attempts']<=1 and pure_spin<1e-6 and max_cross<=.055
+                    and op['final_position_error']<=FAS_STATION_POSITION_TOLERANCE
+                    and op['final_yaw_error_deg']<=math.degrees(FAS_STATION_YAW_TOLERANCE))
+            record=dict(case=name,passed=bool(passed),status=op['status'],direction=op.get('travel_direction'),
+                        pre_turn=bool(op.get('line_turn_used')),final_turns=op['heading_attempts'],
+                        position_replans=op['arrival_retries'],max_cross_track_m=max_cross,
+                        max_spin_linear_m_s=pure_spin,position_error_m=op.get('final_position_error'),
+                        yaw_error_deg=op.get('final_yaw_error_deg'),seconds=time.monotonic()-start_time)
+            results.append(record);print(json.dumps(record),flush=True)
+            bridge.publish_spin_limit(0.);bridge=None
+            if not passed:raise AssertionError('Fixed left-heading path failed: '+str(record))
+        state['turn_offset']=0.
+        state['allow']=True
+        state['x'],state['y'],state['a']=initial_pose  # Reset only between independent fixture cases.
+        run_for(.3)
         speed_request.parameters=[Parameter('FixedHeading.desired_linear_vel',value=.12).to_parameter_msg()]
         wait(parameters.call_async(speed_request),3.)
         scenarios=[('forward',.65,False),('reverse',.05,False),('pedestrian_wait_resume',.65,True)]

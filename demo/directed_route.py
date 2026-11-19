@@ -1,5 +1,6 @@
 """Fixed-heading straight legs; every candidate still needs live Nav2 validation."""
 import math
+from arrival_policy import FAS_STATION_POSITION_TOLERANCE
 
 
 def angle_error(a, b):
@@ -43,19 +44,44 @@ def line_poses(pose, goal, body_heading, spacing):
 
 
 def fas_axis_leg(pose, goal, spacing=.04):
-    """Prefer fore/aft travel near the station's shared heading."""
+    """Prefer a straight approach and save larger turns for a stopped chassis."""
     if pose is None:
         return None
     dx,dy = goal['x']-pose[0],goal['y']-pose[1]
     if not .10 <= math.hypot(dx,dy) <= 12.:
         return None
     bearing = math.atan2(dy,dx)
-    reverse = abs(angle_error(bearing,goal['yaw'])) > math.pi/2
+    reverse = abs(angle_error(bearing,pose[2])) > math.pi/2
     body_heading = angle_error(bearing+(math.pi if reverse else 0.),0.)
-    if (abs(angle_error(body_heading,goal['yaw'])) > math.radians(12)
+    final_turn_limit = math.pi/2 if reverse else math.radians(12)
+    if (abs(angle_error(body_heading,goal['yaw'])) > final_turn_limit+1e-9
             or abs(angle_error(body_heading,pose[2])) > math.radians(15)):
         return None
     return {'reverse':reverse,'poses':line_poses(pose,goal,body_heading,spacing)}
+
+
+def fas_short_leg(pose, goal, spacing=.04, *, min_distance=.10, max_distance=.80):
+    """Connect nearby points independently of the final sampling heading."""
+    if pose is None:
+        return None
+    dx,dy=goal['x']-pose[0],goal['y']-pose[1]
+    if not min_distance<=math.hypot(dx,dy)<=max_distance:
+        return None
+    forward=math.atan2(dy,dx)
+    reverse=angle_error(forward+math.pi,0.)
+    def turn_cost(heading):
+        return abs(angle_error(heading,pose[2]))+abs(angle_error(goal['yaw'],heading))
+    backwards=turn_cost(reverse)+math.radians(12)<turn_cost(forward)
+    return {'reverse':backwards,'poses':line_poses(pose,goal,reverse if backwards else forward,spacing)}
+
+
+def fas_station_leg(pose, goal):
+    """Candidate only. The bridge checks every cell, then asks Nav2 to check the live path."""
+    leg=fas_axis_leg(pose,goal) or fas_short_leg(pose,goal,min_distance=FAS_STATION_POSITION_TOLERANCE,max_distance=12.)
+    if leg:
+        distance=math.dist(pose[:2],(goal['x'],goal['y']))
+        leg['clearance']=.27 if distance>.80 else .23
+    return leg
 
 
 def straight_leg(pose, goal, planned, spacing=.04):

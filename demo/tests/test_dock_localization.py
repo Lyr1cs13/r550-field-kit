@@ -51,6 +51,15 @@ class DockLocalizationTests(unittest.TestCase):
         self.assertIsNone(self.step(12,pose=[.01,.01,.02]))
         self.assertEqual(self.step(15,pose=[.01,.01,.02]),'initialize')
 
+    def test_straight_charge_offset_can_confirm_but_neighbouring_dock_cannot(self):
+        for t in (0,4):
+            self.assertIsNone(self.step(t, pose=[.65,0.,0.]))
+        self.assertEqual(self.p.status,'alignment_required')
+        self.assertIsNone(self.step(5, pose=[.11,.02,.02]))
+        self.assertEqual(self.step(8, pose=[.11,.02,.02]),'initialize')
+        self.assertIsNone(self.step(9, pose=[.11,.02,.02]))
+        self.assertEqual(self.step(10, pose=[.11,.02,.02]),'confirm')
+
     def test_failed_amcl_confirmation_does_not_fake_success(self):
         self.step(0)
         self.assertEqual(self.step(3), 'initialize')
@@ -65,6 +74,29 @@ class DockLocalizationTests(unittest.TestCase):
         for t in (4, 6, 8):
             self.assertIsNone(self.step(t, amcl_updated=False))
         self.assertEqual(self.p.count, 0)
+
+    def test_slow_scan_fitting_does_not_consume_amcl_confirmation_window(self):
+        self.step(0.);self.assertEqual(self.step(3.),'initialize')
+        self.assertIsNone(self.step(25.,pose_request_pending=True,scan_pending=True))
+        self.assertEqual(self.p.status,'applying')
+        self.assertIsNone(self.step(64.,pose_request_pending=True,scan_pending=True))
+        self.assertEqual(self.p.status,'attention')
+
+    def test_contact_bounce_during_scan_does_not_discard_valid_stationary_pose(self):
+        self.step(0.);self.assertEqual(self.step(3.),'initialize')
+        self.assertIsNone(self.step(4.,charging=False,scan_started=True,pose_request_pending=True))
+        self.assertIsNone(self.step(5.,charging=False,scan_started=True))
+        self.assertEqual(self.step(6.1,charging=False,scan_started=True),'confirm')
+
+    def test_longitudinal_wheel_overrun_is_only_a_search_candidate(self):
+        pose=[-.23,.02,.03]
+        self.step(0,pose=pose)
+        self.assertEqual(self.step(3,pose=pose),'initialize')
+        self.assertIsNone(self.step(5,pose=pose,pose_request_pending=True))
+        self.assertIsNone(self.step(6,pose=pose))
+        self.assertEqual(self.p.count,0)
+        self.assertIsNone(self.step(8,pose=[-.02,.02,.03]))
+        self.assertEqual(self.step(9.1,pose=[-.02,.02,.03]),'confirm')
 
     def test_manual_pose_is_never_overwritten(self):
         self.p.suppress()

@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from directed_route import departure_leg, fas_axis_leg, straight_approach_speed, straight_leg, uniform_route
+from directed_route import departure_leg, fas_axis_leg, fas_short_leg, straight_approach_speed, straight_leg, uniform_route
 from motion_health import LocalizationGuard, VelocityLease, OemLease, cautious_twist, swept_footprint_clear
 from endurance import Endurance
 
@@ -54,6 +54,24 @@ class DirectedTests(unittest.TestCase):
         self.assertIsNone(fas_axis_leg((2.,-7.02,yaw),dict(x=2.32,y=-7.02,yaw=yaw)))
         self.assertIsNone(fas_axis_leg((4.125,-3.,0.),dict(x=4.125,y=-2.68,yaw=yaw)))
         self.assertIsNone(fas_axis_leg((4.125,-3.,yaw),dict(x=4.125,y=-2.98,yaw=yaw)))
+
+    def test_fas_station_can_reverse_then_apply_the_shared_heading(self):
+        start=(0.,0.,math.radians(-35))
+        goal=dict(x=-.11,y=.095,yaw=-math.pi/2)
+        leg=fas_axis_leg(start,goal)
+        self.assertTrue(leg['reverse'])
+        self.assertLess(abs(leg['poses'][0]['yaw']-start[2]),math.radians(10))
+        self.assertEqual([leg['poses'][-1][axis] for axis in ('x','y')],[goal['x'],goal['y']])
+        self.assertIsNone(fas_axis_leg(start,{**goal,'yaw':math.pi/2}))
+
+    def test_short_leg_separates_approach_heading_from_the_sampling_heading(self):
+        goal={'x':.31,'y':0.,'yaw':-math.pi/2}
+        leg=fas_short_leg((0.,0.,-math.pi/2),goal)
+        self.assertFalse(leg['reverse'])
+        self.assertTrue(all(point['y']==0. and point['yaw']==0. for point in leg['poses']))
+        self.assertEqual(leg['poses'][-1]['x'],goal['x'])
+        self.assertTrue(fas_short_leg((0.,0.,math.pi),{**goal,'yaw':math.pi})['reverse'])
+        self.assertIsNone(fas_short_leg((0.,0.,-math.pi/2),{**goal,'x':.9}))
 
     def test_forward_and_reject_detour_lateral_or_misaligned(self):
         goal=dict(x=2.,y=0.,yaw=0.)

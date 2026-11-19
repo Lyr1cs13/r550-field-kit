@@ -9,7 +9,7 @@ import yaml
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Int8, String
 from sensor_msgs.msg import LaserScan
@@ -30,6 +30,8 @@ class MotionGate(Node):
         self.lease = VelocityLease()
         self.last_motion=time.monotonic()
         self.last_tick=self.last_motion;self.last_linear=0.
+        self.hold_file=Path(__file__).resolve().parent.parent/'state'/'motion-hold'
+        self.uncommanded_since=None
         self.last_scan=-math.inf
         self.oem=OemLease();self.disable_burst=0
         config=Path(__file__).resolve().parent.parent/'config/vehicle.yaml'
@@ -44,6 +46,7 @@ class MotionGate(Node):
         self.retreat_status=self.create_publisher(String, '/navigation_retreat_status', 1)
         self.create_subscription(Twist, '/guard_cmd_vel', self.command, 1)
         self.create_subscription(Bool, '/navigation_motion_permit', self.permit, 1)
+        self.create_subscription(TwistStamped, '/navigation_spin_limit', self.spin_limit, 1)
         self.create_subscription(LaserScan, '/scan', self.scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.odom, qos_profile_sensor_data)
         self.create_subscription(String, '/navigation_retreat_permit', self.permit_retreat, 1)
@@ -60,7 +63,12 @@ class MotionGate(Node):
         self.lease.receive_command(time.monotonic(), (msg.linear.x, msg.linear.y, msg.angular.z))
 
     def permit(self, msg):
-        self.lease.receive_permit(time.monotonic(), msg.data)
+        self.lease.receive_permit(time.monotonic(), msg.data, self.get_clock().now().nanoseconds*1e-9)
+
+    def spin_limit(self, msg):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        age = self.get_clock().now().nanoseconds * 1e-9 - stamp
+        self.lease.receive_spin_limit(time.monotonic(), stamp, age, msg.twist.angular.z)
 
     def permit_retreat(self, msg):
         if msg.data and msg.data!=self.retreat_identity:
@@ -132,8 +140,25 @@ class MotionGate(Node):
                 if not swept_footprint_clear(v,points):
                     v=(0.,0.,0.)
         self.last_linear=v[0]
+        # An accepted cancellation says nothing about the wheels. Keep braking
+        # until chassis feedback settles, even if the velocity source is gone.
+        fresh=now-self.last_retreat_odom<=.25 and self.retreat_odom is not None
+        moving=fresh and (abs(self.retreat_odom[3])>.025 or abs(self.retreat_odom[4])>.10)
+        if not any(v) and not self.oem.active and moving:
+            if self.uncommanded_since is None:self.uncommanded_since=now
+            if now-self.uncommanded_since>=.65 and not self.hold_file.exists():
+                self.hold_file.parent.mkdir(parents=True,exist_ok=True)
+                self.hold_file.touch()
+                self.get_logger().error('零速指令后车轮持续运动，已锁定底盘')
+        else:
+            self.uncommanded_since=None
+        if self.hold_file.exists():
+            self.ir_disable.publish(Int8(data=0))
+            self.output.publish(Twist())
+            self.last_linear=0.
+            return
         if any(v):self.last_motion=now
-        elif now-self.last_motion>.5:
+        elif self.oem.active and now-self.last_motion>.5:
             return  # Do not continuously send velocity frames during OEM IR docking.
         msg = Twist();msg.linear.x, msg.linear.y, msg.angular.z = v
         self.output.publish(msg)

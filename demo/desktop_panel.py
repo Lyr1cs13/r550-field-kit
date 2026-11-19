@@ -11,6 +11,7 @@ import secrets
 import struct
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 from map_grid import MapGrid
@@ -24,6 +25,9 @@ LIVE_PAGES = {
     '/api/survey/route', '/api/export', '/rssi',
 }
 NETWORK_ERRORS = (OSError, HTTPException)
+STATE_TIMEOUT = 2.
+CONTROL_MAX_AGE = 2.5
+OFFLINE_AFTER = 6.
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,8 @@ class DesktopPanel:
         self.cache = self.data / 'map_snapshot.json'
         self.lock = threading.Lock()
         self.live_state = None
+        self.last_response = self.sample_started = float('-inf')
+        self.missed = 0
         self.saved_map = self.load_map()
         if self.saved_map is None and not self.refresh():
             raise ValueError('找不到已保存的实景地图。请提供现场地图或先连上车端巡航面板。')
@@ -94,13 +100,22 @@ class DesktopPanel:
         finally:
             connection.close()
 
-    def disconnect(self):
+    def failed_poll(self):
         with self.lock:
-            self.live_state = None
+            self.missed += 1
+
+    def connection_status(self, now):
+        # Caller holds lock. The status age and action eligibility use the VM clock.
+        if self.live_state is None or now-self.last_response >= OFFLINE_AFTER:
+            return 'offline'
+        if self.missed or now-self.sample_started > CONTROL_MAX_AGE:
+            return 'reconnecting'
+        return 'online'
 
     def refresh(self):
+        started = time.monotonic()
         try:
-            data, status, _ = self.request('GET', '/api/state')
+            data, status, _ = self.request('GET', '/api/state', timeout=STATE_TIMEOUT)
             if status != 200:
                 raise ValueError('车端状态不可用')
             state = json.loads(data)
@@ -111,20 +126,23 @@ class DesktopPanel:
             info = state['map']
             dock = state.get('dock') if state['health'].get('dock_calibrated',True) else None
             if previous is None or info != previous.info:
-                image, code, kind = self.request('GET', '/map.png')
+                image, code, kind = self.request('GET', '/map.png', timeout=STATE_TIMEOUT)
                 if code != 200 or kind.split(';', 1)[0] != 'image/png':
                     raise ValueError('车端地图图像不可用')
             else:
                 image = previous.image
             saved = SavedMap(info, image, dock)
         except (*NETWORK_ERRORS, ValueError, KeyError, TypeError):
-            self.disconnect()
+            self.failed_poll()
             return False
 
         state['vehicle_connected'] = True
         with self.lock:
             self.saved_map = saved
             self.live_state = state
+            self.sample_started = started
+            self.last_response = time.monotonic()
+            self.missed = 0
         if previous != saved or not self.cache.exists():
             try:
                 self.save_map(saved)
@@ -135,23 +153,30 @@ class DesktopPanel:
     def monitor(self, stopped):
         while not stopped.is_set():
             online = self.refresh()
-            stopped.wait(0.35 if online else 1)
+            with self.lock:
+                quick_retry = self.missed == 1 and self.connection_status(time.monotonic()) == 'reconnecting'
+            stopped.wait(.5 if online else .15 if quick_retry else 1.)
 
     def view_state(self):
         site_url = (f'http://{self.target.hostname}:8896/' if self.target.hostname not in
                     ('127.0.0.1','localhost','::1') else None)
         with self.lock:
-            if self.live_state is not None:
-                return {**self.live_state,'site_url':site_url}
+            now=time.monotonic()
+            status=self.connection_status(now)
+            if status=='online':
+                return {**self.live_state,'site_url':site_url,'connection_status':status}
             saved = self.saved_map
+            previous = self.live_state if status=='reconnecting' else None
         return {
-            'vehicle_connected': False, 'phase': 'disconnected','site_url':site_url,
-            'message': '实车未连接，可查看已保存的场地地图。',
+            'vehicle_connected':False,'connection_status':status,'site_url':site_url,
+            'phase':'reconnecting' if previous else 'disconnected',
+            'message':'正在更新车端状态' if previous else '实车未连接，可查看已保存的场地地图。',
             'health': {'mode': 'robot', 'ready': False, 'pose': None,
-                       'readiness': '导航、定位和采集离线'},
-            'map': saved.info, 'dock': saved.dock, 'points': [], 'run': [],
-            'index': 0, 'remaining': None, 'events': [],
+                       'readiness':'等待最新车端状态' if previous else '导航、定位和采集离线'},
+            'map':saved.info,'dock':saved.dock,'points':previous.get('points',[]) if previous else [],'run':[],
+            'index':0,'remaining':None,'events':previous.get('events',[]) if previous else [],
             'collection': {'mode': 'timed', 'stage': 'disabled'}, 'c5': {},
+            **({'stop_token':previous['control_token']} if previous else {}),
         }
 
     def map_image(self, map_id=None):
@@ -164,26 +189,31 @@ class DesktopPanel:
         if path not in LIVE_PAGES:
             return {'error': '不存在的页面'}, 404, JSON
         with self.lock:
-            connected = self.live_state is not None
+            connected = self.connection_status(time.monotonic()) == 'online'
         if not connected:
             return {'error': '实车未连接'}, 503, JSON
         try:
             return self.request('GET', path, timeout=15)
         except NETWORK_ERRORS:
-            self.disconnect()
             return {'error': '实车连接中断'}, 503, JSON
 
     def command(self, data, token):
         with self.lock:
             state = self.live_state
-        if state is None:
-            return {'error': '实车未连接'}, 503, JSON
+            status = self.connection_status(time.monotonic())
+        if status != 'online':
+            try:
+                stop = status=='reconnecting' and json.loads(data)=={'action':'stop'}
+            except (ValueError,TypeError):
+                stop = False
+            if not stop:
+                return {'error':'等待最新车端状态' if status=='reconnecting' else '实车未连接'},503,JSON
         if not secrets.compare_digest(token.encode('utf-8'), state['control_token'].encode('utf-8')):
             return {'error': '实车控制会话已变更，请等待页面刷新'}, 403, JSON
         try:
             return self.request('POST', '/api/command', body=data, token=token, timeout=8)
         except NETWORK_ERRORS:
-            self.disconnect()
+            self.failed_poll()
             return {'error': '实车连接中断，操作结果未知，请核对车端状态'}, 503, JSON
 
 

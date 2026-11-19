@@ -7,6 +7,20 @@ RETREAT_DISTANCE = .20
 RETREAT_SPEED = .05
 
 
+def slip_obstruction(anchor, odom_start, odom_end):
+    dx,dy=odom_end[0]-odom_start[0],odom_end[1]-odom_start[1]
+    c,s=math.cos(odom_start[2]),math.sin(odom_start[2])
+    along,lateral=dx*c+dy*s,-dx*s+dy*c
+    direction='unknown'
+    point=None
+    if (abs(along)>=.065 and abs(lateral)<=.045
+            and abs(math.remainder(odom_end[2]-odom_start[2],math.tau))<=math.radians(10)):
+        direction='front' if along>0. else 'rear'
+        offset=math.copysign(.28,along)
+        point=[anchor[0]+offset*math.cos(anchor[2]),anchor[1]+offset*math.sin(anchor[2])]
+    return {'anchor':list(anchor),'point':point,'direction':direction,'attempted':False}
+
+
 def rear_is_clear(points, self_echo=None):
     omitted = isolated_echo_indices(points, self_echo)
     points = [p for i,p in enumerate(points) if i not in omitted]

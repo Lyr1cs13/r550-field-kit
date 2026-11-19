@@ -21,7 +21,7 @@ PRESERVE={'config/vehicle.yaml','config/endurance.yaml'}
 
 
 def source_files(root):
-    for name in ('kit','README.md','AGENTS.md'):
+    for name in ('kit','README.md','AGENTS.md','LICENSE','NOTICE.md'):
         yield root/name
     for directory in ('demo','tools','config','docs','vendor','rrt_mapping','scenes/demo-room'):
         for path in (root/directory).rglob('*'):

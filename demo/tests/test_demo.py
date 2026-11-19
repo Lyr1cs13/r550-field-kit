@@ -136,9 +136,9 @@ class DemoTests(unittest.TestCase):
         m.phase='docking';m._fail('对接超时，未收到充电反馈，已停止')
         m.tick();self.clock.advance(3);m.tick()
         self.assertFalse(self.backend.docking_started)
-        self.clock.advance(5.1);m.tick()
+        self.clock.advance(15.1);m.tick()
         self.assertEqual(m.dock_retry_count,1);self.assertEqual(m.phase,'docking')
-        m._fail('对接超时，未收到充电反馈，已停止');self.clock.advance(10);m.tick()
+        m._fail('对接超时，未收到充电反馈，已停止');m.tick();self.clock.advance(18.1);m.tick()
         self.assertEqual(m.phase,'failed');self.assertFalse(m.dock_retry_pending)
 
     def test_late_stable_charge_does_not_push_again(self):
@@ -146,7 +146,7 @@ class DemoTests(unittest.TestCase):
         self.backend.charging=True;m.tick()
         self.assertEqual(m.phase,'docked');self.assertFalse(self.backend.docking_started)
 
-    def test_transient_charge_signal_disarms_retry_even_when_it_drops(self):
+    def test_transient_contact_restarts_the_no_current_observation(self):
         m=self.mission
         raw=False
         self.backend.pose=[.6,0.,0.];self.backend.ir=3
@@ -158,19 +158,39 @@ class DemoTests(unittest.TestCase):
         raw=True;m.tick()
         raw=False;self.clock.advance(4.);m.tick()
         self.assertFalse(self.backend.docking_started)
-        self.assertFalse(m.dock_retry_pending)
+        self.assertTrue(m.dock_retry_pending)
+        self.clock.advance(9.5);m.tick()
+        self.assertFalse(self.backend.docking_started)
         self.backend.charging=True;m.tick()
         self.assertEqual(m.phase,'docked')
 
-    def test_unpowered_seated_pose_cannot_launch_automatic_retry(self):
+    def test_unpowered_seated_pose_must_move_forward_before_redocking(self):
         m=self.mission;self.backend.pose=[-.09,.02,0.];self.backend.ir=3
         original=self.backend.snapshot
         self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.93}
         m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
-        m.tick();self.clock.advance(8.1);m.tick()
+        m.tick();self.clock.advance(18.1);m.tick()
+        self.assertFalse(m.dock_retry_pending)
+        self.assertEqual(m.dock_retry_count,1)
+        goal,kind=self.backend.calls[-1]
+        self.assertEqual(kind,'departure')
+        self.assertTrue(goal['dock_retry_exit'])
+        self.assertGreater(goal['x'],.27)
+        m.tick()
+        self.assertFalse(self.backend.docking_started)
+        self.backend.pose=[goal['x'],goal['y'],goal['yaw']]
+        self.backend.ops[m.operation]['status']='succeeded'
+        m.tick()
+        self.assertEqual(self.backend.calls[-1][1],'return')
+
+    def test_bad_seated_angle_cannot_launch_a_retry(self):
+        m=self.mission;self.backend.pose=[-.09,.02,.4];self.backend.ir=3
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.93}
+        m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
+        m.tick();self.clock.advance(18.1);m.tick()
         self.assertFalse(m.dock_retry_pending)
         self.assertEqual(self.backend.calls,[])
-        self.assertFalse(self.backend.docking_started)
 
     def test_late_contact_while_return_goal_is_in_flight_waits_for_cancel(self):
         m=self.mission;raw=False
@@ -296,17 +316,21 @@ class DemoTests(unittest.TestCase):
         m=self.mission;m.return_to_dock();self.clock.advance(91);m.tick()
         self.assertEqual(m.phase,'failed');self.assertIn('对接超时',m.message)
 
-    def test_charge_bounce_does_not_finish_and_lost_contact_is_reported(self):
+    def test_charge_bounce_after_stop_schedules_one_native_reattempt(self):
         self.backend.pose=[.02,.03,.1];self.backend.ir=2
         original=self.backend.snapshot;stable=[False]
-        self.backend.snapshot=lambda:dict(original(),charging_stable=stable[0])
+        self.backend.snapshot=lambda:dict(original(),charging_stable=stable[0],
+                                          charge_telemetry_fresh=True,scan_map_agreement=.94)
         self.mission.return_to_dock();self.backend.charging=True;self.mission.tick()
         self.assertEqual(self.mission.phase,'docking')
         stable[0]=True;self.mission.tick();self.assertEqual(self.mission.phase,'docked')
         stable[0]=False;self.backend.charging=False;self.mission.tick();self.clock.advance(2.1);self.mission.tick()
         self.assertEqual(self.mission.phase,'docked')
         self.clock.advance(6.);self.mission.tick()
-        self.assertEqual(self.mission.phase,'idle');self.assertIn('接触已中断',self.mission.message)
+        self.assertEqual(self.mission.phase,'failed');self.assertTrue(self.mission.dock_retry_pending)
+        self.clock.advance(18.1);self.mission.tick()
+        self.assertEqual(self.mission.phase,'returning')
+        self.assertTrue(self.backend.calls[-1][0]['dock_retry_exit'])
 
 
 if __name__ == '__main__': unittest.main()

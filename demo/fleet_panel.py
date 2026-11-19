@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from desktop_panel import DesktopPanel, JSON, NETWORK_ERRORS
 from fleet_zone import separated
 from mission import QUIET
+from pair_simulation import PairSimulation
 from server import handler
 
 
@@ -55,6 +56,7 @@ class Fleet:
         self.panels = []
         self.lock = threading.Lock()
         self.paired = False
+        self.simulation = None
         self.last_lease = float('-inf')
         self.token = secrets.token_urlsafe(24)
 
@@ -73,6 +75,8 @@ class Fleet:
         return pair_status(states) or ('请先让两台车结束任务并停稳' if not all(map(parked,states)) else '')
 
     def drive_reason(self, index, states):
+        if self.simulation and self.simulation.running:
+            return '双车模拟采集中，暂停后可单独控制'
         if self.paired:
             return self.paired_reason(states)
         if armed(states[index]):
@@ -92,14 +96,19 @@ class Fleet:
         states = self.states()
         return {'paired':self.paired, 'pair_reason':self.pair_start_reason(states),
                 'reason':self.paired_reason(states) if self.paired else '',
+                'simulation':self.simulation.status(states) if self.simulation else None,
                 'can_leave':all(parked(s) for s in states if s.get('vehicle_connected')),
                 'control_token':self.token, 'vehicles':[
-                    {'connected':s.get('vehicle_connected') is True, 'phase':s['phase'],
+                    {'connected':s.get('vehicle_connected') is True,
+                     'connection_status':s.get('connection_status','online' if s.get('vehicle_connected') else 'offline'),
+                     'phase':s['phase'],
                      'readiness':s['health']['readiness'],'charging':bool(s['health'].get('charging_stable')),
                      'localized':s['health'].get('localization_confirmed',False)} for s in states]}
 
     def set_paired(self, requested):
         with self.lock:
+            if self.simulation and self.simulation.running:
+                raise ValueError('请先暂停双车模拟采集')
             states=self.states()
             if requested==self.paired:
                 return
@@ -113,6 +122,25 @@ class Fleet:
             elif not all(parked(s) for s in states if s.get('vehicle_connected')):
                 raise ValueError('请先让在线车辆结束任务并停稳')
             self.paired=requested
+
+    def set_simulation(self, requested):
+        with self.lock:
+            if self.simulation is None:
+                raise ValueError('当前场地未配置采集点位')
+            if not requested:
+                self.simulation.pause()
+                return
+            if self.simulation.running:
+                return
+            states = self.states()
+            reason = self.simulation.status(states)['reason']
+            if reason:
+                raise ValueError(reason)
+            self.paired=False
+            for panel,state in zip(self.panels,states):
+                if armed(state):
+                    panel.set_mode(False,state)
+            self.simulation.start(self.states())
 
     def maintain(self,stopped):
         while not stopped.is_set():
@@ -131,7 +159,8 @@ class Fleet:
                         break
             elif self.lock.acquire(blocking=False):
                 try:
-                    if self.paired and len(online)==1 and parked(online[0]) and time.monotonic()-self.last_lease>=LEASE_GRACE:
+                    offline=any(s.get('connection_status')=='offline' for s in states)
+                    if self.paired and offline and len(online)==1 and parked(online[0]) and time.monotonic()-self.last_lease>=LEASE_GRACE:
                         self.paired=False
                     if not self.paired:
                         for panel,state in zip(self.panels,self.states()):
@@ -157,7 +186,10 @@ class FleetDesktopPanel(DesktopPanel):
         with self.refresh_lock:
             if not super().refresh():
                 return False
-            self.last_state=super().view_state()
+            snapshot=super().view_state()
+            if not snapshot.get('vehicle_connected'):
+                return False
+            self.last_state=snapshot
             self.motion_unknown=False
             return True
 
@@ -185,9 +217,16 @@ class FleetDesktopPanel(DesktopPanel):
                and s['map']['map_id']==state['map']['map_id']]
         zones=[{'number':i+1,'bounds':zone(s).get('bounds')} for i,s in enumerate(states)
                if self.fleet.paired and zone(s).get('bounds') and s['map']['map_id']==state['map']['map_id']]
+        simulation = self.fleet.simulation
+        overlay = None
+        if simulation and simulation.stations.map_id==state['map']['map_id']:
+            progress = simulation.status(states)
+            overlay = {'points':simulation.points,'targets':progress['targets'],
+                       'running':progress['running'],'peer_path':peer['health'].get('path',[]) if peer_pose else []}
         return {**state,'fleet_paired':self.fleet.paired or armed(state),
                 'fleet_control':self.fleet.drive_reason(index,states) if state.get('vehicle_connected') else '',
-                'fleet_number':index+1,'fleet_peer':peer_pose,'fleet_docks':docks,'fleet_zones':zones}
+                'fleet_number':index+1,'fleet_peer':peer_pose,'fleet_docks':docks,'fleet_zones':zones,
+                'fleet_simulation':overlay}
 
     def command(self, data, token):
         try:
@@ -199,9 +238,19 @@ class FleetDesktopPanel(DesktopPanel):
         action=command['action']
         if action in ('fleet_lease','fleet_mode'):
             return {'error':'运行模式和许可由管理面板维护'},403,JSON
-        if action not in MOVEMENT:
-            return super().command(data,token)
         with self.fleet.lock:
+            if action=='collection_config' and (command.get('mode') not in ('timed','broadcast','broadcast_station') or command.get('c5')):
+                return {'error':'此入口仅支持固定基站 WS63 采集'},409,JSON
+            simulation = self.fleet.simulation
+            if simulation and simulation.running:
+                if action!='stop':
+                    return {'error':'双车模拟采集中，暂停后可单独控制'},409,JSON
+                snapshot=DesktopPanel.view_state(self)
+                cached = snapshot.get('control_token') or snapshot.get('stop_token','')
+                if cached and secrets.compare_digest(token.encode(),cached.encode()):
+                    simulation.pause()
+            if action not in MOVEMENT:
+                return super().command(data,token)
             index=self.fleet.panels.index(self)
             states=self.fleet.states()
             if not states[index].get('vehicle_connected'):
@@ -233,6 +282,12 @@ def main():
 
     fleet = Fleet()
     fleet.panels = [FleetDesktopPanel(fleet, robot['address'], Path(robot['data'])) for robot in robots]
+    if settings.get('position_pairs'):
+        try:
+            fleet.simulation = PairSimulation(args.config.resolve().parent,settings['position_pairs'],
+                                              [robot['address'] for robot in robots])
+        except (OSError,ValueError,TypeError,KeyError) as error:
+            print(f'采集点配置不可用：{error}',flush=True)
     site_urls=[]
     for robot in robots:
         host=urlsplit(robot['address']).hostname
@@ -273,7 +328,7 @@ def main():
                 i=int(self.path[-1])-1
                 if not site_urls[i]:
                     self.reply({'error':'此车还未配置新场地面板地址'},status=404)
-                elif fleet.paired:
+                elif fleet.paired or (fleet.simulation and fleet.simulation.running):
                     self.reply({'error':'先切回单车模式'},status=409)
                 else:
                     self.send_response(303)
@@ -286,7 +341,7 @@ def main():
         def do_POST(self):
             if not self.local():
                 return
-            if self.path!='/api/fleet/mode':
+            if self.path not in ('/api/fleet/mode','/api/fleet/simulation','/api/fleet/charge'):
                 self.send_error(404)
                 return
             if not secrets.compare_digest(self.headers.get('X-Control-Token','').encode(),fleet.token.encode()):
@@ -297,10 +352,18 @@ def main():
                 if not 1<=length<=256:
                     raise ValueError('请求大小无效')
                 value=json.loads(self.rfile.read(length))
-                if not isinstance(value,dict) or type(value.get('paired')) is not bool:
+                paired = self.path=='/api/fleet/mode'
+                charge=self.path=='/api/fleet/charge'
+                key = 'enabled' if charge else 'paired' if paired else 'running'
+                if not isinstance(value,dict) or type(value.get(key)) is not bool:
                     raise ValueError('运行模式无效')
-                fleet.set_paired(value['paired'])
-            except (ValueError, TypeError, KeyError) as error:
+                if charge:
+                    with fleet.lock:
+                        if not fleet.simulation:raise ValueError('未配置 50 点测试')
+                        fleet.simulation.charge_option(value.get('action'),value[key])
+                else:
+                    (fleet.set_paired if paired else fleet.set_simulation)(value[key])
+            except (OSError, ValueError, TypeError, KeyError) as error:
                 self.reply({'error':str(error)},status=409)
                 return
             self.reply({**fleet.status(),'site_available':[bool(u) for u in site_urls]})
@@ -321,6 +384,8 @@ def main():
             browser.serve_forever()
         finally:
             stopped.set()
+            if fleet.simulation:
+                fleet.simulation.pause()
 
 
 if __name__ == '__main__':

@@ -34,11 +34,27 @@ class App:
 
     def view_state(self):
         state=self.mission.state();proposal=self.loop_proposal
-        if proposal and len(proposal['points'])==len(state['points']) and all(a['id']==b['id'] and a['x']==b['x'] and a['y']==b['y'] for a,b in zip(proposal['points'],state['points'])):
+        moving=('departing','navigating','returning','retreating','docking','settling',
+                'settling_departure','settling_return')
+        if state['phase'] not in moving:
+            state['health']={**state['health'],'path':[],'track':[]}
+        if (proposal and len(proposal['points'])==len(state['points'])
+                and all(a['id']==b['id'] and a['x']==b['x'] and a['y']==b['y'] for a,b in zip(proposal['points'],state['points']))):
             state['survey_route_preview']=proposal.get('preview_path',[])
         if self.fas is not None:
             state['fas'] = self.fas.state()
         return state
+
+    def fas_view_state(self):
+        with self.mission.lock:
+            h=self.backend.snapshot()
+            keys=('ready','readiness','localization_confirmed','pose','pose_age_s','dock_calibrated','stationary',
+                  'voltage','current','charging_stable','charging_elapsed_s','dock_localization','scan_map_agreement',
+                  'scan_structure_verified','scan_window_agreement','fas_local_rotation',
+                  'localization_covariance','motion_fault','fas_localization_active','map_matches','arrival')
+            return {'phase':self.mission.phase,'message':self.mission.message,'health':{k:h.get(k) for k in keys},
+                    'map':{'map_id':self.grid.map_id},'fas':self.fas.state(),'dock':self.backend.dock_pose,
+                    'events':list(self.mission.events)[:8],'control_token':self.token}
 
     def command(self, data):
         action = data['action'];m = self.mission
@@ -50,6 +66,8 @@ class App:
                 if self.fas is None:
                     raise ValueError('此车未配置双车射频实验')
                 result = self.fas.command(action,data)
+                if action=='fas_renew':
+                    return self.fas_view_state()
                 return {'fas':self.fas.state(),**result}
             if self.fas is not None and self.fas.lease.owner:
                 if action == 'stop':
@@ -137,6 +155,13 @@ class App:
                 self.grid.validate(pose[0],pose[1],clearance=0)
                 self.backend.initialize_pose(pose, known_dock=action=='initial_dock')
                 m.event('按已保存桩位初始化定位，未修改充电桩坐标' if action=='initial_dock' else '设置当前位置，等待核对雷达与地图')
+            elif action == 'align_pose':
+                align=getattr(self.backend,'refine_stationary_pose',None)
+                if m.phase not in QUIET or not align:
+                    raise ValueError('请用实车入口停稳后进行雷达精校')
+                result=align(data.get('pose'))
+                m.message='静止雷达精校完成，请核对地图墙线和朝向'
+                m.event(f'雷达精校，固定边缘匹配 {result["wall_support"]:.0%}')
             elif action == 'confirm':
                 if m.phase not in QUIET:
                     raise ValueError('请先停止任务')
@@ -190,6 +215,8 @@ def handler(app, desktop=None):
                     self.respond(desktop.view_state())
                 else:
                     state = app.view_state();state['control_token'] = app.token;self.respond(state)
+            elif path=='/api/fas/state' and desktop is None and app.fas is not None:
+                self.respond(app.fas_view_state())
             elif path == '/map.png':
                 query = parse_qs(self.path.partition('?')[2])
                 image = desktop.map_image(query.get('map_id', [None])[0]) if desktop else app.image

@@ -3,7 +3,8 @@ from pathlib import Path
 import sys
 import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from arrival_policy import (FAS_STATION_YAW_TOLERANCE, fas_heading_needs_brake, refinement_stage,
+from arrival_policy import (FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE, SpinBrake,
+                            fas_heading_needs_brake, refinement_stage,
                             heading_profile, in_place_heading_profile, heading_needs_brake)
 
 
@@ -26,6 +27,13 @@ class ArrivalPolicyTests(unittest.TestCase):
     def test_position_first_and_strict_completion(self):
         self.assertEqual(refinement_stage(.08,.01,position_tolerance=.05,yaw_tolerance=.052),'position')
         self.assertEqual(refinement_stage(.02,.02,position_tolerance=.05,yaw_tolerance=.052),'complete')
+
+    def test_fas_keeps_position_when_only_heading_is_outside_tolerance(self):
+        limits={'position_tolerance':FAS_STATION_POSITION_TOLERANCE,
+                'yaw_tolerance':FAS_STATION_YAW_TOLERANCE}
+        self.assertEqual(refinement_stage(.0423,math.radians(.37),**limits),'complete')
+        self.assertEqual(refinement_stage(.0526,math.radians(4.36),**limits),'heading')
+        self.assertEqual(refinement_stage(.056,0.,**limits),'position')
 
     def test_small_turn_does_not_reuse_large_turn_speed(self):
         small=heading_profile(math.radians(6));large=heading_profile(math.pi/2)
@@ -57,3 +65,17 @@ class ArrivalPolicyTests(unittest.TestCase):
         self.assertFalse(fas_heading_needs_brake(error,rate,tolerance,.25))
         self.assertFalse(fas_heading_needs_brake(error,0.,tolerance,.10))
         self.assertTrue(fas_heading_needs_brake(-error,-rate,tolerance,.10))
+
+    def test_gyro_brakes_small_turn_during_breakaway_not_after_the_goal(self):
+        for sign in (-1.,1.):
+            brake=SpinBrake(sign*math.radians(3.5),0.,.005)
+            self.assertFalse(brake.observe(.05,.005))
+            self.assertFalse(brake.observe(.10,.005+sign*.020))
+            self.assertTrue(brake.observe(.15,.005+sign*.060))
+            self.assertLess(brake.progress,math.radians(.5))
+
+    def test_gyro_gap_brakes_a_pending_small_turn(self):
+        brake=SpinBrake(math.radians(3.5),0.,0.)
+        self.assertFalse(brake.observe(.25,.02))
+        self.assertFalse(brake.moving)
+        self.assertTrue(brake.observe(.50,.06))

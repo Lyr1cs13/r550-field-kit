@@ -13,7 +13,9 @@ button{cursor:pointer;background:#25495d;color:white;text-align:left;border:1px 
 button[aria-pressed="true"]{background:#e4f5f1;color:#153f45;border-color:#e4f5f1}
 button span{margin-left:7px;font-size:12px}
 button:disabled{cursor:default;opacity:.55}
-#mode{white-space:nowrap}
+#mode,#simulation{white-space:nowrap}
+#simulation{background:#147777;border-color:#4aaba6}
+#simulation[aria-pressed="true"]{background:#e4f5f1;color:#153f45;border-color:#e4f5f1}
 #status{font-size:13px;margin:0;min-width:12em}
 #error{margin:0;font-size:13px;color:#ffd0b3}
 iframe{width:100%;border:0;flex:1}
@@ -24,7 +26,10 @@ iframe{width:100%;border:0;flex:1}
     <button aria-pressed="true" data-index="0">一号车 <span>检测中</span></button>
     <button aria-pressed="false" data-index="1">二号车 <span>检测中</span></button>
   </nav>
-  <button id="mode" disabled>启用双车联动</button>
+  <button id="simulation" aria-pressed="false" hidden disabled>双车模拟采集</button>
+  <label><input type="checkbox" id="auto-charge"> 低电回充</label>
+  <button id="return-now" disabled>结束测试并回充</button>
+  <button id="mode" disabled>启用分区联动</button>
   <button id="site" disabled>新场地建图 ↗</button>
   <p id="status" aria-live="polite">正在检查车辆在线状态</p>
   <p id="error" role="alert" hidden></p>
@@ -36,9 +41,10 @@ const buttons=[...document.querySelectorAll('nav button')];
 const views=[...document.querySelectorAll('iframe')];
 const statusLine=document.getElementById('status');
 const modeButton=document.getElementById('mode');
+const simulationButton=document.getElementById('simulation');
 const siteButton=document.getElementById('site');
 const errorLine=document.getElementById('error');
-let selected=0, lastOnline=[], state, changing=false;
+let selected=0, lastLinks=[], state, changing=false;
 
 function select(index){
   selected=index;
@@ -50,43 +56,66 @@ function select(index){
 }
 buttons.forEach((button,index)=>button.onclick=()=>select(index));
 function renderSite(){
-  siteButton.disabled=state.paired||!state.site_available?.[selected];
-  siteButton.title=state.paired?'先切回单车模式':state.site_available?.[selected]?'':'此车尚未配置场地面板';
+  const active=state.paired||state.simulation?.running;
+  siteButton.disabled=active||!state.site_available?.[selected];
+  siteButton.title=active?'请先停稳并退出当前模式':state.site_available?.[selected]?'':'此车尚未配置场地面板';
 }
 siteButton.onclick=()=>window.open('/new-site/'+(selected+1),'_blank','noopener');
 
 function render(){
-  const online=state.vehicles.map(car=>car.connected);
-  if((!lastOnline.length||lastOnline[selected])&&!online[selected]&&online.some(Boolean)){
-    select(online.indexOf(true));
+  const links=state.vehicles.map(car=>car.connection_status||(car.connected?'online':'offline'));
+  const online=links.map(link=>link==='online');
+  if(links[selected]==='offline'&&online.some(Boolean)&&
+      (lastLinks[selected]!=='offline'||!lastLinks.includes('online'))){
+    select(links.indexOf('online'));
   }
-  lastOnline=online;
+  lastLinks=links;
   const count=online.filter(Boolean).length;
-  statusLine.textContent=state.paired?(state.reason||'双车联动 · 两车各自在本车区域内运行'):
-    count===2?'单车模式 · 可切换车辆':count===1?'单车模式 · '+(online[0]?'一号车':'二号车')+'可用':'等待车辆连接';
-  modeButton.textContent=state.paired?'切回单车模式':'启用双车联动';
-  modeButton.disabled=changing||(state.paired?!state.can_leave:!!state.pair_reason);
+  const sim=state.simulation;
+  const progress=sim?.round?`第 ${sim.round} 组`:`已完成 ${sim?.completed||0} 组`;
+  statusLine.textContent=sim?.running?`${sim.message} · ${progress}`:
+    state.paired?(state.reason||'分区联动 · 两车各自在本车区域内运行'):
+    sim?.reason&&count===2?`${sim.reason} · ${progress}`:
+    sim?.completed?`${sim.message||'双车模拟采集'} · 已完成 ${sim.completed} 组`:
+    count===2?'普通巡航 · 可切换车辆':count===1?(online[0]?'一号车':'二号车')+'可用':
+    links.includes('reconnecting')?'正在重连车端':'等待车辆连接';
+  simulationButton.hidden=!sim;
+  simulationButton.textContent=sim?.running?(sim.stopping?'正在停车':'停止 50 点测试'):'开始 50 点无采集测试';
+  const auto=document.getElementById('auto-charge'), dock=document.getElementById('return-now');
+  auto.checked=sim?.auto_charge!==false;auto.disabled=changing||!sim;
+  dock.disabled=changing||!sim?.running||sim.stopping||sim.return_requested;
+  dock.textContent=sim?.return_requested?'双车回充中':'结束测试并回充';
+  simulationButton.setAttribute('aria-pressed',String(!!sim?.running));
+  simulationButton.disabled=changing||!sim||(sim.running?sim.stopping:!!sim.reason);
+  simulationButton.title=sim&&!sim.running?sim.reason:'';
+  modeButton.textContent=state.paired?'退出分区联动':'启用分区联动';
+  modeButton.disabled=changing||!!sim?.running||(state.paired?!state.can_leave:!!state.pair_reason);
   modeButton.title=state.paired?(state.can_leave?'':'两车停稳后切换'):state.pair_reason;
   renderSite();
   state.vehicles.forEach((car,i)=>{
-    buttons[i].querySelector('span').textContent=car.connected?
-      (car.charging&&car.localized?'在线 · 充电中':car.localized?'在线 · 已定位':'在线 · 待定位'):'离线';
+    buttons[i].querySelector('span').textContent=online[i]?
+      (car.charging?'在线 · 充电中':car.localized?'在线 · 已定位':'在线 · 待定位'):
+      links[i]==='reconnecting'?'正在重连':'离线';
     buttons[i].title=car.readiness;
   });
 }
-modeButton.onclick=async()=>{
+async function setMode(path,value){
   if(!state||changing)return;
   changing=true;errorLine.hidden=true;render();
   try{
-    const response=await fetch('/api/fleet/mode',{method:'POST',
+    const response=await fetch(path,{method:'POST',
       headers:{'Content-Type':'application/json','X-Control-Token':state.control_token},
-      body:JSON.stringify({paired:!state.paired})});
+      body:JSON.stringify(value)});
     const result=await response.json();
     if(!response.ok)throw new Error(result.error);
     state=result;
   }catch(error){errorLine.textContent=error.message;errorLine.hidden=false;}
   finally{changing=false;render();}
-};
+}
+document.getElementById('auto-charge').onchange=e=>setMode('/api/fleet/charge',{action:'auto_charge',enabled:e.target.checked});
+document.getElementById('return-now').onclick=()=>setMode('/api/fleet/charge',{action:'return_now',enabled:true});
+modeButton.onclick=()=>setMode('/api/fleet/mode',{paired:!state?.paired});
+simulationButton.onclick=()=>setMode('/api/fleet/simulation',{running:!state?.simulation?.running});
 async function refresh(){
   try {
     if(!changing){
@@ -95,7 +124,7 @@ async function refresh(){
       const result=await response.json();
       if(!changing){state=result;render();}
     }
-  } catch (_) { statusLine.textContent='管理面板连接中断';modeButton.disabled=true; }
+  } catch (_) { statusLine.textContent='管理面板连接中断';modeButton.disabled=true;simulationButton.disabled=true; }
   setTimeout(refresh,850);
 }
 refresh();

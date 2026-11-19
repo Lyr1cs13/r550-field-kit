@@ -18,6 +18,7 @@ import yaml
 
 TERMINAL = {'succeeded', 'failed', 'canceled'}
 QUIET = {'idle', 'completed', 'failed', 'docked'}
+DOCK_RECHECK_SECONDS = 18.
 
 
 class Mission:
@@ -32,7 +33,7 @@ class Mission:
         self.until = 0;self.remaining = 0;self.auto_return = False;self.low_since = None
         self.return_via = None
         self.dock_failure_reconcile=False;self.dock_retry_count=0;self.dock_retry_pending=False
-        self.dock_retry_stationary_since=None;self.dock_contact_seen=False
+        self.dock_retry_stationary_since=None
         self._load()
         self.collection = Collection(self.directory,grid)
         self.c5 = C5Station(self.collection.directory / 'c5')
@@ -114,13 +115,17 @@ class Mission:
             if self.phase not in QUIET:
                 raise ValueError('已有任务运行，请先停止或暂停')
             self.require_ready()
+            health=self.backend.snapshot()
+            dock_status=health.get('dock_localization',{}).get('status')
+            if health.get('charging_stable') and dock_status not in (None,'confirmed','manual'):
+                raise ValueError('等待贴桩后的静止雷达定位复核')
             if auto_return and getattr(self.backend,'fleet_zone',None):
                 raise ValueError('双车运行区内请关闭自动回充')
             self.endurance.cancel()
             self.health_pause=False;self.health_good_since=None
             if auto_return and not getattr(self.backend,'dock_calibrated',True):raise ValueError('先标定充电桩，再启用完成后回充')
             self.dock_retry_count=0;self.dock_retry_pending=False
-            self.dock_failure_reconcile=False;self.dock_contact_seen=False
+            self.dock_failure_reconcile=False
             chosen = ([{**self.validate_points([station])[0],'fas_station':True}] if station is not None else
                       [p for p in self.points if (p['id'] == identity if identity else p['enabled'])])
             if start_from:
@@ -326,7 +331,7 @@ class Mission:
     def begin_recharge(self):
         self.save_checkpoint()
         self.endurance.pending=False;self.endurance.resuming=True
-        self.dock_retry_count=0;self.dock_retry_pending=False;self.dock_contact_seen=False
+        self.dock_retry_count=0;self.dock_retry_pending=False
         self.event('低电量回充，已保存下一待完成点位；充电稳定并满足实测恢复电压后继续')
         self.return_to_dock(automatic=True)
 
@@ -351,7 +356,7 @@ class Mission:
             if not getattr(self.backend,'dock_calibrated',True):raise ValueError('当前场景尚未标定充电桩')
             if not automatic:
                 self.dock_retry_count=0;self.dock_retry_pending=False
-                self.dock_failure_reconcile=False;self.dock_contact_seen=False
+                self.dock_failure_reconcile=False
             self.return_via=via
             collection=self.collection.snapshot()
             if collection['mode']==BROADCAST_STATION and self.phase in ('collecting','paused_collection'):
@@ -373,11 +378,11 @@ class Mission:
             else:
                 self._return()
 
-    def retreat(self):
+    def retreat(self, *, fas=False):
         if self.phase not in QUIET or self.c5.active:
             raise ValueError('先结束当前任务，再短退')
         self.require_ready();self._require_motion_allowed()
-        self.operation=self.backend.retreat()
+        self.operation=self.backend.retreat(fas=True) if fas else self.backend.retreat()
         self.phase='retreating';self.message='低速直退，监测车尾和两侧'
         self.event(self.message)
 
@@ -389,14 +394,15 @@ class Mission:
         health=self.backend.snapshot()
         if health.get('charging_stable',health.get('charging')) or health.get('charge_contact_live'):
             self._hold_dock_contact(health);return
-        if self._can_handoff_dock(health):
+        if self.return_via is None and self._can_handoff_dock(health):
             self.operation=None;self.pending=None
             self.event('已在有效红外接管区域，直接使用厂家对接')
             self._begin_arrival(True)
             return
         if self.return_via is not None:
-            self.operation=self.backend.navigate(self.return_via,'waypoint')
-            self.message='先回到走廊中线，再前往充电桩'
+            clearing=self.return_via.get('dock_retry_exit',False)
+            self.operation=self.backend.navigate(self.return_via,'departure' if clearing else 'waypoint')
+            self.message='低速向前离开触点，再重新对接' if clearing else '先回到走廊中线，再前往充电桩'
         else:
             self.operation = self.backend.navigate(self.backend.dock_approach, 'return')
             self.message = '正在导航至充电桩前方'
@@ -447,7 +453,7 @@ class Mission:
             self.health_pause=False;self.repeat=False
             self.endurance.cancel();self.clear_checkpoint()
             if hasattr(self.backend,'set_survey_planning'):self.backend.set_survey_planning(False)
-            self.dock_retry_pending=False;self.dock_failure_reconcile=False;self.dock_contact_seen=False
+            self.dock_retry_pending=False;self.dock_failure_reconcile=False
             self.backend.survey_speed_limit=None
             self.c5.cancel()
             self.collection.cancel()
@@ -464,10 +470,12 @@ class Mission:
         if self.phase!='docking':self.endurance.cancel()
         if hasattr(self.backend,'set_survey_planning'):self.backend.set_survey_planning(False)
         self.dock_failure_reconcile=self.phase=='docking'
-        retryable=(self.phase=='docking' and self.dock_retry_count<1 and not self.dock_contact_seen and
-                   any(t in message for t in ('桩旁轮程已达到保护上限但未检测到充电','对接超时，未收到充电反馈')))
+        retryable=(self.phase=='docking' and any(t in message for t in (
+                   '桩旁轮程已达到保护上限但未检测到充电','对接超时，未收到充电反馈',
+                   '桩旁连续对接未取得充电反馈','原生对接达到行程或时间上限但未充电')))
         self.dock_retry_pending=retryable
         self.dock_retry_stationary_since=None
+        if retryable:self.until=self.clock()+30.
         self.backend.survey_speed_limit=None
         self.c5.cancel()
         self.collection.cancel()
@@ -482,7 +490,10 @@ class Mission:
     def _hold_dock_contact(self,health):
         self.backend.stop()
         self.return_via=None
-        self.dock_retry_pending=False;self.dock_failure_reconcile=True;self.dock_contact_seen=True
+        self.dock_retry_pending=True
+        self.dock_retry_stationary_since=None
+        self.dock_failure_reconcile=True
+        self.until=self.clock()+30.
         if self.operation and self.backend.operation(self.operation)['status'] not in TERMINAL:
             self.backend.cancel(self.operation);self.pending='dock_contact';self.phase='canceling'
         else:
@@ -494,34 +505,48 @@ class Mission:
         if self.phase in ('failed','idle') and self.dock_failure_reconcile and health.get('stationary') and health.get('charging_stable',health.get('charging')):
             self.dock_retry_pending=False;self.dock_failure_reconcile=False;self.phase='docked';self.message='停车复核已稳定充电，无需再次移动';self.event(self.message);return True
         if not self.dock_retry_pending or self.phase!='failed':return False
-        if self.dock_contact_seen:
-            self.dock_retry_pending=False
-            self.message='检测到充电接触，保持停车复核电流'
-            return True
-        if not health.get('stationary'):
+        if not health.get('stationary') or health.get('charge_contact_live'):
+            if now>=self.until:
+                self.dock_retry_pending=False
+                self.message='触点或停轮状态仍待确认，保持停车'
+                self.event(self.message)
             self.dock_retry_stationary_since=None;return True
         if self.dock_retry_stationary_since is None:self.dock_retry_stationary_since=now
-        if now-self.dock_retry_stationary_since<8.:return True
-        pose=health.get('pose')
-        clear=bool(pose and dock_offset(pose,self.backend.dock_pose)[0]>.27 and
-                   (health.get('scan_map_agreement') or 0.)>=.80)
-        if not (health.get('ready') and health.get('localization_confirmed')
-                and health.get('charge_telemetry_fresh') and clear):
+        if now-self.dock_retry_stationary_since<DOCK_RECHECK_SECONDS:return True
+        if self.dock_retry_count>=1:
             self.dock_retry_pending=False
-            self.message='已停在桩旁复核充电；未确认车辆离开触点，请检查接触'
+            self.message='重新贴合后仍未确认通电，已停轮并保留任务'
             self.event(self.message)
             return True
+        pose=health.get('pose')
+        dock=self.backend.dock_pose
+        along,side=dock_offset(pose,dock) if pose else (None,None)
+        if not (health.get('ready') and health.get('localization_confirmed')
+                and health.get('charge_telemetry_fresh') and pose and (health.get('scan_map_agreement') or 0.)>=.80):
+            self.dock_retry_pending=False
+            self.message='停车复核后仍未通电，定位或充电反馈不可用于重试'
+            self.event(self.message)
+            return True
+        via=None
+        if along<=.27:
+            x,y,heading=dock
+            angle=abs(math.remainder(pose[2]-heading,2*math.pi))
+            if along<-.16 or abs(side)>.12 or angle>math.radians(15):
+                self.dock_retry_pending=False
+                self.message='未通电，车辆姿态超出可安全离桩的范围，保持停稳'
+                self.event(self.message)
+                return True
+            via={'x':x+.34*math.cos(heading),'y':y+.34*math.sin(heading),'yaw':heading,
+                 'name':'回充重试离桩','wait':0.,'dock_retry_exit':True}
         self.dock_retry_pending=False;self.dock_retry_count+=1
-        self.event('首次贴合未确认充电，停轮复核后自动重新执行主动回充（1/1）')
-        self.return_to_dock(automatic=True);return True
+        self.event('贴合后持续无电流，已停轮复核，重试回充（1/1）')
+        self.return_to_dock(automatic=True,via=via);return True
 
     def tick(self):
         with self.lock:
             self.backend.tick()
             health = self.backend.snapshot();now = self.clock()
             contact=health.get('charge_contact_live') or health.get('charging_stable',health.get('charging'))
-            if contact and (self.phase in ('returning','settling_return','docking') or self.dock_failure_reconcile):
-                self.dock_contact_seen=True
             if contact and self.phase in ('returning','settling_return'):
                 self._hold_dock_contact(health)
                 return
@@ -554,7 +579,7 @@ class Mission:
             calibrated=health.get('dock_localization',{}).get('calibrations',0)
             if calibrated>getattr(self,'dock_calibrations_seen',0):
                 self.dock_calibrations_seen=calibrated
-                text='已按保存的充电桩位自动校准定位，无需再次确认'
+                text='贴桩停稳后已用雷达复核定位'
                 self.event(text)
                 if self.phase in QUIET and self.phase!='failed':
                     self.message=('正在充电；' if health.get('charging') else '')+text
@@ -596,6 +621,9 @@ class Mission:
             elif self.phase == 'canceling':
                 if self.operation and self.backend.operation(self.operation)['status'] not in TERMINAL:
                     return
+                if health.get('mode')=='robot' and not health.get('stationary'):
+                    self.message='取消已下发，等待底盘反馈停稳'
+                    return
                 action = self.pending;self.pending = None;self.operation = None
                 if action == 'return':
                     if health['ready']:
@@ -626,9 +654,10 @@ class Mission:
                     name=self.run[self.index]['name'];stage=result.get('stage')
                     self.message=(f'{name}：'+(result.get('detail') or '等待通路恢复，随后自动继续') if stage=='waiting' else
                                   f'{name}：正在低速收敛位置与朝向' if stage=='terminal' else
+                                  '正在对准短直线' if stage=='approach' else
                                   f'{name} 位置已到，正在对正朝向' if stage=='heading' else
                                   f'正在前往 {name}，跟踪可通行路线')
-                if self.phase == 'returning' and self._can_handoff_dock(health):
+                if self.phase == 'returning' and self.return_via is None and self._can_handoff_dock(health):
                     if result['status'] not in TERMINAL:
                         self.backend.cancel(self.operation);self.pending = 'dock_handoff'
                         self.phase = 'canceling';self.message = '已到红外接管区域，停止导航并等待确认'
@@ -640,6 +669,9 @@ class Mission:
                     return
                 if result['status'] != 'succeeded':
                     self._fail(result.get('error') or '目标导航失败，已停车');return
+                if (self.phase=='returning' and self.return_via and self.return_via.get('dock_retry_exit')
+                        and not health.get('stationary')):
+                    return
                 if self.phase=='navigating' and result.get('quality')=='near':
                     self.event(f'{self.run[self.index]["name"]} 已在附近停稳，位置误差 {result["position_error"]*100:.1f} cm、朝向误差 {result["yaw_error_deg"]:.1f}°，按可用精度继续任务')
                 self.operation = None
@@ -736,10 +768,8 @@ class Mission:
                 if not hasattr(self,'charge_lost_since'):self.charge_lost_since=now
                 if now-self.charge_lost_since>=8:
                     del self.charge_lost_since
-                    self.endurance.cancel()
-                    self.dock_failure_reconcile=True
-                    self.phase='idle';self.message='充电接触已中断，小车保持停稳，请检查触点或主动回充'
-                    self.event(self.message)
+                    self.event('充电接触已中断，停稳复核后重试')
+                    self._hold_dock_contact(health)
             elif hasattr(self,'charge_lost_since'):
                 del self.charge_lost_since
 

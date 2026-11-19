@@ -27,7 +27,7 @@ def main():
     sys.path.insert(0,str(ROOT/'demo'))
     from map_grid import MapGrid
     from survey_path import checked_path
-    g=MapGrid(ROOT/'scenes/demo-room');route=json.loads((g.directory/'survey_route.json').read_text())
+    g=MapGrid(ROOT/'scenes/demo-room');route=json.loads((g.directory/'survey_route.json').read_text(encoding='utf-8'))
     if route['map_id']!=g.map_id:errors.append('示例路线 map_id 不匹配')
     for p in route['points']:checked_path(g,p['survey_path'],[p['x'],p['y']])
     if sys.platform!='win32':

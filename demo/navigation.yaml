@@ -143,6 +143,7 @@ controller_server:
     - goal_checker
     - point_position_checker
     - directed_position_checker
+    - fas_turn_position_checker
     - recovery_position_checker
     - point_heading_checker
     - point_pose_checker
@@ -153,6 +154,10 @@ controller_server:
     directed_position_checker:
       plugin: nav2_controller::PositionGoalChecker
       xy_goal_tolerance: 0.03
+      stateful: false
+    fas_turn_position_checker:
+      plugin: nav2_controller::PositionGoalChecker
+      xy_goal_tolerance: 0.022
       stateful: false
     point_heading_checker:
       plugin: nav2_controller::StoppedGoalChecker

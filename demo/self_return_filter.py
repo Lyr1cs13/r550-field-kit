@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 """Preserve raw /scan_raw and mask only the confirmed onboard antenna volume."""
-import math,time,json
+import math,time
 from pathlib import Path
 import yaml
-import self_return_geometry
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer,TransformListener
-from self_return_geometry import inside_antenna, isolated_echo_indices
+from self_return_geometry import antenna_echo_indices
 class Filter(Node):
     def __init__(self):
         config=yaml.safe_load((Path(__file__).resolve().parent.parent/'config/vehicle.yaml').read_text())['antenna_filter']
-        self_return_geometry.CENTER=tuple(config['center']);self_return_geometry.RADIUS=float(config['radius'])
+        self.center=tuple(config['center']);self.radius=float(config['radius'])
         self.secondary_echo=config.get('retreat_echo')
         super().__init__('lab_antenna_self_filter');self.tf=Buffer();self.listener=TransformListener(self.tf,self)
         self.out=self.create_publisher(LaserScan,'/scan',qos_profile_sensor_data);self.last_log=0.
-        self.create_subscription(LaserScan,'/scan_raw',self.scan,qos_profile_sensor_data)
+        current=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(LaserScan,'/scan_raw',self.scan,current)
     def scan(self,m):
         try:t=self.tf.lookup_transform('base_footprint',m.header.frame_id,Time()).transform
         except Exception:return  # Missing TF produces stale-scan stop, never a guessed mask.
-        q=t.rotation;a=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z));count=0
+        q=t.rotation;a=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
         ranges=list(m.ranges)
-        points=[(t.translation.x+r*math.cos(a+m.angle_min+i*m.angle_increment),
-                 t.translation.y+r*math.sin(a+m.angle_min+i*m.angle_increment))
-                if m.range_min<=r<=m.range_max else (math.inf,math.inf) for i,r in enumerate(ranges)]
-        secondary=isolated_echo_indices(points,self.secondary_echo)
-        for i,(x,y) in enumerate(points):
-            if i in secondary or inside_antenna(x,y):
-                ranges[i]=float('nan');count+=1
+        masked=antenna_echo_indices(ranges,a+m.angle_min,m.angle_increment,(t.translation.x,t.translation.y),
+                                   (m.range_min,m.range_max),self.center,self.radius,self.secondary_echo)
+        for index in masked:
+            ranges[index]=float('nan')
         m.ranges=ranges;self.out.publish(m)
         if time.monotonic()-self.last_log>10:
-            self.get_logger().info(f'Onboard antenna returns masked: {count}; raw scan retained');self.last_log=time.monotonic()
+            self.get_logger().info(f'Onboard antenna returns masked: {len(masked)}; raw scan retained');self.last_log=time.monotonic()
 def main():
     rclpy.init();n=Filter()
     try:rclpy.spin(n)

@@ -43,6 +43,7 @@
       <div class="two-buttons">
         <button id="initial-dock" title="车辆已贴合原桩时校准">在桩位校准</button>
         <button id="confirm" class="outline-primary" title="确认车头与红色雷达已对齐地图">确认定位</button>
+        <button id="align-pose" title="用长墙和固定边缘精校当前位置">雷达精校</button>
       </div>
     </section>
 
@@ -70,19 +71,20 @@
               <option value="timed">定时停留</option>
               <option value="broadcast_station">WS63 · 固定基站定点</option>
               <option value="broadcast">WS63 · 沿途广播</option>
-              <option value="servo_car_v2">WS63 · 旋转基站定点</option>
-              <option value="ws63">WS63 · 旧版联动</option>
             </select>
           </label>
           <label id="serial-field" hidden>WS63 串口
             <input id="collection-device" list="collection-ports" class="form-control" value="auto" placeholder="/dev/serial/by-id/...">
           </label>
           <datalist id="collection-ports"></datalist>
-          <label id="c5-field" class="check"><input type="checkbox" id="collection-c5">ESP32-C5 CSI</label>
           <button id="collection-apply" class="wide" disabled>应用设置</button>
           <p id="collection-status" class="hint" role="status" hidden></p>
-          <p id="c5-status" class="hint" role="status" hidden></p>
 
+          <details class="feature-subgroup"><summary>双频基站 · WS63 + ESP32-C5</summary>
+            <p>双车到点停稳后同时发包，基站记录两车的双频信号。</p>
+            <p>联调顺序：连接两车发端与基站 → 静止收包核对车辆身份 → 启用位置对采集。</p>
+            <p id="dual-preflight" role="status">等待车端配置</p>
+          </details>
           <details class="feature-subgroup">
             <summary>北区回环与基站</summary>
             <div class="two-buttons">
@@ -97,8 +99,6 @@
             <summary>结果与导出</summary>
             <button id="collection-export" class="wide">导出当前采集记录</button>
             <a data-vehicle-link href="/rssi" target="_blank" rel="noopener">RSSI 热力图 ↗</a>
-            <a data-vehicle-link href="/api/collection/servo/export" download="WS63旋转定点采集与地图.zip">导出旋转定点记录</a>
-            <a data-vehicle-link href="/api/collection/c5/export" download="C5停靠位姿与地图.zip">导出 C5 停靠位姿</a>
           </details>
         </div>
       </details>
@@ -129,6 +129,7 @@
       <div class="map-header">
         <div><h3><svg class="icon" aria-hidden="true"><use href="/vendor/icons.svg#map-2"></use></svg>场景地图 <span id="map-live" class="map-live" hidden></span></h3><p id="map-version"></p></div>
         <div class="map-toolbar">
+          <button id="simulation-points" aria-pressed="true" hidden>50 个采集点</button>
           <button id="pan-tool" class="active" title="拖动与缩放地图"><svg class="icon" aria-hidden="true"><use href="/vendor/icons.svg#arrows-move"></use></svg>平移</button>
           <button id="add-tool"><svg class="icon" aria-hidden="true"><use href="/vendor/icons.svg#map-pin"></use></svg>添加点</button>
           <button id="pose-tool"><svg class="icon" aria-hidden="true"><use href="/vendor/icons.svg#crosshair"></use></svg>设置位置</button>

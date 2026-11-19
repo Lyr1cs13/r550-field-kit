@@ -74,9 +74,30 @@ class FleetTests(unittest.TestCase):
         backend=SimpleNamespace(lock=threading.RLock(),active='task',ops={'task':{'status':'navigating'}},
             snapshot=lambda:health,confirmed=True,localization_guard=SimpleNamespace(reason=''),
             fleet_zone=True,motion_permit=SimpleNamespace(publish=lambda msg:commands.append(msg.data)),
-            docking_since=None,oem_lease=SimpleNamespace(publish=lambda msg:None),
+            publish_spin_limit=lambda limit:None,docking_since=None,oem_lease=SimpleNamespace(publish=lambda msg:None),
             retreat_permit=SimpleNamespace(publish=lambda msg:None))
         RosBackend.publish_motion_permit(backend)
         health['fleet']['leased']=False
         RosBackend.publish_motion_permit(backend)
         self.assertEqual(commands,[True,False])
+
+    @unittest.skipUnless(importlib.util.find_spec('rclpy'), 'Requires ROS message types')
+    def test_profiled_spin_obeys_peer_reservation_and_imu_freshness(self):
+        import time
+        from ros_backend import RosBackend
+        caps=[];permits=[];allowed=[True]
+        sink=SimpleNamespace(publish=lambda msg:None)
+        op=dict(status='spinning',kind='waypoint',spin_brake=SimpleNamespace(signed_limit=-.14))
+        backend=SimpleNamespace(lock=threading.RLock(),active='point',ops={'point':op},path=[[0.,0.]],
+            snapshot=lambda:dict(ready=True),confirmed=True,localization_guard=SimpleNamespace(reason=''),
+            fleet_zone=None,fas_lease=SimpleNamespace(owner='pair',allows=lambda *args:allowed[0]),
+            docking_since=None,retreat_permit=sink,oem_lease=sink,gyro=(time.monotonic(),0.,0.),
+            motion_permit=SimpleNamespace(publish=lambda msg:permits.append(msg.data)),publish_spin_limit=caps.append)
+        RosBackend.publish_motion_permit(backend)
+        self.assertEqual((permits,caps),([],[-.14]))
+        allowed[0]=False
+        RosBackend.publish_motion_permit(backend)
+        self.assertEqual((permits[-1],caps[-1]),(False,0.))
+        allowed[0]=True;backend.gyro=(time.monotonic()-.3,0.,0.)
+        RosBackend.publish_motion_permit(backend)
+        self.assertEqual((permits[-1],caps[-1]),(False,0.))

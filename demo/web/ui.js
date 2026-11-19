@@ -13,13 +13,18 @@
   let last=0;
   const connection=document.getElementById('connection-state');
   document.addEventListener('cruise-state',event=>{
-    last=Date.now();const h=event.detail.health;
+    last=performance.now();const h=event.detail.health;
     const disconnected=event.detail.vehicle_connected===false;
+    const reconnecting=event.detail.connection_status==='reconnecting';
     connection.classList.toggle('online',!disconnected&&!!h.ready);
     connection.classList.toggle('offline-mode',disconnected||h.mode==='offline');
-    connection.querySelector('span').textContent=disconnected?'离线':h.mode==='offline'?'演练':h.ready?'在线':'准备中';
+    connection.querySelector('span').textContent=reconnecting?'正在重连':disconnected?'离线':h.mode==='offline'?'演练':h.ready?'在线':'准备中';
   });
   setInterval(()=>{
-    if(last && Date.now()-last>2500){connection.classList.remove('online');connection.querySelector('span').textContent='连接中断';}
+    const age=performance.now()-last;
+    if(last && age>2500){
+      connection.classList.remove('online');
+      connection.querySelector('span').textContent=age>=6000?'面板未连接':'面板重连中';
+    }
   },1000);
 })();

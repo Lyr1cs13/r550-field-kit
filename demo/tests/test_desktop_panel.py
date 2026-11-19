@@ -10,11 +10,12 @@ from tempfile import TemporaryDirectory
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))
 
-from desktop_panel import DesktopPanel
+from desktop_panel import CONTROL_MAX_AGE, OFFLINE_AFTER, DesktopPanel
 from map_grid import MapGrid
 from server import handler
 
@@ -41,6 +42,47 @@ def request(web, path, *, body=None, headers=None):
 
 
 class DesktopPanelTests(unittest.TestCase):
+    def test_transient_loss_keeps_selection_data_but_only_allows_stop(self):
+        fixture = HERE.parents[2] / 'scenes' / 'demo-room'
+        with TemporaryDirectory() as temporary:
+            data = Path(temporary)
+            shutil.copytree(fixture, data / 'scene')
+            panel = DesktopPanel('http://127.0.0.1:1', data)
+            state = {'health': {'mode': 'robot', 'pose': [1, 2, 0]}, 'phase': 'idle',
+                     'control_token': 'session-a', 'map':panel.saved_map.info, 'points':[{'id':'one'}]}
+            reply = (json.dumps(state).encode(), 200, 'application/json')
+            with patch('desktop_panel.time.monotonic', return_value=10.) as clock, patch.object(panel,'request') as send:
+                send.return_value = reply
+                self.assertTrue(panel.refresh())
+                self.assertEqual(panel.view_state()['connection_status'], 'online')
+                send.side_effect = TimeoutError()
+                clock.return_value = 12.
+                self.assertFalse(panel.refresh())
+                pending = panel.view_state()
+                self.assertEqual(pending['connection_status'], 'reconnecting')
+                self.assertFalse(pending['vehicle_connected'])
+                self.assertEqual(pending['points'], state['points'])
+                self.assertIsNone(pending['health']['pose'])
+                self.assertNotIn('control_token', pending)
+                send.reset_mock()
+                self.assertEqual(panel.command(b'{"action":"start"}','session-a')[1],503)
+                self.assertEqual(panel.command(b'{"action":"stop"}','wrong')[1],403)
+                send.assert_not_called()
+                send.side_effect = None
+                self.assertEqual(panel.command(b'{"action":"stop"}',pending['stop_token'])[1],200)
+                send.assert_called_once()
+                clock.return_value = 10.+OFFLINE_AFTER
+                offline = panel.view_state()
+                self.assertEqual(offline['connection_status'], 'offline')
+                self.assertNotIn('stop_token', offline)
+                self.assertEqual(panel.command(b'{"action":"stop"}','session-a')[1],503)
+                send.side_effect = [reply]
+                self.assertTrue(panel.refresh())
+                self.assertEqual(panel.view_state()['connection_status'], 'online')
+                clock.return_value += CONTROL_MAX_AGE+.1
+                self.assertFalse(panel.view_state()['vehicle_connected'])
+                self.assertEqual(panel.command(b'{"action":"start"}','session-a')[1],503)
+
     def test_real_map_stays_available_and_only_live_session_can_send_commands(self):
         fixture = HERE.parents[2] / 'scenes' / 'demo-room'
         grid = MapGrid(fixture)
