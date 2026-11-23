@@ -23,6 +23,24 @@ def isolated_echo_indices(points, echo):
     return indices if len(indices) <= 3 else ()
 
 
+def rear_center_glint_indices(ranges, angle, increment, sensor, limits):
+    """Mask an observed narrow rear glint only when it starts inside the chassis."""
+    tx,ty=sensor
+    lower,upper=limits
+    candidates=[]
+    anchors=[]
+    for index,distance in enumerate(ranges):
+        if not math.isfinite(distance) or not max(lower,.10)<=distance<=min(upper,.27):
+            continue
+        heading=angle+index*increment
+        x,y=tx+distance*math.cos(heading),ty+distance*math.sin(heading)
+        if -.197<=x<=-.107 and .006<=y<=.021:
+            candidates.append(index)
+            if x>=-.1325:
+                anchors.append(index)
+    return {i for i in candidates if any(abs(i-j)*abs(increment)<=math.radians(2.4) for j in anchors)}
+
+
 def antenna_echo_indices(ranges, angle, increment, sensor, limits, center, radius, secondary=None):
     """Only project ranges that could intersect either measured body envelope."""
     tx,ty=sensor

@@ -12,7 +12,11 @@ def configure(interface, peer, domain, output=None):
     if not re.fullmatch(r'[A-Za-z0-9_.:-]+',interface):raise ValueError('网卡名称无效')
     ipaddress.ip_address(peer)
     if not 0<=domain<=232:raise ValueError('ROS_DOMAIN_ID 使用 0～232')
-    directory=output or Path.home()/'.config/wheeltec_ros';directory.mkdir(parents=True,exist_ok=True)
+    directory=output
+    if directory is None:
+        root=Path(__file__).resolve().parents[1]
+        directory=root/'state' if (root/'state/workspace.env').is_file() else Path.home()/'.config/wheeltec_ros'
+    directory.mkdir(parents=True,exist_ok=True)
     xml=f'''<CycloneDDS xmlns="https://cdds.io/config"><Domain id="any"><General><Interfaces><NetworkInterface name="{escape(interface)}"/></Interfaces><AllowMulticast>spdp</AllowMulticast><MaxMessageSize>1400B</MaxMessageSize><FragmentSize>1200B</FragmentSize></General><Discovery><Peers><Peer address="{peer}"/></Peers></Discovery></Domain></CycloneDDS>'''
     (directory/'network.xml').write_text(xml,encoding='utf-8')
     text='unset FASTRTPS_DEFAULT_PROFILES_FILE RMW_FASTRTPS_PUBLICATION_MODE RMW_FASTRTPS_USE_QOS_FROM_XML\n'

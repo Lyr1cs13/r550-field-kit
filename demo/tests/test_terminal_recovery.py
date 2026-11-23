@@ -11,6 +11,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(importlib.util.find_spec('rclpy'), 'Requires ROS message types')
 class RecoveryTests(unittest.TestCase):
+    def test_first_terminal_measurement_survives_pre_turn_and_a_second_adjustment(self):
+        from ros_backend import record_stopped_turn
+        op=dict(turn_origin=(0.,0.,0.),last_turn={'stage':'line_settling'})
+        record_stopped_turn(op,(0.,0.,.4))
+        self.assertNotIn('first_terminal_turn',op)
+        op.update(turn_origin=(1.,0.,.4),turn_aim=(.99,0.),turn_started_at=time.monotonic(),
+                  last_turn={'stage':'heading_settling','requested_deg':12.})
+        record_stopped_turn(op,(1.01,0.,.7))
+        op.update(turn_origin=(1.01,0.,.7),last_turn={'stage':'heading_settling','requested_deg':-4.})
+        record_stopped_turn(op,(1.011,0.,.63))
+        self.assertEqual(op['first_terminal_turn']['requested_deg'],12.)
+        self.assertEqual(op['first_terminal_turn']['after'],[1.01,0.,.7])
+        self.assertEqual(op['first_terminal_turn']['approach_aim'],(.99,0.))
+        self.assertGreaterEqual(op['first_terminal_turn']['seconds'],0.)
+        self.assertEqual(op['last_turn']['requested_deg'],-4.)
+
+    def test_handoff_checks_actual_station_and_only_moves_to_original_goal_on_retry(self):
+        import threading
+        from ros_backend import RosBackend
+        backend=SimpleNamespace(arrival={},pose=[0.,0.,0.],zero_motion=lambda:None)
+        op=dict(sequential=True,kind='waypoint',controller_id='FixedHeading',station_pivot=True,
+                xy_tolerance=.035,stop_xy_tolerance=.04,turn_approach_radius=.022,turn_aim=(0.,0.),
+                handle=None,cancel=False)
+        self.assertFalse(RosBackend.stop_at_waypoint(backend,op,.045,10.))
+        self.assertTrue(RosBackend.stop_at_waypoint(backend,op,.036,10.1))
+        self.assertEqual(op['settle_after_cancel'],'position_settling')
+        op.update(cancel=False,explicit_path=True,goal=dict(x=.39,y=0.,yaw=0.))
+        backend.active='x';backend.ops={'x':op};backend.lock=threading.RLock()
+        def done(status):
+            RosBackend.nav_done(backend,SimpleNamespace(result=lambda:SimpleNamespace(status=status)),'x')
+        done(6)
+        self.assertFalse(op['direct_failed'])
+        done(6)
+        self.assertTrue(op['direct_failed'])
+        op.pop('direct_failed')
+        done(4)
+        self.assertTrue(op['direct_failed'])
+        self.assertEqual(op['status'],'position_settling')
+        self.assertEqual(op['goal']['x'],.39)
+
     def test_large_terminal_turn_spends_at_most_one_second_on_xy_margin(self):
         from ros_backend import RosBackend
         canceled=[]
@@ -21,9 +61,8 @@ class RecoveryTests(unittest.TestCase):
         stop=lambda distance,now:RosBackend.stop_at_waypoint(backend,op,distance,now)
         self.assertFalse(stop(.039,10.))
         self.assertFalse(stop(.042,10.4))
-        self.assertFalse(stop(.033,11.))
-        self.assertFalse(stop(.031,11.9))
-        self.assertTrue(stop(.031,12.))
+        self.assertFalse(stop(.033,10.9))
+        self.assertTrue(stop(.031,11.))
         self.assertEqual(canceled,[True])
         self.assertEqual(op['settle_after_cancel'],'position_settling')
         self.assertTrue(stop(.021,13.))

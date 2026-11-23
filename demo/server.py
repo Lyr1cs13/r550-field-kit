@@ -4,8 +4,10 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import secrets
+import sys
 import threading
 import time
 import traceback
@@ -15,6 +17,8 @@ from map_grid import MapGrid
 from mission import Mission, QUIET
 
 HERE = Path(__file__).resolve().parent
+sys.path.append(str(HERE.parent/'tools'))
+from workspace_guard import hardware_command
 
 
 class App:
@@ -28,12 +32,20 @@ class App:
         self.parallel_proposal=None;self.probe_proposal=None
         self.fas = None
         fas_file = HERE.parent/'state/fas_robot.json'
-        if hasattr(backend,'preview_route') and (fas_file.exists() or fas_file.with_name('fas_robot_claim.json').exists()):
-            from fas_car import FasCar
-            self.fas = FasCar(backend,self.mission,fas_file)
+        if hasattr(backend,'preview_route'):
+            claim = fas_file.with_name('fas_robot_claim.json')
+            if claim.exists() or (
+                fas_file.exists()
+                and json.loads(fas_file.read_text(encoding='utf-8'))['map_id'] == grid.map_id
+            ):
+                from fas_car import FasCar
+                self.fas = FasCar(backend,self.mission,fas_file)
 
     def view_state(self):
         state=self.mission.state();proposal=self.loop_proposal
+        if os.environ.get('R550_WORKSPACE_DOMAIN'):
+            state['workspace']={'name':os.environ['R550_WORKSPACE_NAME'],'domain':int(os.environ['R550_WORKSPACE_DOMAIN']),
+                                'site_port':int(os.environ['R550_SITE_PORT'])}
         moving=('departing','navigating','returning','retreating','docking','settling',
                 'settling_departure','settling_return')
         if state['phase'] not in moving:
@@ -50,7 +62,7 @@ class App:
             h=self.backend.snapshot()
             keys=('ready','readiness','localization_confirmed','pose','pose_age_s','dock_calibrated','stationary',
                   'voltage','current','charging_stable','charging_elapsed_s','dock_localization','scan_map_agreement',
-                  'scan_structure_verified','scan_window_agreement','fas_local_rotation',
+                  'scan_structure_verified','scan_window_agreement','fas_local_rotation','fas_dock_staging',
                   'localization_covariance','motion_fault','fas_localization_active','map_matches','arrival')
             return {'phase':self.mission.phase,'message':self.mission.message,'health':{k:h.get(k) for k in keys},
                     'map':{'map_id':self.grid.map_id},'fas':self.fas.state(),'dock':self.backend.dock_pose,
@@ -288,7 +300,18 @@ def handler(app, desktop=None):
                     self.respond(*desktop.command(body, token))
                     return
                 data = json.loads(body.decode('utf-8'),parse_constant=invalid)
-                self.respond(app.command(data))
+                if not isinstance(data,dict):
+                    raise ValueError('请求内容必须是对象')
+                if getattr(getattr(app,'backend',None),'mode',None)=='robot':
+                    with hardware_command(HERE.parent,stop=data.get('action')=='stop'):
+                        result=app.command(data)
+                else:
+                    if (HERE.parent/'state/workspace.env').is_file() and data.get('action') not in (
+                            'save_points','start','go','pause','resume','stop','return',
+                            'initial_pose','initial_dock','confirm','recover_points','import'):
+                        raise ValueError('离线预览仅支持模拟巡航和点位编辑')
+                    result=app.command(data)
+                self.respond(result)
             except (ValueError,KeyError,TypeError) as e:
                 self.respond({'error':str(e)},400)
             except Exception:
@@ -311,9 +334,14 @@ def main():
         from mock_backend import MockBackend
         backend = MockBackend(grid,dock)
     else:
+        with hardware_command(HERE.parent):
+            pass
         import rclpy
-        from ros_backend import RosBackend
-        rclpy.init(args=[]);backend = RosBackend(grid,dock)
+        if (grid.directory/'corridor_route.json').is_file():
+            from corridor_ros import CorridorBackend as LiveBackend
+        else:
+            from ros_backend import RosBackend as LiveBackend
+        rclpy.init(args=[]);backend = LiveBackend(grid,dock)
         threading.Thread(target=rclpy.spin,args=(backend,),daemon=True).start()
     directory = args.data or HERE/'data'/args.backend
     app = App(grid,backend,directory)

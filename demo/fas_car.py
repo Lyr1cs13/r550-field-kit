@@ -15,6 +15,7 @@ SCAN_UNSTABLE = '雷达或定位数据尚不稳定'
 NOT_PARKED = '实验接管前两车须各自停稳、定位就绪并标好桩位'
 PATH_KINDS = ('move','return','retreat')
 WS63_IDS = {'A': '52:35:35:30:00:a1', 'B': '52:35:35:30:00:b1'}
+WS63_CONNECTED_IDS = {'A': '11:22:33:44:55:61', 'B': '11:22:33:44:55:62'}
 
 
 def obstruction_clear(health, path):
@@ -99,7 +100,9 @@ class CorridorLease:
         age = health.get('pose_age_s')
         sigma = position_sigma(health)
         rotation=kind=='move' and health.get('fas_local_rotation') is True
-        if not pose or age is None or not 0. <= age <= (.70 if rotation else .45) or not (rotation or scan_confirmed(health)):
+        docking=kind=='return' and (health.get('fas_dock_staging') is True or health.get('fas_local_docking') is True)
+        if (not pose or age is None or not 0. <= age <= (.70 if rotation else .45)
+                or not (rotation or docking or scan_confirmed(health))):
             return SCAN_UNSTABLE
         if sigma is None or sigma > MAX_FLEET_SIGMA:
             return '定位不确定性超过走廊预约上限'
@@ -186,13 +189,20 @@ class FasCar:
         if type(self.motion_only) is not bool:
             raise ValueError('仅行驶模式必须明确启用或关闭')
         self.tx = self.c5 = None
+        self.ws63_device = None
+        self.ws63_mode = settings.get('ws63_mode','broadcast')
+        if self.ws63_mode not in ('broadcast','connected'):
+            raise ValueError('WS63 模式须为 broadcast 或 connected')
         self.links = {}
         if not self.motion_only:
             sle, c5 = settings['ws63_device'], settings['c5_device']
             if (sle == c5 or not all(re.fullmatch(r'/dev/serial/by-(id|path)/[^/]+', port) for port in (sle,c5))):
                 raise ValueError('WS63 和 C5 需分别配置稳定的 USB 串口路径')
-            self.tx, self.c5 = Ws63Transmitter(sle,self.car),Path(c5)
-            self.links = {'sle':WS63_IDS[self.car],'c5':mac(settings['c5_mac'])}
+            self.ws63_device,self.c5 = Path(sle),Path(c5)
+            if self.ws63_mode=='broadcast':
+                self.tx = Ws63Transmitter(sle,self.car)
+            addresses = WS63_CONNECTED_IDS if self.ws63_mode=='connected' else WS63_IDS
+            self.links = {'sle':addresses[self.car],'c5':mac(settings['c5_mac'])}
         self.claim = config_path.with_name('fas_robot_claim.json')
         self.pose_checkpoint = config_path.with_name('fas_robot_pose.json')
         self.pose_checkpoint_at = 0.
@@ -227,11 +237,19 @@ class FasCar:
                 'scan_hold':self.lease.live and self.lease.scan_hold_since is not None,
                 'command_id':self.command_id,'operator_hold':self.operator_hold,
                 'motion_only':self.motion_only,
-                'usb':bool(self.tx and self.tx.device.exists() and self.c5.exists()),
+                'usb':self.usb_ready(),
+                'ws63_mode':self.ws63_mode,
                 'tx':self.links,'energy':dict(self.mission.endurance.config),
                 'dock_retry_pending':self.mission.dock_retry_pending,
                 'recovery':recovery() if recovery else None,
                 'retreat_available':bool(blocked and blocked['direction']=='front' and not blocked['attempted'])}
+
+    def usb_ready(self):
+        try:
+            return (self.ws63_device is not None and self.ws63_device.is_char_device()
+                    and self.c5.is_char_device() and not self.ws63_device.samefile(self.c5))
+        except OSError:
+            return False
 
     def require_parked(self, *, localization=True):
         from mission import QUIET
@@ -319,9 +337,10 @@ class FasCar:
             raise ValueError('仅行驶试验禁止操作射频设备')
         if action == 'fas_probe':
             self.require_parked()
-            self.tx.probe()
-            if not self.c5.exists():
-                raise ValueError('车载 C5 USB 未枚举')
+            if not self.usb_ready():
+                raise ValueError('两块车载射频板须分别枚举为不同的 USB 串口')
+            if self.tx:
+                self.tx.probe()
             return {}
         if action == 'fas_stop':
             with self.backend.lock:
@@ -357,10 +376,11 @@ class FasCar:
             if type(data['enabled']) is not bool or (data['enabled'] and self.lease.live):
                 raise ValueError('只有停车采样窗口可以开启发端')
             if data['enabled']:
-                if not self.c5.exists():
-                    raise ValueError('车载 C5 USB 枚举已丢失')
-                self.tx.set(True)
-                self.air_until = time.monotonic()+5.5
+                if not self.usb_ready():
+                    raise ValueError('车载射频 USB 枚举已丢失或重复')
+                if self.tx:
+                    self.tx.set(True)
+                    self.air_until = time.monotonic()+5.5
             else:
                 self.disarm_radio()
             return {}

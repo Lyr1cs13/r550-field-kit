@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -f "$root/demo/vision_node.py" ]]; then
+  for address in http://192.168.0.100:8990 http://127.0.0.1:8991; do
+    if curl --noproxy '*' -fsS --max-time 2 "$address/api/state" 2>/dev/null |
+       python3 -c 'import json,sys; sys.exit((json.load(sys.stdin).get("workspace") or {}).get("name")!="vision")' 2>/dev/null; then
+      exec xdg-open "$address/"
+    fi
+  done
+  message='请先打开视觉离线预览，或在交接实车后启动视觉面板。'
+  echo "$message"
+  if command -v notify-send >/dev/null; then notify-send '视觉开发' "$message"; fi
+  exit 1
+fi
 local_panel=http://127.0.0.1:8891
 robot_panel=http://192.168.0.100:8890
 robot_site=http://192.168.0.100:8896
@@ -62,7 +74,7 @@ start_robot() {
   while (( SECONDS < deadline )); do
     if ssh -n -o BatchMode=yes -o ConnectTimeout=3 -o ConnectionAttempts=1 \
         -o ServerAliveInterval=3 -o ServerAliveCountMax=2 r550 \
-        'cd "$HOME/lab_cruise_ws" && ./kit site && if [[ -f state/active_scene.json && ! -f state/site-mapping/owns-robot ]] && ! curl --noproxy "*" -fsS --max-time 2 http://127.0.0.1:8890/api/state >/dev/null; then ./kit nav; fi'; then
+        'root="$HOME/lab_cruise_ws"; if [[ -f "$HOME/r550-patrol/state/workspace.env" ]]; then root="$HOME/r550-patrol"; fi; cd "$root" && { [[ ! -f state/workspace.env ]] || ./kit profile select; } && ./kit site && if [[ -f state/active_scene.json && ! -f state/site-mapping/owns-robot ]] && ! curl --noproxy "*" -fsS --max-time 2 http://127.0.0.1:8890/api/state >/dev/null; then ./kit nav; fi'; then
       return 0
     else
       status=$?

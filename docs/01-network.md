@@ -80,4 +80,6 @@ SSH 通、ROS 不通时，先核对两端 Domain、网卡和时间，不先改�
 ssh -t wheeltec@192.168.0.100 sudo date -u -s "@$(date +%s)"
 ```
 
+304 使用 Windows 上位机。首次在一号车巡航工程内运行 `sudo bash tools/install_host_clock.sh`，授权该车账号调用专用校时程序。304 的中继使用 `-StartPanels -SyncCarAClock`。每次启动车端导航时，中继通过该车 SSH 连接发送 304 的 UTC 时间；车端在 ROS 启动前设置系统时钟，并尝试写入 RTC。已运行的巡航服务可直接重连。
+
 已经启动建图时不跳变系统时间。远程外网开发可用校园 VPN 或现有组网工具，SSH 仍走其提供的私网地址。

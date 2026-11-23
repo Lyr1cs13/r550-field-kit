@@ -14,10 +14,10 @@ import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from directed_route import uniform_route
-from fas_car import CorridorLease, WS63_IDS, obstruction_clear
+from fas_car import CorridorLease, FasCar, WS63_CONNECTED_IDS, WS63_IDS, obstruction_clear
 from fas_experiment import (C5Sample, Journal, PROTOCOL, RecoveryWait, ScanEvidence, Stations, aggregate,
                             capture_request, evaluate, move_batches, parallel_bounds, phase_state, position_rounds,
-                            scan_confirmed, search, station_ids, stopped_station_arrival)
+                            scan_confirmed, search, station_ids, stopped_station_arrival, sweep_pairs)
 from guarded_retreat import slip_obstruction
 
 
@@ -31,6 +31,52 @@ def receipt(request, sle=(-55.,-61.), c5=(-64.,-70.), n=30):
     output['data'] = {key:{'epoch':8,'rssi_dbm':dict(zip(('A','B'),values)),'samples':{'A':n,'B':n}}
                       for key,values in zip(RECEIVERS,(sle,c5))}
     return output
+
+
+class ConnectedTransmitterTests(TestCase):
+    def test_connected_mode_uses_base_managed_transmitters(self):
+        with TemporaryDirectory() as directory:
+            config = Path(directory)/'fas_robot.json'
+            config.write_text(json.dumps({
+                'car':'B', 'map_id':'map', 'ws63_mode':'connected',
+                'ws63_device':'/dev/serial/by-path/ws63',
+                'c5_device':'/dev/serial/by-path/c5',
+                'c5_mac':LINKS['c5']['B'],
+            }),encoding='utf-8')
+            mission = SimpleNamespace(grid=SimpleNamespace(map_id='map'))
+            with patch('fas_car.Ws63Transmitter') as transmitter:
+                car = FasCar(SimpleNamespace(),mission,config)
+                transmitter.assert_not_called()
+            self.assertEqual(car.links, {'sle':WS63_CONNECTED_IDS['B'],'c5':LINKS['c5']['B']})
+            car.disarm_radio()
+            with patch.object(Path,'is_char_device',return_value=True), patch.object(Path,'samefile',return_value=True):
+                self.assertFalse(car.usb_ready())
+            with patch.object(Path,'is_char_device',return_value=True), patch.object(Path,'samefile',return_value=False):
+                self.assertTrue(car.usb_ready())
+
+
+class FasSceneTests(TestCase):
+    def test_stale_config_keeps_single_car_available_and_retains_claim_validation(self):
+        import server
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / 'state'
+            state.mkdir()
+            (state / 'fas_robot.json').write_text(json.dumps({
+                'car': 'A', 'map_id': 'original-map', 'motion_only': True,
+            }), encoding='utf-8')
+            grid = SimpleNamespace(directory=root, map_id='new-map', png=lambda: b'')
+            backend = SimpleNamespace(preview_route=lambda: None)
+            mission = SimpleNamespace(grid=grid)
+            with patch.object(server, 'HERE', root / 'demo'), patch.object(server, 'Mission', return_value=mission):
+                self.assertIsNone(server.App(grid, backend, root).fas)
+                (state / 'fas_robot_claim.json').write_text(json.dumps({
+                    'owner': 'test-run', 'map_id': 'original-map', 'motion_only': True,
+                }), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, '地图版本'):
+                    server.App(grid, backend, root)
+                grid.map_id = 'original-map'
+                self.assertEqual(server.App(grid, backend, root).fas.lease.owner, 'test-run')
 
 
 class FasProtocolTests(TestCase):
@@ -210,7 +256,34 @@ class FasMotionTests(TestCase):
         self.assertTrue(stopped_station_arrival(health))
         self.assertFalse(stopped_station_arrival({**health,'stationary':False}))
         self.assertFalse(stopped_station_arrival({**health,'pose_age_s':.6}))
-        self.assertFalse(stopped_station_arrival({**health,'arrival':{**arrival,'yaw_error_deg':3.5}}))
+        self.assertTrue(stopped_station_arrival({**health,'arrival':{**arrival,'yaw_error_deg':3.5}}))
+        self.assertFalse(stopped_station_arrival({**health,'arrival':{**arrival,'yaw_error_deg':4.3}}))
+
+    def test_native_dock_can_renew_with_local_feedback_inside_the_reserved_corridor(self):
+        lease=CorridorLease(lambda:0.);lease.owner='run'
+        epoch=uuid.uuid4().hex
+        lease.reserve(epoch,'return',(-.75,2.,-.75,.75),[1.6,0.])
+        h={'ready':True,'localization_confirmed':True,'pose':(0.,0.,0.),'pose_age_s':.04,
+           'localization_covariance':(.001,.001,.002),'scan_window_agreement':None,
+           'scan_structure_verified':False,'fas_local_docking':True}
+        lease.supervise(epoch,h,(),docking=True)
+        self.assertTrue(lease.allows('return',h))
+        self.assertFalse(lease.allows('return',{**h,'fas_local_docking':False}))
+        self.assertFalse(lease.allows('return',{**h,'pose_age_s':.55}))
+        self.assertFalse(lease.allows('return',{**h,'pose':(1.2,0.,0.)}))
+
+    def test_dock_staging_still_requires_fresh_pose_and_safe_route(self):
+        lease=CorridorLease(lambda:0.);lease.owner='run'
+        lease.reserve(uuid.uuid4().hex,'return',(-.75,2.,-.75,.75),[1.6,0.])
+        h={'ready':True,'localization_confirmed':True,'pose':(0.,0.,0.),'pose_age_s':.04,
+           'localization_covariance':(.0034,.0008,.005),'scan_window_agreement':.75,
+           'fas_dock_staging':True}
+        self.assertTrue(lease.allows('return',h))
+        self.assertFalse(lease.allows('return',{**h,'fas_dock_staging':False}))
+        self.assertFalse(lease.allows('return',{**h,'pose_age_s':.55}))
+        self.assertFalse(lease.allows('return',h,((1.2,0.),)))
+        lease.reserve(uuid.uuid4().hex,'move',(-.75,2.,-.75,.75),[1.6,0.])
+        self.assertFalse(lease.allows('move',h))
 
     def test_anchored_rotation_keeps_corridor_and_peer_checks(self):
         lease=CorridorLease(lambda:0.);lease.owner='run'
@@ -330,6 +403,28 @@ class MotionSimulationTests(TestCase):
         driver.drive_batch=lambda cars,*_:calls.append(('drive',cars))
         self.assertEqual(driver.place_once(('a','b')),('a','b'))
         self.assertEqual(calls,[('plan','B'),('drive',('B',))])
+
+    def test_control_release_uses_parked_state_after_stop_and_release_replies_drop(self):
+        driver = self.driver((0.,2.),{'a':0.,'b':2.4})
+        driver.journal = SimpleNamespace(run_id='run')
+        a = {'phase':'navigating','health':{'stationary':False},'fas':{'owner':'run','lease_live':True}}
+        b = {'fas':{'owner':None}}
+        driver.car_state = lambda car: a if car=='A' else b
+        commands = []
+        def command(car, action, **kwargs):
+            commands.append((car,action))
+            if action=='fas_stop':
+                a.update(phase='idle',health={'stationary':True},fas={'owner':'run','lease_live':False})
+            else:
+                a['fas']['owner'] = None
+            raise TimeoutError('reply dropped')
+        driver.command = command
+        now = [0.]
+        clock = SimpleNamespace(monotonic=lambda:now[0],sleep=lambda delay:now.__setitem__(0,now[0]+delay))
+        with patch.object(self.host,'time',clock),redirect_stdout(io.StringIO()):
+            self.assertEqual(driver.release_available(),0)
+        self.assertEqual(commands,[('A','fas_stop'),('A','fas_release')])
+        self.assertFalse(driver.claimed)
 
     def test_charge_timer_uses_vehicle_evidence_after_a_host_link_drop(self):
         driver = self.driver((0.,2.),{'a':0.,'b':2.})
@@ -484,6 +579,45 @@ class FasSearchTests(TestCase):
         self.addCleanup(second.close)
         self.assertEqual(second.charging(),['B'])
         self.assertEqual(second.report(),[])
+
+    def test_pair_sweep_resumes_at_missing_state_and_stops_at_first_joint_hit(self):
+        self.driver.bad={0}
+        self.driver.interrupt=2
+        capture=self.driver.capture
+        def alternating(request):
+            result=capture(request)
+            if request['state_id']==1:
+                return receipt(request,c5=(-68,-62))
+            return result
+        self.driver.capture=alternating
+        config={'order':'pair-first'}
+        journal=Journal(self.path,config)
+        try:
+            with redirect_stdout(io.StringIO()), self.assertRaises(ConnectionError):
+                sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=2)
+            pair=journal.report()[0]['pair']
+            self.assertEqual(journal.report()[0]['hits'],[])
+            self.assertEqual(journal.report()[0]['tested_states'],2)
+        finally:
+            journal.close()
+        self.driver.interrupt=None
+        journal=Journal(self.path,config)
+        self.addCleanup(journal.close)
+        with redirect_stdout(io.StringIO()):
+            records=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=2)
+        self.assertEqual(self.driver.calls,[0,1,2,2,0,1,2])
+        self.assertEqual(records[0]['pair'],pair)
+        self.assertEqual(len({frozenset(row['pair']) for row in records}),2)
+        self.assertTrue(all(row['status']=='hit' and row['hits']==[2] for row in records))
+
+    def test_pair_without_joint_hit_tests_every_state(self):
+        self.driver.bad=set(range(4))
+        journal=Journal(self.path,{'order':'pair-first'})
+        self.addCleanup(journal.close)
+        with redirect_stdout(io.StringIO()):
+            rows=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=1)
+        self.assertEqual(self.driver.calls,[0,1,2,3])
+        self.assertEqual((rows[0]['status'],rows[0]['tested_states'],rows[0]['hits']),('no_hit',4,[]))
 
     def test_motion_round_retains_pair_through_interruption_and_queues_one_charge(self):
         journal=Journal(self.path,{'motion_only':True})

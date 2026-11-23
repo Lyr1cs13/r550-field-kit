@@ -22,6 +22,9 @@ function syncMapImage() {
  image.src = '/map.png?map_id='+encodeURIComponent(mapId);
 }
 const esc = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const returnPhases = new Set(['returning','settling_return','docking','paused_return',
+ 'paused_settling_return','paused_dock']);
+const canCancelReturn = () => returnPhases.has(state?.phase) && !state?.fleet_simulation?.running;
 const quiet = () => state && state.vehicle_connected !== false && ['idle','completed','failed','docked'].includes(state.phase);
 function toast(text){ $('toast').textContent = text;$('toast').classList.add('show');clearTimeout(toast.timer);toast.timer = setTimeout(() => $('toast').classList.remove('show'), 4200); }
 async function command(data) {
@@ -216,7 +219,7 @@ function render(){
  }
  $('fleet-open').hidden=window.location.hostname!=='127.0.0.1'||window.location.port!=='8891';
  const browserUrl=new URL(location.href),local=['127.0.0.1','localhost','[::1]'].includes(browserUrl.hostname);
- browserUrl.port=8896;browserUrl.pathname='/';browserUrl.search=browserUrl.hash='';
+ browserUrl.port=state.workspace?.site_port||8896;browserUrl.pathname='/';browserUrl.search=browserUrl.hash='';
  const siteUrl=state.site_url||(!local&&h.mode==='robot'?browserUrl.href:'');
  $('site-open').hidden=!siteUrl||!!state.fleet_number;
  if(siteUrl)$('site-open').href=siteUrl;
@@ -296,6 +299,10 @@ function render(){
  $('initial-dock').disabled=$('initial-dock').disabled||h.dock_calibrated===false;
  if($('align-pose'))$('align-pose').disabled=locked||!h.stationary||!h.pose||h.mode!=='robot';
  $('return').disabled=$('return').disabled||fleetActive||!!fleetBlock||h.dock_calibrated===false;
+ const cancelReturn=canCancelReturn();
+ $('return').lastChild.nodeValue=cancelReturn?'取消回充':'主动回充';
+ if(cancelReturn) $('return').disabled=disconnected;
+
  $('resume').disabled=$('resume').disabled||!!fleetBlock;
  $('start').disabled=$('start').disabled||!collectionReady||!!fleetBlock;
  $('recover-points').hidden=!state.checkpoint_available;
@@ -313,7 +320,9 @@ $('simulation-points').onclick=()=>{
  showSimulationPoints=!showSimulationPoints;
  gesture=null;setMode('pan');render();fit(false);
 };
-['stop','pause','resume','return','confirm'].forEach(id=>$(id).onclick=()=>command({action:id}));$('initial-dock').onclick=()=>command({action:'initial_dock'});$('start').onclick=()=>command({action:'start',auto_return:$('auto-return').checked,repeat:$('repeat').checked});
+['stop','pause','resume','confirm'].forEach(id=>$(id).onclick=()=>command({action:id}));
+$('return').onclick=()=>command({action:canCancelReturn()?'stop':'return'});
+$('initial-dock').onclick=()=>command({action:'initial_dock'});$('start').onclick=()=>command({action:'start',auto_return:$('auto-return').checked,repeat:$('repeat').checked});
 if($('align-pose'))$('align-pose').onclick=()=>command({action:'align_pose'});
 $('export').onclick=async()=>{const data=await(await fetch('/api/export')).json();const link=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));link.href=url;link.download='实验室导航点.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};$('import').onclick=()=>$('file').click();$('file').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());command({action:'import',map_id:data.map_id,points:data.points});}catch(err){toast('点位文件无法读取：'+err.message);}e.target.value='';};
 function updateCollectionForm(){

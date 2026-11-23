@@ -7,9 +7,52 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from arrival_policy import StationCheck
 from motion_health import VelocityLease
 from spin_control import ProfiledSpin
+from turn_approach import TurnApproach, approach_radius
 
 
 class StationSpinTests(unittest.TestCase):
+    def test_directional_aim_needs_independent_stations_and_respects_reverse_and_xy(self):
+        model=TurnApproach()
+        def sample(site,degrees,radius=.04):
+            angle=math.radians(degrees)
+            # Known off-centre pivot on a chassis initially facing map +Y.
+            before=(site,0.,math.pi/2)
+            after=(site+radius*math.sin(angle),radius*(1-math.cos(angle)),math.pi/2+angle)
+            model.observe(site,before,after,angle,math.radians(3),.055)
+        goal=dict(x=0.,y=0.,yaw=math.pi)
+        for _ in range(8):
+            sample(0,90)
+        self.assertIsNone(model.aim((0.,-1.),goal,False,.055,.022))
+        for n,angle in enumerate((75,100,105),1):
+            sample(n,angle)
+        a=model.aim((0.,-1.),goal,False,.055,.022)
+        b=model.aim((0.,1.),goal,True,.055,.022)
+        self.assertLess(a['x'],0.)
+        self.assertLessEqual(a['y'],0.)
+        self.assertLess(b['x'],0.)
+        self.assertGreaterEqual(b['y'],0.)
+        for point in (a,b):
+            self.assertLessEqual(math.hypot(point['x'],point['y'])+.022,.055+1e-12)
+            self.assertEqual(point['yaw'],math.pi)
+        self.assertIsNone(model.prediction(-math.pi/2,.055))
+        self.assertIsNone(model.prediction(math.radians(12),.055))
+        self.assertIsNone(TurnApproach().aim((0.,-1.),goal,False,.055,.022))
+        sample(4,90,-.04)
+        self.assertIsNone(model.prediction(math.pi/2,.055))
+
+    def test_radius_changes_continuously_and_inconsistent_turns_get_no_offset(self):
+        outer,inner=.035,.022
+        get=lambda angle:approach_radius(math.radians(angle),math.radians(3),outer,inner)
+        self.assertIsNone(get(2.))
+        self.assertGreater(get(12.),get(30.))
+        self.assertGreater(get(30.),get(45.))
+        self.assertAlmostEqual(get(45.),get(-90.))
+        self.assertAlmostEqual(get(45.),inner)
+        model=TurnApproach()
+        for site,drift in enumerate((.04,-.04,.045,-.045)):
+            model.observe(site,(0.,0.,0.),(drift,0.,math.pi/2),math.pi/2,math.radians(3),.055)
+        self.assertIsNone(model.prediction(math.pi/2,.055))
+
     def test_both_directions_bias_and_latched_brake(self):
         for sign in (-1,1):
             turn=ProfiledSpin(sign*math.radians(6),12.,.013)

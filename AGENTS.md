@@ -1,5 +1,6 @@
 # Development
 
+- On a deployed robot, read `~/R550-WORKSPACES.md` before opening a workspace or running a command. The production patrol workspace is reserved for its maintainers. Use the designated development workspace for other work.
 - Read README.md and docs/ before changing launch or motion behavior.
 - Run `python -m unittest discover -s demo/tests` and `python tools/check_repository.py`.
 - Keep vehicle parameters, scene geometry and acquisition transport separate.

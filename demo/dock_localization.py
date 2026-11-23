@@ -4,6 +4,7 @@ import math
 from directed_route import dock_offset
 
 DOCK_MATCH_RADIUS = .14
+DOCK_SCAN_START_YAW_DEG = 6.
 SCAN_FIT_TIMEOUT = 60.
 AMCL_VERIFY_TIMEOUT = 15.
 
@@ -22,13 +23,29 @@ def in_dock_capture(pose, reference):
         return False
     along,side = dock_offset(pose,reference)
     angle = math.remainder(pose[2]-reference[2],2*math.pi)
-    return abs(along)<=.28 and abs(side)<=DOCK_MATCH_RADIUS and abs(angle)<=math.radians(5)
+    return abs(along)<=.28 and abs(side)<=DOCK_MATCH_RADIUS and abs(angle)<=math.radians(DOCK_SCAN_START_YAW_DEG)
 
 
 def matches_dock(pose, reference):
     return (bool(pose) and all(math.isfinite(v) for v in pose)
             and math.dist(pose[:2],reference[:2])<=DOCK_MATCH_RADIUS
             and abs(math.remainder(pose[2]-reference[2],2*math.pi))<=math.radians(10))
+
+
+def staging_scan_supported(pose, approach, dock, scan_window, covariance):
+    """Accept a lower scan score only in the well-localized approach to this dock."""
+    if (not pose or scan_window is None or not .70<=scan_window<=1.
+            or covariance is None or len(covariance)!=3
+            or any(v is None or not math.isfinite(v) or v<0. for v in covariance)
+            or covariance[2]>math.radians(8)**2):
+        return False
+    forward, side = dock_offset(pose,dock)
+    # Bound lateral uncertainty conservatively even when the cross-covariance is unavailable.
+    yaw=dock[2]
+    lateral_sigma=(abs(math.sin(yaw))*math.sqrt(covariance[0])
+                   +abs(math.cos(yaw))*math.sqrt(covariance[1]))
+    return (forward>=.30 and abs(side)<=.20 and abs(side)+2*lateral_sigma<=.28
+            and math.dist(pose[:2],approach)<=.28)
 
 
 class DockLocalization:

@@ -28,8 +28,14 @@ def scene_dir(name):
     return ROOT/'scenes'/name
 
 
-def ensure_stopped(nav_port=8890):
-    if os.name!='nt' and Path('/proc').exists():
+def ensure_stopped(nav_port=None):
+    if nav_port is None:
+        nav_port=int(os.environ.get('R550_PANEL_PORT',8890))
+    if (ROOT/'state/workspace.env').is_file() and Path('/proc').exists():
+        from workspace_guard import root_processes
+        if any(kind!='site' for kind in root_processes(ROOT).values()):
+            raise ValueError('先在本工程运行 ./kit stop，再切换场景')
+    elif os.name!='nt' and Path('/proc').exists():
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():continue
             try:cmd=(proc/'cmdline').read_bytes()
@@ -90,12 +96,16 @@ def create(name, source, *, target=None):
     return target
 
 
-def activate(name, *, nav_port=8890):
+def activate(name, *, nav_port=None):
     ensure_stopped(nav_port);directory=scene_dir(name);grid=MapGrid(directory)
+    if (directory/'corridor_route.json').is_file():
+        from corridor_route import CorridorRoute
+        CorridorRoute.load(grid)
     assets=ROOT/'demo/assets';backup=ROOT/'state/backups'/f"scene_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()%1000000}"
     backup.mkdir(parents=True, exist_ok=False)
     names=['map.yaml','WHEELTEC.yaml','WHEELTEC.pgm','threshold_keepout.pgm','threshold_keepout.yaml',
-           'boundary.json','dock_start.json','map_metadata.json','survey_settings.json','survey_route.json']
+           'boundary.json','dock_start.json','map_metadata.json','survey_settings.json','survey_route.json',
+           'corridor_route.json']
     for file in names:
         original=assets/file
         if original.exists():shutil.copy2(original,backup/file)
@@ -106,7 +116,7 @@ def activate(name, *, nav_port=8890):
                 pending=original.with_suffix(original.suffix+'.scene-tmp')
                 shutil.copy2(directory/file,pending)
                 pending.replace(original)
-            elif file=='survey_route.json':
+            elif file in ('survey_route.json','corridor_route.json'):
                 original.unlink(missing_ok=True)
         status=ROOT/'state/active_scene.json'
         pending=status.with_suffix('.tmp')

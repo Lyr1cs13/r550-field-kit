@@ -67,8 +67,8 @@ class Stations:
         if not re.fullmatch('[0-9a-f]{64}', self.map_id):
             raise ValueError('点位文件缺少有效 map_id')
         items = route['points']
-        if len(items) != 50:
-            raise ValueError('采集路线应包含 50 个点位')
+        if not 2 <= len(items) <= 50:
+            raise ValueError('采集路线应包含 2 到 50 个点位')
         self.yaw = items[0]['yaw']
         for i, point in enumerate(items):
             name = point['id']
@@ -108,6 +108,9 @@ class Stations:
             return (distance + 1.6*repeated + .65*stationary, pair)
 
         return sorted((pair for pair in self.pairs if pair!=last_pair), key=rank)
+
+    def pair_candidates(self, positions, visited):
+        return (pair for pair in self.ranked(positions, set()) if tuple(sorted(pair)) not in visited)
 
 
 def sample_box(path, pad=LOCALIZATION_PAD):
@@ -339,7 +342,12 @@ class Journal:
                 status TEXT NOT NULL, request TEXT NOT NULL, receipt TEXT, delta TEXT,
                 created_utc REAL NOT NULL, completed_utc REAL);
             CREATE INDEX IF NOT EXISTS trials_state ON trials (state_id,status);
+            CREATE INDEX IF NOT EXISTS trials_pair ON trials (a,b,status,state_id);
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending ON trials (status) WHERE status='pending';
+            CREATE TABLE IF NOT EXISTS pair_sweeps (
+                lo TEXT NOT NULL, hi TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
+                status TEXT NOT NULL, PRIMARY KEY (lo,hi));
+            CREATE UNIQUE INDEX IF NOT EXISTS one_sweep ON pair_sweeps(status) WHERE status='active';
         ''')
         fingerprint = hashlib.sha256(canonical(config).encode()).hexdigest()
         with self.connection:
@@ -399,7 +407,7 @@ class Journal:
             self.connection.execute('INSERT INTO trials VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (request['trial_id'],state,*pair,'pending',canonical(request),None,None,time.time(),None))
 
-    def finish(self, trial, receipt, deltas):
+    def finish(self, trial, receipt, deltas, *, mark_state=True):
         threshold_met = all(value >= MIN_DELTA_DB for value in deltas.values())
         status = 'pass' if threshold_met else 'miss'
         with self.connection:
@@ -408,8 +416,13 @@ class Journal:
                 (status,canonical(receipt),canonical(deltas),time.time(),trial['id'])).rowcount
             if changed != 1:
                 raise ValueError('当前采样请求已结束')
-            if threshold_met:
+            if threshold_met and mark_state:
                 self.complete(trial['state_id'],'pass',{'trial_id':trial['id'],'pair':[trial['a'],trial['b']],'delta_db':deltas})
+            elif threshold_met:
+                if self.connection.execute(
+                    "UPDATE pair_sweeps SET status='hit' WHERE a=? AND b=? AND status='active'",
+                    (trial['a'],trial['b'])).rowcount!=1:
+                    raise ValueError('达标采样没有对应的活动位置对')
         return status
 
     def abandon(self, trial, reason, receipt=None):
@@ -431,8 +444,83 @@ class Journal:
         self.connection.execute('INSERT INTO states VALUES (?,?,?)', (state,status,canonical(details)))
 
     def report(self):
+        sweeps=self.connection.execute('SELECT a,b,status FROM pair_sweeps ORDER BY rowid').fetchall()
+        if sweeps:
+            return [
+                {'pair':[row['a'],row['b']],'status':row['status'],
+                 'tested_states':self.connection.execute(
+                     "SELECT COUNT(*) FROM trials WHERE a=? AND b=? AND status IN ('pass','miss')",
+                     (row['a'],row['b'])).fetchone()[0],
+                 'hits':[hit['state_id'] for hit in self.connection.execute(
+                     "SELECT state_id FROM trials WHERE a=? AND b=? AND status='pass' ORDER BY state_id",
+                     (row['a'],row['b']))]}
+                for row in sweeps]
         return [{'state_id':r['state_id'],'status':r['status'],**json.loads(r['details'])}
                 for r in self.connection.execute('SELECT * FROM states WHERE state_id>=0 ORDER BY state_id')]
+
+
+def sweep_pairs(journal, stations, c5_codes, links, receivers, driver, *, start=0, count=STATE_COUNT,
+                max_pairs=0, window_s=1., min_samples=30):
+    """Keep both cars parked until the first joint hit or all states have been tested."""
+    pending=journal.pending()
+    if pending:
+        prior=json.loads(pending['request'])
+        receipt=driver.reconcile(prior)
+        if receipt is None:
+            journal.abandon(pending,'中断窗口已关闭，待重新采样')
+        else:
+            journal.finish(pending,receipt,evaluate(prior,receipt,receivers),mark_state=False)
+    db=journal.connection
+    while True:
+        active=db.execute("SELECT a,b FROM pair_sweeps WHERE status='active'").fetchone()
+        visited={tuple(row) for row in db.execute('SELECT lo,hi FROM pair_sweeps')}
+        if not active and max_pairs and len(visited)>=max_pairs:
+            return journal.report()
+        driver.service_energy()
+        if active:
+            pair=tuple(active)
+            poses=driver.place(pair)
+            if poses is None:
+                raise ValueError('无法返回未完成的位置对，保留该对已采状态')
+        else:
+            poses=None
+            for pair in stations.pair_candidates(driver.positions(),visited):
+                poses=driver.place(pair)
+                if poses is not None:
+                    break
+            if poses is None:
+                if len(visited)==len({tuple(sorted(pair)) for pair in stations.pairs}):
+                    return journal.report()
+                raise ValueError('目前没有可达的新位置对，已保存采集进度')
+            with db:
+                db.execute("INSERT INTO pair_sweeps VALUES (?,?,?,?,'active')",(*sorted(pair),*pair))
+        tested={row[0] for row in db.execute(
+            "SELECT state_id FROM trials WHERE a=? AND b=? AND status IN ('pass','miss')",pair)}
+        for state in range(start,start+count):
+            if state in tested:
+                continue
+            for retry in range(2):
+                if hasattr(driver,'sweep_pose'):
+                    poses=driver.sweep_pose(pair)
+                trial=capture_request(journal.run_id,uuid.uuid4().hex,state,poses,phase_state(state,c5_codes),
+                                      links,min_samples=min_samples,window_s=window_s)
+                journal.start(pair,state,trial)
+                receipt=driver.capture(trial)
+                try:
+                    deltas=evaluate(trial,receipt,receivers)
+                except (ValueError,KeyError) as exc:
+                    journal.abandon(journal.pending(),str(exc),receipt)
+                    if retry:
+                        raise ValueError('当前点对连续两次采样无效，保留未完成状态') from exc
+                    continue
+                status=journal.finish(journal.pending(),receipt,deltas,mark_state=False)
+                print(f'位置对 {pair[0]} / {pair[1]} · 状态 {state:04d} · {status} · {deltas}',flush=True)
+                break
+            if status=='pass':
+                break
+        else:
+            with db:
+                db.execute("UPDATE pair_sweeps SET status='no_hit' WHERE a=? AND b=? AND status='active'",pair)
 
 
 def position_rounds(journal, stations, driver, *, start, count, max_pairs, recharge_after=None, order_pairs=None):
@@ -535,7 +623,7 @@ def search(journal, stations, c5_codes, links, receivers, driver, *, start=0, co
                 preferred=pair
                 break
         if not journal.state(state):
-            if not tested and unavailable:
+            if len(tested)<max_pairs and unavailable and len(tested)<len(stations.pairs):
                 raise ValueError('两车当前无可安全调度的位置对，保留待采状态')
             status=('no_match' if len(tested)==len(stations.pairs)
                     else 'budget_exhausted' if len(tested)>=max_pairs else 'routes_unavailable')

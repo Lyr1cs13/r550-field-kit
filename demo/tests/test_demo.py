@@ -84,6 +84,29 @@ class DemoTests(unittest.TestCase):
         m.tick();self.assertEqual(m.phase,'docking')
         self.backend.charging=True;m.tick();self.assertEqual(m.phase,'docked')
 
+    def test_stop_discards_paused_return_before_starting_new_waypoint(self):
+        mission = self.mission
+        mission.return_to_dock()
+        old = mission.operation
+        mission.pause(automatic=True)
+        self.backend.ops[old]['status'] = 'canceled'
+        mission.tick()
+        self.assertEqual(mission.phase, 'paused_return')
+
+        mission.stop()
+        self.clock.advance(10)
+        mission.tick()
+        self.assertEqual(mission.phase, 'idle')
+        self.assertFalse(mission.health_pause)
+        self.assertIsNone(mission.operation)
+        self.assertEqual(len(self.backend.calls), 1)
+
+        mission.start(self.points[1]['id'])
+        mission.tick()
+        self.assertEqual(mission.phase, 'navigating')
+        point, kind = self.backend.calls[-1]
+        self.assertEqual((point['id'], kind), (self.points[1]['id'], 'waypoint'))
+
     def test_pause_navigation_replans_same_point(self):
         m=self.mission;m.start();old=m.operation;m.pause();m.tick()
         self.backend.ops[old]['status']='canceled';m.tick();self.assertEqual(m.phase,'paused_navigation')
@@ -181,6 +204,21 @@ class DemoTests(unittest.TestCase):
         self.backend.pose=[goal['x'],goal['y'],goal['yaw']]
         self.backend.ops[m.operation]['status']='succeeded'
         m.tick()
+        self.assertEqual(self.backend.calls[-1][1],'return')
+
+    def test_manual_return_from_unpowered_dock_uses_guarded_departure(self):
+        m=self.mission;self.backend.pose=[.02,-.03,0.]
+        original=self.backend.snapshot
+        self.backend.snapshot=lambda:{**original(),'mode':'robot','charge_telemetry_fresh':True,
+                                      'scan_map_agreement':.95}
+        m.return_to_dock();m.return_to_dock()
+        self.assertEqual(len(self.backend.calls),1)
+        goal,kind=self.backend.calls[-1]
+        self.assertEqual(kind,'departure')
+        self.assertTrue(goal['dock_retry_exit'])
+        self.assertFalse(self.backend.docking_started)
+        self.backend.pose=[goal['x'],goal['y'],goal['yaw']]
+        self.arrive()
         self.assertEqual(self.backend.calls[-1][1],'return')
 
     def test_bad_seated_angle_cannot_launch_a_retry(self):
@@ -285,6 +323,38 @@ class DemoTests(unittest.TestCase):
         self.backend.pose=[.59,0,.25];self.backend.ir=2;m.tick()
         self.backend.ir=0;self.backend.ops[old]['status']='canceled';m.tick()
         self.assertEqual(m.phase,'failed');self.assertFalse(self.backend.docking_started)
+
+    def test_aligned_dock_waits_for_ir_after_a_successful_navigation(self):
+        m=self.mission
+        self.backend.dock_handoff_ready=lambda health: abs(health['pose'][1]) <= .04
+        m.return_to_dock()
+        self.backend.pose=[.60,.06,-.26]
+        self.backend.ir=2
+        self.arrive()
+        self.assertEqual(m.phase,'settling_return')
+        self.assertFalse(self.backend.docking_started)
+        self.backend.pose[1]=.02
+        self.backend.ir=0
+        self.clock.advance(1.)
+        m.tick()
+        self.assertEqual(m.phase,'settling_return')
+        self.backend.ir=2
+        m.tick()
+        self.assertEqual(m.phase,'docking')
+        self.assertTrue(self.backend.docking_started)
+        self.assertEqual(len(self.backend.calls),1)
+
+    def test_aligned_dock_cannot_start_oem_after_missing_feedback_deadline(self):
+        m=self.mission
+        self.backend.dock_handoff_ready=lambda health: True
+        m.return_to_dock()
+        self.backend.pose=[.60,0.,-.26]
+        self.arrive()
+        self.clock.advance(11.)
+        m.tick()
+        self.assertEqual(m.phase,'failed')
+        self.assertFalse(self.backend.docking_started)
+        self.assertEqual(len(self.backend.calls),1)
 
     def test_dock_capture_requires_stopped_nearby_aligned_and_ir(self):
         good={'ready':True,'localization_confirmed':True,'stationary':True,'ir':2,'pose':[.59,0,.25]}

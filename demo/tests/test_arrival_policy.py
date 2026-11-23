@@ -32,6 +32,7 @@ class ArrivalPolicyTests(unittest.TestCase):
         limits={'position_tolerance':FAS_STATION_POSITION_TOLERANCE,
                 'yaw_tolerance':FAS_STATION_YAW_TOLERANCE}
         self.assertEqual(refinement_stage(.0423,math.radians(.37),**limits),'complete')
+        self.assertEqual(refinement_stage(.0172,math.radians(3.56),**limits),'complete')
         self.assertEqual(refinement_stage(.0526,math.radians(4.36),**limits),'heading')
         self.assertEqual(refinement_stage(.056,0.,**limits),'position')
 

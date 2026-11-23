@@ -18,7 +18,7 @@ from fas_experiment import (CARS, EXCLUSIVE_LOCALIZATION_PAD, LOCALIZATION_PAD, 
                             PROTOCOL, STATE_COUNT, Journal, RecoveryWait, Stations, boxes_apart, canonical,
                             capture_request, clear_of_parked_peer, evaluate, fleet_pose_ready, move_batches,
                             parallel_bounds, peer_clearance, phase_state, point_xy, position_rounds, position_sigma,
-                            sample_box, search, station_ids, stopped_station_arrival, yaw_error)
+                            sample_box, search, station_ids, stopped_station_arrival, sweep_pairs, yaw_error)
 from fas_car import NOT_PARKED, WS63_IDS
 
 
@@ -90,9 +90,16 @@ class Base:
         return result
 
     def cancel(self, request):
-        result = self.post('/fas/cancel',{k:request[k] for k in ('run_id','trial_id')})
-        if result.get('status') not in ('idle','canceled','complete'):
-            raise ValueError('基站尚未关闭上一采样窗口')
+        identity={k:request[k] for k in ('run_id','trial_id')}
+        deadline=time.monotonic()+8.
+        while True:
+            result=self.post('/fas/cancel',identity)
+            status=result.get('status')
+            if status in ('idle','canceled','complete'):
+                return
+            if status!='canceling' or time.monotonic()>=deadline:
+                raise ValueError(result.get('error') or '基站尚未关闭上一采样窗口')
+            time.sleep(.15)
 
 
 class Live:
@@ -112,6 +119,12 @@ class Live:
         self.states = {}
         self.compact_status = dict.fromkeys(CARS,True)
         self.started_low = {car:None for car in CARS}
+        self.initial_departure = {}
+        self.resume_voltage_by_car=settings.get('resume_voltage_by_car',{})
+        if (not isinstance(self.resume_voltage_by_car,dict) or
+                not set(self.resume_voltage_by_car)<=set(CARS) or
+                any(type(v) not in (int,float) or not math.isfinite(v) for v in self.resume_voltage_by_car.values())):
+            raise ValueError('续采电压配置必须为按 A/B 车提供的有限数值')
         self.cache = {}
         self.anchor = None
         self.claimed = set()
@@ -146,6 +159,12 @@ class Live:
                     or fas.get('protocol') != PROTOCOL or not health['dock_calibrated']
                     or fas.get('motion_only',False)!=self.motion_only or fas['tx']!=expected_links):
                 raise ValueError(f'{car} 车的试验模式、地图、桩位或发端身份未对齐')
+            resume=self.resume_voltage_by_car.get(car)
+            if resume is not None:
+                energy=fas['energy']
+                if not energy['low_voltage'] < resume <= energy['resume_voltage']:
+                    raise ValueError(f'{car} 车实验续采电压须高于低电阈值且不超过车端设置')
+                state['fas']={**fas,'energy':{**energy,'resume_voltage':resume}}
             owner=fas.get('owner')
             if owner not in (None,self.journal.run_id):
                 raise ValueError(f'{car} 车已交给另一任务')
@@ -182,6 +201,16 @@ class Live:
         state = self.states[car]
         request = {'action':action,'run_id':self.journal.run_id,'map_id':self.stations.map_id,**payload}
         return self.cars[car].fetch('/api/command',request,{'X-Control-Token':state['control_token']},timeout)
+
+    def parked_command(self, car, action, *, timeout=3., **payload):
+        deadline=time.monotonic()+12.
+        while True:
+            try:
+                return self.command(car,action,timeout=timeout,**payload)
+            except ValueError as exc:
+                if str(exc)!=NOT_PARKED or time.monotonic()>=deadline:
+                    raise
+            self.wait_retry(.25)
 
     def start(self, preflight_state, c5_codes, min_samples, window_s, resume_operator):
         self.window_s = window_s
@@ -221,7 +250,7 @@ class Live:
         if self.motion_only:
             print('两车停稳预检通过，开始位置对通行验证。',flush=True)
             return
-        self.parallel(CARS,lambda car:self.command(car,'fas_probe',timeout=3.))
+        self.parallel(CARS,lambda car:self.parked_command(car,'fas_probe'))
         test_poses = self.actual_poses(('preflight-A','preflight-B'))
         check = capture_request(self.journal.run_id,uuid.uuid4().hex,preflight_state,test_poses,
                                 phase_state(preflight_state,c5_codes),self.links,
@@ -231,7 +260,8 @@ class Live:
         print('两车静止预检通过，基站已确认各指定通道分别收到 A、B 帧。',flush=True)
 
     def wait_parked(self):
-        deadline = time.monotonic()+(30. if self.motion_only else 15.)
+        started = time.monotonic()
+        deadline = started+(30. if self.motion_only else 15.)
         while time.monotonic() < deadline:
             try:
                 self.sync()
@@ -242,6 +272,11 @@ class Live:
                    for s in self.states.values()):
                 if all(fleet_pose_ready(s['health']) for s in self.states.values()):
                     return
+                if any(s['health'].get('charging_stable')
+                       and s['health'].get('dock_localization',{}).get('status')=='applying'
+                       for s in self.states.values()):
+                    # The stationary dock fit and subsequent AMCL check can outlast a normal stop.
+                    deadline = max(deadline,started+85.)
                 if self.motion_only:
                     self.relocalize_parked()
             time.sleep(.3)
@@ -296,25 +331,32 @@ class Live:
     def release_available(self):
         released, pending = [], []
         for car in CARS:
-            try:
-                self.states[car] = self.cars[car].fetch('/api/state')
-                if self.states[car].get('fas', {}).get('owner') != self.journal.run_id:
-                    continue
-                self.claimed.add(car)
-                self.command(car,'fas_stop')
-                deadline = time.monotonic()+8.
-                while time.monotonic()<deadline:
-                    self.states[car] = self.cars[car].fetch('/api/state')
-                    state = self.states[car]
-                    if state['health']['stationary'] and state['phase'] in ('idle','docked','completed','failed'):
+            deadline = time.monotonic()+8.
+            stop_requested = False
+            while time.monotonic()<deadline:
+                try:
+                    state = self.states[car] = self.car_state(car)
+                    fas = state['fas']
+                    if fas.get('owner') != self.journal.run_id:
+                        if car in self.claimed:
+                            self.claimed.discard(car)
+                            if fas.get('owner') is None:
+                                released.append(car)
+                        break
+                    self.claimed.add(car)
+                    if state['health']['stationary'] and state['phase'] in PARKED_PHASES and not fas['lease_live']:
                         self.command(car,'fas_release',timeout=3.)
-                        self.claimed.remove(car)
+                        self.claimed.discard(car)
                         released.append(car)
                         break
-                    time.sleep(.3)
-                else:
-                    pending.append(car)
-            except (OSError,ValueError,KeyError):
+                    if not stop_requested:
+                        self.command(car,'fas_stop',timeout=3.)
+                        stop_requested = True
+                except (OSError,ValueError,KeyError):
+                    # A lost reply may still have stopped or released the car.
+                    pass
+                time.sleep(.3)
+            else:
                 pending.append(car)
         print(f'已释放 {released}。待车辆连通并停稳后核对 {pending}。',flush=True)
         return 1 if pending else 0
@@ -334,8 +376,15 @@ class Live:
         ready = []
         for car,state in self.states.items():
             h, config = state['health'], state['fas']['energy']
+            start_voltage=self.initial_departure.get(car)
+            if start_voltage is not None and not h.get('charging_stable'):
+                self.initial_departure.pop(car,None)
+                start_voltage=None
             low = h['voltage'] is not None and h['voltage'] < config['low_voltage']
             self.started_low[car] = (self.started_low[car] or now) if low else None
+            if (start_voltage is not None and h['voltage'] is not None and h['voltage']>=start_voltage
+                    and h.get('dock_localization',{}).get('status')=='confirmed'):
+                continue
             if (not self.motion_only and h.get('charging_stable') and h['voltage'] is not None
                     and h['voltage'] < config['resume_voltage']):
                 ready.append(car)
@@ -346,7 +395,7 @@ class Live:
     def preview(self, car, point=None):
         key = car, None if point is None else point['id']
         if key not in self.cache:
-            response = self.command(car,'fas_preview',kind='return' if point is None else 'move',
+            response = self.parked_command(car,'fas_preview',kind='return' if point is None else 'move',
                                     point=point,timeout=7.)
             self.cache[key] = response['navigation_path']
         return self.cache[key]
@@ -617,6 +666,13 @@ class Live:
                 raise RouteRetry(f'{car} 车停靠位置或朝向不符合采样要求')
         return poses
 
+    def sweep_pose(self, pair):
+        poses=self.measured(pair)
+        low=self.low_cars()
+        if low:
+            raise ChargeNeeded(low)
+        return poses
+
     def actual_poses(self, pair):
         self.wait_parked()
         poses = {}
@@ -671,8 +727,11 @@ class Live:
                     try:
                         self.drive_batch((car,),path,{car:None},{},returning=True)
                         break
-                    except RouteRetry:
+                    except RouteRetry as error:
+                        print(f'{car} 车回充停稳后复核。{error}',flush=True)
                         self.wait_parked()
+                        if self.states[car]['health'].get('charging_stable'):
+                            break  # The contact was confirmed even though the previous reply was lost.
                 else:
                     raise RecoveryWait(f'{car} 车等待回充通道或触点恢复')
             config = self.states[car]['fas']['energy']
@@ -694,14 +753,16 @@ class Live:
                 interrupted_since = None if stable else (interrupted_since if interrupted_since is not None else now)
                 if interrupted_since is not None and now-interrupted_since>=12.:
                     raise RecoveryWait(f'{car} 车充电中断，待复核后重新回充')
-                if manual and stable and health.get('charging_elapsed_s',0) is not None and (health.get('charging_elapsed_s') or 0)>=3.:break
+                dock_confirmed=(stable and health['localization_confirmed']
+                                and health.get('dock_localization',{}).get('status')=='confirmed')
+                if manual and dock_confirmed and (health.get('charging_elapsed_s') or 0)>=3.:
+                    break
                 stable_since = (stable_since or now) if stable else None
                 onboard_duration=health.get('charging_elapsed_s')
                 elapsed=(onboard_duration if stable and isinstance(onboard_duration,(int,float))
                          and math.isfinite(onboard_duration) and onboard_duration>=0.
                          else now-stable_since if stable_since is not None else 0.)
-                confirmed = (stable and health['voltage'] is not None and health['voltage'] >= config['resume_voltage']
-                             and health['localization_confirmed'] and health.get('dock_localization',{}).get('status')=='confirmed')
+                confirmed = dock_confirmed and health['voltage'] is not None and health['voltage']>=config['resume_voltage']
                 ready_since = (ready_since or now) if confirmed else None
                 if (ready_since and now-ready_since>=config['charge_hold_seconds']
                         and elapsed>=config.get('min_charge_seconds',0.)):
@@ -750,10 +811,10 @@ class Live:
         pair = tuple(request['cars'][car]['point_id'] for car in CARS)
         self.wait_parked()
         try:
-            self.parallel(CARS,lambda car:self.command(car,'fas_radio',enabled=True,timeout=3.))
+            self.parallel(CARS,lambda car:self.parked_command(car,'fas_radio',enabled=True))
             now = time.monotonic()
             self.base.post('/fas/capture',request)
-            deadline = now+max(12., request['window_s']*4)
+            deadline = now+max(24., request['window_s']*4)
             next_lease = now+2.
             while time.monotonic()<deadline:
                 receipt = self.base.receipt(request['trial_id'])
@@ -770,15 +831,13 @@ class Live:
                         low = self.low_cars()
                         if low:
                             raise ChargeNeeded(low)
-                    self.parallel(CARS,lambda car:self.command(car,'fas_radio',enabled=True,timeout=3.))
+                    self.parallel(CARS,lambda car:self.parked_command(car,'fas_radio',enabled=True))
                     next_lease = time.monotonic()+2.
                 time.sleep(.25)
             raise ValueError('基站采样超时，保留当前状态待恢复')
-        except Exception:
-            try:
-                self.base.cancel(request)
-            except (OSError,ValueError):
-                pass  # The base also owns and expires its capture lease.
+        except (Exception,KeyboardInterrupt):
+            # Require close acknowledgment before the caller can initiate a charging move.
+            self.base.cancel(request)
             raise
         finally:
             self.off()
@@ -861,10 +920,14 @@ def unattended_motion(driver, *, start, count, max_pairs, recharge_after, window
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--route',type=Path,required=True)
+    parser.add_argument('--station-count',type=int,help='Use only the first N waypoints from the route')
+    parser.add_argument('--initial-departure-voltage',type=float,
+                        help='Optional first departure voltage at a verified dock for a fresh live run')
     parser.add_argument('--journal',type=Path,required=True)
     parser.add_argument('--start',type=int,default=0)
     parser.add_argument('--count',type=int,default=16)
-    parser.add_argument('--max-pairs',type=int,default=12)
+    parser.add_argument('--max-pairs',type=int,default=12,help='Pair budget (0 tests all admissible pairs)')
+    parser.add_argument('--pair-first',action='store_true',help='Test each distinct point pair until the first joint 6 dB hit')
     parser.add_argument('--min-samples',type=int,default=30)
     parser.add_argument('--window-s',type=float,default=1.)
     parser.add_argument('--live-config',type=Path,help='Explicitly enable physical control with this configuration')
@@ -877,7 +940,13 @@ def main():
     parser.add_argument('--pause-file',type=Path,help='Honor a managed simulation pause and release stopped cars on exit')
     args=parser.parse_args()
     route=json.loads(args.route.read_text(encoding='utf-8'))
+    if args.station_count is not None:
+        if not 2<=args.station_count<=len(route['points']):
+            parser.error('点位数量超出所选路线范围')
+        route={**route,'points':route['points'][:args.station_count]}
     stations=Stations(route)
+    if args.max_pairs==0 and not args.motion_only:
+        args.max_pairs=len({tuple(sorted(pair)) for pair in stations.pairs}) if args.pair_first else len(stations.pairs)
     if not (args.start>=0 and 1<=args.count<=STATE_COUNT and (args.unattended or args.start+args.count<=STATE_COUNT)
             and 1<=args.max_pairs<=len(stations.pairs) and 5<=args.min_samples<=5000
             and .2<=args.window_s<=180.):
@@ -886,6 +955,12 @@ def main():
         parser.error('静止联调与释放二选一，并提供真实设备配置')
     if args.motion_only and args.bench:
         parser.error('仅行驶模式不使用基站联调')
+    if args.motion_only and args.pair_first:
+        parser.error('按位置对扫描需要射频采样模式')
+    if args.initial_departure_voltage is not None and (
+            not args.live_config or not args.pair_first or args.bench or args.release
+            or not math.isfinite(args.initial_departure_voltage)):
+        parser.error('首次离桩电压仅用于新的实车按位置对采集')
     if args.unattended and (not args.motion_only or not args.live_config or args.release):
         parser.error('持续运行需要两车实车仅行驶模式')
     if args.pause_file is not None and (not args.motion_only or not args.live_config or args.release):
@@ -909,6 +984,12 @@ def main():
             parser.error('C5 必须提供 4096 个明确的原始 GPIO 状态字')
         record_config=dict(route=route,tx=links,receivers=receivers,c5_codes=codes,live=bool(args.live_config),
                            max_pairs=args.max_pairs,min_samples=args.min_samples,window_s=args.window_s)
+        if args.pair_first:
+            if {key.split('/')[0] for key in receivers}!={'sle','c5'}:
+                parser.error('按位置对采集须同时指定 WS63 和 C5 接收链')
+            record_config.update(order='pair-first-joint-hit',start=args.start,count=args.count)
+        if config.get('resume_voltage_by_car'):
+            record_config['resume_voltage_by_car']=config['resume_voltage_by_car']
     journal=Journal(args.journal,record_config)
     driver=(Live(config,args.live_config.parent,stations,journal,links,receivers,
                  motion_only=args.motion_only,pause_file=args.pause_file) if args.live_config
@@ -925,6 +1006,13 @@ def main():
             if args.bench:
                 driver.completed=True
                 return 0
+            if (args.initial_departure_voltage is not None and not journal.charging()
+                    and not journal.connection.execute('SELECT 1 FROM trials LIMIT 1').fetchone()):
+                for car,state in driver.sync().items():
+                    energy=state['fas']['energy']
+                    if not energy['low_voltage']<args.initial_departure_voltage<=energy['resume_voltage']:
+                        raise ValueError('首次离桩电压须高于低电阈值且不超过续采电压')
+                    driver.initial_departure[car]=args.initial_departure_voltage
         while True:
             try:
                 if args.motion_only:
@@ -932,8 +1020,9 @@ def main():
                                     max_pairs=args.max_pairs,recharge_after=args.recharge_after,
                                     order_pairs=driver.order_motion_pairs if args.live_config else None)
                 else:
-                    search(journal,stations,codes,links,receivers,driver,start=args.start,count=args.count,
-                           max_pairs=args.max_pairs,min_samples=args.min_samples,window_s=args.window_s)
+                    collect=sweep_pairs if args.pair_first else search
+                    collect(journal,stations,codes,links,receivers,driver,start=args.start,count=args.count,
+                            max_pairs=args.max_pairs,min_samples=args.min_samples,window_s=args.window_s)
                 if args.live_config:
                     driver.completed=True
                 break

@@ -1,5 +1,35 @@
 """Conservative localization supervision. Consistency is not absolute accuracy."""
 import math
+from directed_route import dock_footprint_intersects
+
+
+DEPARTURE_SPEED = .07
+SPIN_CLEARANCE_RADIUS = .195
+
+
+def scan_points_in_base(scan, x, y, heading):
+    first = heading+scan.angle_min
+    return [(x+r*math.cos(first+i*scan.angle_increment),
+             y+r*math.sin(first+i*scan.angle_increment))
+            for i,r in enumerate(scan.ranges)
+            if math.isfinite(r) and scan.range_min<=r<=scan.range_max]
+
+
+def departure_twist(speed, points, dock_relative, last_linear, dt):
+    """Check a slow, forward-only escape from an already seated dock."""
+    if dock_relative is not None:
+        along,side,error=dock_relative
+        if -.13<=along<=.12 and abs(side)<=.08 and abs(error)<=math.radians(12):
+            c,s=math.cos(error),math.sin(error)
+            # A rear return must be at the calibrated dock as well as behind
+            # this car. Front and side returns remain part of the envelope.
+            points=[(x,y) for x,y in points
+                    if not (-.24<=x<=-.125 and abs(y)<=.105
+                            and -.25<=along+c*x-s*y<=-.115 and abs(side+s*x+c*y)<=.11)]
+    if not 0.<speed<=DEPARTURE_SPEED or sum(x>.22 and abs(y)<x for x,y in points)<8:
+        return (0.,0.,0.)
+    velocity=cautious_twist((speed,0.,0.),points,last_linear,dt)
+    return velocity if swept_footprint_clear(velocity,points) else (0.,0.,0.)
 
 
 def swept_footprint_clear(velocity, scan_points):
@@ -7,7 +37,7 @@ def swept_footprint_clear(velocity, scan_points):
     vx, _, wz = velocity
     nearby = [(x,y) for x,y in scan_points if x*x+y*y <= .32**2]
     if abs(vx) < .015 and abs(wz) > .015:
-        return all(x*x+y*y > .195**2 for x,y in nearby)
+        return all(x*x+y*y > SPIN_CLEARANCE_RADIUS**2 for x,y in nearby)
     for t in (0., .16, .32, .48):
         angle=wz*t;c=math.cos(angle);s=math.sin(angle)
         dx=vx*t if abs(wz)<1e-6 else vx*s/wz
@@ -16,6 +46,19 @@ def swept_footprint_clear(velocity, scan_points):
             rx=c*(x-dx)+s*(y-dy);ry=-s*(x-dx)+c*(y-dy)
             if -.16<=rx<=.15 and abs(ry)<=.12:
                 return False
+    return True
+
+
+def swept_dock_clear(velocity, pose, dock):
+    x,y,heading = pose
+    vx,vy,turn = velocity
+    c,s = math.cos(heading),math.sin(heading)
+    for t in (0., .12, .24, .36, .48):
+        angle = turn*t
+        advance, bend = (t,0.) if abs(turn)<1e-6 else (math.sin(angle)/turn,(1.-math.cos(angle))/turn)
+        dx,dy = vx*advance-vy*bend, vy*advance+vx*bend
+        if dock_footprint_intersects((x+c*dx-s*dy,y+s*dx+c*dy,heading+angle),dock):
+            return False
     return True
 
 
@@ -112,6 +155,29 @@ class LocalizationGuard:
         return self.fault
 
 
+class StopFeedback:
+    """Distinguish a bounded coast after spin cancellation from unintended travel."""
+    def __init__(self):
+        self.last_turn = None
+        self.since = None
+
+    def still_moving(self, now, command, odometry, turn_clear=lambda: False):
+        if any(command):
+            self.last_turn = (now, command[2]) if abs(command[0]) < .01 and command[2] else None
+        if any(command) or odometry is None or (abs(odometry[3]) <= .025 and abs(odometry[4]) <= .10):
+            self.since = None
+            return False
+
+        if self.since is None:
+            self.since = now
+        if now-self.since < .65:
+            return False
+        linear_speed, yaw_rate = odometry[3:]
+        return not (self.last_turn and now-self.last_turn[0] < 2.5
+                    and abs(linear_speed) <= .025 and yaw_rate*self.last_turn[1] > 0.
+                    and turn_clear())
+
+
 class VelocityLease:
     """No stale nonzero command can survive a missing permission heartbeat."""
     def __init__(self, timeout=.3):
@@ -164,12 +230,15 @@ class VelocityLease:
 
 
 class OemLease:
-    """Only revokes OEM drive after lost supervision; never enables hardware."""
+    """Track supervision of the OEM docking mode."""
     def __init__(self):
         self.active=False;self.received=-math.inf
 
     def receive(self,now,active):
-        self.active=bool(active);self.received=now
+        active=bool(active)
+        released=self.active and not active
+        self.active=active;self.received=now
+        return released
 
     def expired(self,now):
         if self.active and now-self.received>.5:

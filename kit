@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
 set -eo pipefail
-export R550_KIT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export R550_KIT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$R550_KIT_ROOT"
 export R550_MAPPING_STATE="$R550_KIT_ROOT/state/mapping"
 [[ ! -f state/runtime.env ]] || source state/runtime.env
+[[ ! -f state/workspace.env ]] || source state/workspace.env
 session_prefix=${R550_SCREEN_PREFIX:-r550}
 command=${1:-help}; shift || true
+if [[ -f state/workspace.env ]]; then
+  case "$command" in
+    profile) exec python3 tools/workspace_guard.py "${1:-status}" ;;
+    nav|site|mapping|teleop|explore|hold|stop|api|network|setup|servo-probe|c5-config|c5-collector)
+      if [[ ${R550_GUARD_PARENT:-} != "$PPID" ]]; then
+        exec python3 tools/workspace_guard.py run "$command" "$@"
+      fi ;;
+  esac
+  unset R550_GUARD_PARENT
+fi
 ros_env() {
-  source /opt/ros/humble/setup.bash
-  source "$HOME/wheeltec_ros2/install/setup.bash"
-  [[ ! -f "$R550_KIT_ROOT/vendor_nav2_overlay/install/setup.bash" ]] || source "$R550_KIT_ROOT/vendor_nav2_overlay/install/setup.bash"
-  if [[ -f "$R550_KIT_ROOT/state/network.sh" ]]; then
-    source "$R550_KIT_ROOT/state/network.sh"
-  elif [[ -f "$HOME/.config/wheeltec_ros/network.sh" ]]; then
-    source "$HOME/.config/wheeltec_ros/network.sh"
-  fi
+  source "$R550_KIT_ROOT/tools/ros_environment.sh"
 }
 case "$command" in
   setup) exec bash tools/install.sh "$@" ;;
   network) exec python3 tools/network.py "$@" ;;
   scene) exec python3 tools/scene.py "$@" ;;
-  preview) exec python3 demo/server.py --backend offline --host 127.0.0.1 --port 8890 ;;
+  preview) exec python3 demo/server.py --backend offline --host 127.0.0.1 --port "${R550_PREVIEW_PORT:-8890}" ;;
   test) exec python3 -m unittest discover -s demo/tests ;;
   postprocess) exec python3 tools/postprocess_heatmap.py "$@" ;;
   doctor) if [[ "${1:-}" != --offline ]]; then ros_env; fi; exec python3 tools/doctor.py "$@" ;;
@@ -38,7 +42,7 @@ case "$command" in
       new)
         [[ "${1:-}" == --at-dock ]] || { echo '车尾贴合新桩、车头朝场内后运行：./kit mapping new --at-dock [--auto]'; exit 1; }
         [[ ! -f state/site-mapping/owns-robot ]] || { echo '请先在新场地页面退出建图'; exit 1; }
-        if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|demo/server.py' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
+        if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|demo/server[.]py.*--backend[ =]+ros([[:space:]]|$)' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
         python3 tools/mapping_state.py
         automatic=false; [[ "${2:-}" != --auto ]] || automatic=true
         mkdir -p state/logs
@@ -47,7 +51,7 @@ case "$command" in
       resume)
         [[ -n "${1:-}" ]] || { echo './kit mapping resume maps/checkpoint_xxx'; exit 1; }
         [[ ! -f state/site-mapping/owns-robot ]] || { echo '请先在新场地页面退出建图'; exit 1; }
-        if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|demo/server.py' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
+        if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|demo/server[.]py.*--backend[ =]+ros([[:space:]]|$)' >/dev/null; then echo '先执行 ./kit stop'; exit 1; fi
         checkpoint=$(realpath "$1");mkdir -p state/logs
         [[ -f "$checkpoint/manifest.json" ]] || { echo '缺少检查点 manifest.json'; exit 1; }
         mkdir -p state/mapping

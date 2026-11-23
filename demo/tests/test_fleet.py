@@ -89,7 +89,7 @@ class FleetTests(unittest.TestCase):
         sink=SimpleNamespace(publish=lambda msg:None)
         op=dict(status='spinning',kind='waypoint',spin_brake=SimpleNamespace(signed_limit=-.14))
         backend=SimpleNamespace(lock=threading.RLock(),active='point',ops={'point':op},path=[[0.,0.]],
-            snapshot=lambda:dict(ready=True),confirmed=True,localization_guard=SimpleNamespace(reason=''),
+            dock_calibrated=False,snapshot=lambda:dict(ready=True,charge_contact_live=False),confirmed=True,localization_guard=SimpleNamespace(reason=''),
             fleet_zone=None,fas_lease=SimpleNamespace(owner='pair',allows=lambda *args:allowed[0]),
             docking_since=None,retreat_permit=sink,oem_lease=sink,gyro=(time.monotonic(),0.,0.),
             motion_permit=SimpleNamespace(publish=lambda msg:permits.append(msg.data)),publish_spin_limit=caps.append)

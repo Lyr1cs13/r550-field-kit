@@ -1,12 +1,26 @@
+import math
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dock_localization import DockLocalization, localization_inputs_ready
+from dock_localization import DockLocalization, localization_inputs_ready, staging_scan_supported
 
 
 class DockLocalizationTests(unittest.TestCase):
+    def test_staging_support_requires_nearby_dock_approach_and_good_pose_evidence(self):
+        dock = (0., 0., 0.)
+        approach = (.60, 0.)
+        pose = (.58, .05, math.radians(82))
+        cov = (.0034, .0008, .005)
+        self.assertTrue(staging_scan_supported(pose,approach,dock,.75,cov))
+        self.assertFalse(staging_scan_supported((.58,.23,0.),approach,dock,.75,cov))
+        self.assertFalse(staging_scan_supported((.92,.05,0.),approach,dock,.75,cov))
+        self.assertFalse(staging_scan_supported(pose,approach,dock,None,cov))
+        self.assertFalse(staging_scan_supported(pose,approach,dock,.65,cov))
+        self.assertTrue(staging_scan_supported((.59,.03,0.),approach,dock,.712,(.0007,.0088,.007)))
+        self.assertFalse(staging_scan_supported((.59,.11,0.),approach,dock,.75,(.0007,.0088,.007)))
+
     def test_cold_start_initialization_does_not_wait_for_costmap_tf(self):
         states={'amcl':(3,99.),'map_server':(3,99.),'controller_server':(1,99.)}
         self.assertTrue(localization_inputs_ready(100.,map_matches=True,mapping=False,
@@ -50,6 +64,13 @@ class DockLocalizationTests(unittest.TestCase):
         self.assertEqual(self.p.status,'alignment_required');self.assertEqual(self.p.count,0)
         self.assertIsNone(self.step(12,pose=[.01,.01,.02]))
         self.assertEqual(self.step(15,pose=[.01,.01,.02]),'initialize')
+
+    def test_small_charging_heading_offset_starts_scan_without_confirming_pose(self):
+        pose = [.01, -.04, math.radians(5.2)]
+        self.assertIsNone(self.step(0, pose=pose))
+        self.assertEqual(self.step(3, pose=pose), 'initialize')
+        self.assertIsNone(self.step(4, pose=pose, amcl_updated=False))
+        self.assertEqual(self.p.count, 0)
 
     def test_straight_charge_offset_can_confirm_but_neighbouring_dock_cannot(self):
         for t in (0,4):

@@ -4,6 +4,7 @@ __pycache__/
 state/
 maps/
 demo/data/
+/demo/assets/corridor_route.json
 vendor_nav2_overlay/
 build/
 install/

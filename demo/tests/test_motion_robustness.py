@@ -4,9 +4,49 @@ import sys
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from directed_route import departure_leg, fas_axis_leg, fas_short_leg, straight_approach_speed, straight_leg, uniform_route
-from motion_health import LocalizationGuard, VelocityLease, OemLease, cautious_twist, swept_footprint_clear
+from directed_route import (DOCK_STAGING_DISTANCE, departure_goal, departure_leg, dock_staging_needed,
+                            fas_axis_leg, fas_short_leg, straight_approach_speed, straight_leg, uniform_route)
+from motion_health import (LocalizationGuard, StopFeedback, VelocityLease, OemLease, cautious_twist, departure_twist,
+                           swept_dock_clear, swept_footprint_clear)
+from self_return_geometry import rear_center_glint_indices
 from endurance import Endurance
+
+
+class StopFeedbackTests(unittest.TestCase):
+    def test_same_direction_spin_coast_can_settle(self):
+        stops=StopFeedback()
+        stops.still_moving(1., (0.,0.,.21), (0.,0.,0.,0.,.2))
+        self.assertFalse(stops.still_moving(1.05,(0.,0.,0.),(0.,0.,0.,0.,.2)))
+        self.assertFalse(stops.still_moving(1.85,(0.,0.,0.),(0.,0.,.14,0.,.13),lambda: True))
+        self.assertFalse(stops.still_moving(2.15,(0.,0.,0.),(0.,0.,.17,0.,.05)))
+
+    def test_braking_allowance_cannot_hide_translation_reversal_or_a_long_turn(self):
+        for time_s, linear, rate in [(1.85,.04,.14),(1.85,0.,-.14),(3.55,0.,.14)]:
+            with self.subTest(time_s=time_s, linear=linear, rate=rate):
+                stops=StopFeedback()
+                stops.still_moving(1.,(0.,0.,.21),(0.,0.,0.,0.,.2))
+                stops.still_moving(1.05,(0.,0.,0.),(0.,0.,0.,0.,.2))
+                self.assertTrue(stops.still_moving(time_s,(0.,0.,0.),(0.,0.,.15,linear,rate),lambda: True))
+
+    def test_turn_coast_still_requires_clearance(self):
+        stops=StopFeedback()
+        stops.still_moving(1.,(0.,0.,-.2),(0.,0.,0.,0.,-.2))
+        stops.still_moving(1.05,(0.,0.,0.),(0.,0.,0.,0.,-.2))
+        self.assertTrue(stops.still_moving(1.85,(0.,0.,0.),(0.,0.,-.25,0.,-.13)))
+
+
+class DockFootprintTests(unittest.TestCase):
+    def test_nearby_pass_is_clear_and_swept_contact_is_blocked(self):
+        dock=(0.,0.,0.)
+        self.assertTrue(swept_dock_clear((.08,0.,0.),(.12,0.,0.),dock))
+        self.assertTrue(swept_dock_clear((.05,0.,0.),(-.14,.27,math.pi/2),dock))
+        self.assertFalse(swept_dock_clear((-.10,0.,0.),(.06,0.,0.),dock))
+        self.assertFalse(swept_dock_clear((0.,0.,.60),(.045,0.,0.),dock))
+
+    def test_rotated_dock_uses_the_same_casing_and_contact_dimensions(self):
+        dock=(2.,-1.,math.pi/2)
+        self.assertTrue(swept_dock_clear((.08,0.,0.),(2.,-.88,math.pi/2),dock))
+        self.assertFalse(swept_dock_clear((-.10,0.,0.),(2.,-.94,math.pi/2),dock))
 
 
 class DirectedTests(unittest.TestCase):
@@ -20,6 +60,38 @@ class DirectedTests(unittest.TestCase):
         self.assertEqual(departure_leg([.33,0.,0.],[0.,0.,0.],goal)['distance'],0.)
         with self.assertRaises(ValueError):
             departure_leg([0.,0.,math.pi],[0.,0.,0.],goal)
+
+    def test_interrupted_departure_can_continue_without_spinning_next_to_dock(self):
+        dock=(0.,0.,0.)
+        pose=(.33,.01,math.radians(39))
+        goal=departure_goal(dock,DOCK_STAGING_DISTANCE)
+        self.assertTrue(dock_staging_needed(pose,dock,DOCK_STAGING_DISTANCE))
+        leg=departure_leg(pose,dock,goal,staging=True)
+        target=leg['poses'][-1]
+        self.assertAlmostEqual(target['x'],DOCK_STAGING_DISTANCE)
+        self.assertEqual(target['yaw'],pose[2])
+        self.assertFalse(dock_staging_needed((target['x'],target['y'],target['yaw']),dock,DOCK_STAGING_DISTANCE))
+        with self.assertRaises(ValueError):
+            departure_leg((.07,pose[1],pose[2]),dock,goal,staging=True)
+
+    def test_departure_checks_live_front_and_side_with_only_seated_dock_contact_excepted(self):
+        coverage=[(.60,i*.025) for i in range(-8,9)]
+        rear_dock=(-.15,.03)
+        seated=(0.,0.,0.)
+        self.assertEqual(departure_twist(.07,coverage+[rear_dock],seated,.07,.05),(.07,0.,0.))
+        for points,contact in ((coverage+[rear_dock],None),
+                               (coverage+[rear_dock],(.18,0.,0.)),
+                               (coverage+[rear_dock,(.15,.02)],seated),
+                               (coverage+[rear_dock,(-.143,.114)],seated),
+                               ([rear_dock],seated)):
+            with self.subTest(points=points[-2:],contact=contact):
+                self.assertEqual(departure_twist(.07,points,contact,.07,.05),(0.,0.,0.))
+
+    def test_rear_glint_needs_in_body_anchor_and_preserves_external_returns(self):
+        geometry=(3.055,.004,(.03163,.00009),(.15,50.))
+        self.assertEqual(rear_center_glint_indices([.151,.18,.21,.25],*geometry),{0,1,2})
+        self.assertEqual(rear_center_glint_indices([math.nan,.18,.21,.25],*geometry),set())
+        self.assertEqual(rear_center_glint_indices([.151,.18,.21,.25],2.85,*geometry[1:]),set())
 
     def test_straight_geometry_ignores_final_heading_and_slows_before_the_goal(self):
         goal=dict(x=2.,y=0.,yaw=math.pi/2)
@@ -114,7 +186,9 @@ class HealthTests(unittest.TestCase):
         guard=OemLease();self.assertFalse(guard.expired(100.))
         guard.receive(100.,True);self.assertFalse(guard.expired(100.4))
         self.assertTrue(guard.expired(100.6));self.assertFalse(guard.expired(101.))
-        guard.receive(102.,True);guard.receive(102.2,False)
+        self.assertFalse(guard.receive(102.,True))
+        self.assertTrue(guard.receive(102.2,False))
+        self.assertFalse(guard.receive(102.3,False))
         self.assertFalse(guard.expired(110.))
 
     def test_command_and_permission_both_expire(self):
@@ -260,6 +334,70 @@ class MissionRecoveryTests(unittest.TestCase):
             self.assertEqual(m.phase,'completed')
             self.assertEqual(m.index,50)
             self.assertFalse((Path(directory)/'mission_checkpoint.json').exists())
+
+
+    def test_day_of_continuous_station_patrol(self):
+        from test_demo import ControlledBackend, Clock
+        from mission import Mission
+        from map_grid import MapGrid
+        import tempfile
+
+        clock = Clock()
+        backend = ControlledBackend()
+        original = backend.snapshot
+        backend.snapshot = lambda: {**original(), 'charging_stable': backend.charging}
+        grid = MapGrid(Path(__file__).resolve().parents[2]/'scenes/demo-room')
+        with tempfile.TemporaryDirectory() as directory:
+            mission = Mission(grid, backend, directory, clock)
+            mission.endurance = Endurance(dict(enabled=True, low_voltage=10., resume_voltage=12.,
+                                               low_hold_seconds=20., charge_hold_seconds=120.))
+            mission.save_points(uniform_route([[.4,-2.],[4.4,-2.]],50,0.,wait=30.))
+            mission.start(repeat=True)
+            elapsed_from = clock()
+            arrivals = charges = pauses = 0
+            while clock()-elapsed_from < 86400:
+                lap, index = divmod(arrivals,50)
+                self.assertEqual((mission.lap,mission.index,mission.phase),(lap+1,index,'navigating'))
+                if index == 9:
+                    backend.ready = False
+                    mission.tick()
+                    backend.ops[mission.operation]['status'] = 'canceled'
+                    mission.tick()
+                    backend.ready = True
+                    mission.tick()
+                    clock.advance(3.1)
+                    mission.tick()
+                    pauses += 1
+                if index == 25:
+                    backend.voltage = 9.8
+                    mission.tick()
+                    clock.advance(21.)
+                    mission.tick()
+                    backend.ops[mission.operation]['status'] = 'canceled'
+                    mission.tick()
+                    self.assertEqual(mission.phase,'returning')
+                    backend.ops[mission.operation]['status'] = 'succeeded'
+                    mission.tick()
+                    self.assertEqual(mission.phase,'docking')
+                    backend.charging = True
+                    backend.voltage = 12.3
+                    mission.tick()
+                    clock.advance(121.)
+                    mission.tick()
+                    self.assertEqual(mission.phase,'departing')
+                    backend.charging = False
+                    backend.ops[mission.operation]['status'] = 'succeeded'
+                    mission.tick()
+                    charges += 1
+                self.assertEqual((mission.index,mission.phase),(index,'navigating'))
+                clock.advance(30.)
+                backend.ops[mission.operation]['status'] = 'succeeded'
+                mission.tick()
+                clock.advance(30.1)
+                mission.tick()
+                arrivals += 1
+            self.assertGreater(arrivals,1300)
+            self.assertGreaterEqual(min(charges,pauses),26)
 
 
 if __name__=='__main__':unittest.main()

@@ -11,6 +11,7 @@ from collections import deque
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,9 @@ ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repeat',type=int,default=0,help='additional alternating forward/reverse arrivals')
-    parser.add_argument('--safety-only',action='store_true')
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--safety-only',action='store_true')
+    mode.add_argument('--corridor-only',action='store_true',help='check the guided corridor and dock handoff')
     args=parser.parse_args()
     if not 0<=args.repeat<=100:raise SystemExit('--repeat must be 0..100')
     if os.environ.get('ROS_LOCALHOST_ONLY')!='1' or os.environ.get('ROS_DOMAIN_ID')!='187':
@@ -34,19 +37,20 @@ def main():
     import rclpy
     from rclpy.action import ActionClient
     from rclpy.parameter import Parameter
-    from geometry_msgs.msg import Twist, TwistStamped, TransformStamped, PoseStamped
+    from geometry_msgs.msg import Twist, TwistStamped, TransformStamped, PoseStamped, PoseWithCovarianceStamped
     from nav_msgs.msg import Odometry, OccupancyGrid, Path as NavPath
     from nav2_msgs.action import DriveOnHeading, FollowPath, ComputePathToPose, Spin
     from nav2_msgs.srv import IsPathValid, ManageLifecycleNodes
     from rcl_interfaces.srv import SetParametersAtomically
     from sensor_msgs.msg import Imu, LaserScan
-    from std_msgs.msg import Bool, Int8
+    from std_msgs.msg import Bool, Int8, UInt8
     from tf2_ros import TransformBroadcaster
     from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
     sys.path.insert(0,str(ROOT/'demo'))
     from directed_route import fas_axis_leg, straight_approach_speed
     from arrival_policy import FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE
     from ros_backend import RosBackend
+    from turn_approach import TurnApproach
 
     out=ROOT/'state/robustness/native';out.mkdir(parents=True,exist_ok=True)
     (out/'result.json').unlink(missing_ok=True)
@@ -55,11 +59,14 @@ def main():
     arrival=config['demo_arrival']['ros__parameters']
     position_tolerance=arrival['final_position_tolerance']
     yaw_tolerance=arrival.get('final_yaw_tolerance',controller['goal_checker']['yaw_goal_tolerance'])
-    controller['controller_plugins']=['FixedHeading'] if args.safety_only else ['FixedHeading','PointPose']
+    controller['controller_plugins']=(['CorridorTrack','CorridorBend','FollowPath'] if args.corridor_only else
+                                      ['FixedHeading'] if args.safety_only else ['FixedHeading','PointPose'])
     controller['goal_checker_plugins']=(['point_position_checker'] if args.safety_only else
                                          ['point_position_checker','point_pose_checker'])
     controller['goal_checker_plugins'].extend(['directed_position_checker','fas_turn_position_checker'])
-    controller['goal_checker_plugin']='point_position_checker'
+    if args.corridor_only:
+        controller['goal_checker_plugins'].append('goal_checker')
+    controller['goal_checker_plugin']='goal_checker' if args.corridor_only else 'point_position_checker'
     controller['point_position_checker']['xy_goal_tolerance']=controller['directed_position_checker']['xy_goal_tolerance']
     local=config['local_costmap']['local_costmap']['ros__parameters']
     local.pop('filters',None)
@@ -80,8 +87,12 @@ def main():
     spawn('gate',[sys.executable,str(ROOT/'demo/motion_gate.py')])
     spawn('planner',['ros2','run','nav2_planner','planner_server','--ros-args','--params-file',str(params)])
     spawn('behavior',['ros2','run','nav2_behaviors','behavior_server','--ros-args','--params-file',str(params),'-r','cmd_vel:=/nav_cmd_vel'])
+    managed=['planner_server','controller_server','velocity_smoother','collision_monitor','behavior_server']
+    if args.corridor_only:
+        spawn('bt_navigator',['ros2','run','nav2_bt_navigator','bt_navigator','--ros-args','--params-file',str(params)])
+        managed.append('bt_navigator')
     spawn('lifecycle',['ros2','run','nav2_lifecycle_manager','lifecycle_manager','--ros-args','-p','autostart:=true',
-                       '-p','node_names:=[planner_server, controller_server, velocity_smoother, collision_monitor, behavior_server]'])
+                       '-p','node_names:=['+', '.join(managed)+']'])
     rclpy.init();node=rclpy.create_node('synthetic_navigation_plant')
     tf=TransformBroadcaster(node)
     odom=node.create_publisher(Odometry,'/odom',10)
@@ -98,6 +109,28 @@ def main():
     world.info.resolution=.05;world.info.width=100;world.info.height=80
     world.info.origin.position.x=-2.;world.info.origin.position.y=-2.;world.info.origin.orientation.w=1.
     world.data=[100 if x in (0,99) or y in (0,79) else 0 for y in range(80) for x in range(100)]
+    fixture=None;fixture_grid=None;corridor_bridge=None
+    if args.corridor_only:
+        import numpy as np
+        from map_grid import MapGrid
+        fixture=tempfile.TemporaryDirectory()
+        scene=Path(fixture.name)/'demo-room'
+        shutil.copytree(ROOT/'scenes/demo-room',scene)
+        fixture_grid=MapGrid(scene)
+        lane_x=.5
+        guide={'schema':1,'map_id':fixture_grid.map_id,'lanes':[[lane_x,-6.,-3.],[lane_x+1.,-6.,-3.]],
+               'links':[-6.,-3.],'clearance_m':.27}
+        (scene/'corridor_route.json').write_text(json.dumps(guide))
+        world.info.resolution=fixture_grid.resolution
+        world.info.width=fixture_grid.width;world.info.height=fixture_grid.height
+        world.info.origin.position.x,world.info.origin.position.y=fixture_grid.origin[:2]
+        world.data=fixture_grid.cells
+        cells=np.asarray(fixture_grid.cells).reshape(fixture_grid.height,fixture_grid.width)
+        rays=np.arange(.05,10.01,.045)[None,:]
+        ray_angles=np.linspace(-math.pi,math.pi,360,endpoint=False)[:,None]
+        amcl=node.create_publisher(PoseWithCovarianceStamped,'/amcl_pose',
+                                   QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        ir=node.create_publisher(UInt8,'/robot_red_flag',qos_profile_sensor_data)
     map_publisher.publish(world)
     state=dict(x=0.,y=.012,a=.01,v=0.,w=0.,command=(0.,0.),command_time=0.,obstacle=None,
                sensors=True,allow=True,manual=False,freeze=False,scan_at=0.)
@@ -140,21 +173,38 @@ def main():
         m.twist.twist.linear.x=state['v'];m.twist.twist.angular.z=state['w'];odom.publish(m);combined.publish(m)
         if bridge is not None:
             bridge.wheel_received(m)
+        if corridor_bridge is not None:
+            sample=PoseWithCovarianceStamped()
+            sample.header.stamp=stamp;sample.header.frame_id='map'
+            sample.pose.pose=m.pose.pose
+            for index in (0,7,35):sample.pose.covariance[index]=.001
+            amcl.publish(sample)
+            ir.publish(UInt8(data=state.get('ir',0)))
         if state['allow'] is not None:permit.publish(Bool(data=state['allow']))
         if state['sensors'] and now-state['scan_at']>.05:
             state['scan_at']=now
-            if bridge is not None:
+            if bridge is not None or corridor_bridge is not None:
                 rate=Imu();rate.header.stamp=stamp;rate.angular_velocity.z=state['w']+.004
                 imu.publish(rate)
             s=LaserScan();s.header.stamp=stamp;s.header.frame_id='laser'
             s.angle_min=-math.pi;s.angle_increment=math.pi/180;s.angle_max=math.pi-s.angle_increment
             s.range_min=.02;s.range_max=10.;s.scan_time=.05
             ranges=[]
+            if fixture_grid is not None:
+                radians=ray_angles+state['a']
+                ix=np.floor((state['x']+np.cos(radians)*rays-fixture_grid.origin[0])/fixture_grid.resolution).astype(int)
+                iy=np.floor((state['y']+np.sin(radians)*rays-fixture_grid.origin[1])/fixture_grid.resolution).astype(int)
+                inside=(0<=ix)&(ix<fixture_grid.width)&(0<=iy)&(iy<fixture_grid.height)
+                hit=~inside|(cells[iy.clip(0,fixture_grid.height-1),ix.clip(0,fixture_grid.width-1)]!=0)
+                ray_ranges=np.where(hit.any(axis=1),rays[0,hit.argmax(axis=1)],s.range_max)
             for i in range(360):
                 a=state['a']+s.angle_min+i*s.angle_increment;cx,cy=math.cos(a),math.sin(a)
-                distances=[(wall-state['x'])/cx for wall in (-2.,3.) if abs(cx)>1e-9 and (wall-state['x'])/cx>0]
-                distances += [(wall-state['y'])/cy for wall in (-2.,2.) if abs(cy)>1e-9 and (wall-state['y'])/cy>0]
-                d=min(distances)
+                if fixture_grid is None:
+                    distances=[(wall-state['x'])/cx for wall in (-2.,3.) if abs(cx)>1e-9 and (wall-state['x'])/cx>0]
+                    distances += [(wall-state['y'])/cy for wall in (-2.,2.) if abs(cy)>1e-9 and (wall-state['y'])/cy>0]
+                    d=min(distances)
+                else:
+                    d=ray_ranges[i]
                 if state['obstacle'] is not None:
                     ox,oy=state['obstacle'];rx,ry=ox-state['x'],oy-state['y']
                     projection=rx*cx+ry*cy;cross=rx*cy-ry*cx
@@ -197,31 +247,32 @@ def main():
     leg_validator=node.create_client(IsPathValid,'/is_path_valid')
     spin_limit=node.create_publisher(TwistStamped,'/navigation_spin_limit',1)
     nav_zero=node.create_publisher(Twist,'/nav_cmd_vel',1)
-    def station_bridge(goal, blocked_until):
+    def station_bridge(goal, blocked_until, *, fas_station=True, turn_approach=None):
         sink=SimpleNamespace(publish=lambda msg:None)
         def check_wall(x,y,clearance):
             if min(x+2,3-x,y+2,2-y)<=clearance:raise ValueError('Synthetic wall clearance')
         b=SimpleNamespace(ops={},active=None,lock=threading.RLock(),spin_action=spin,
             get_clock=node.get_clock,spin_limit_pub=spin_limit,motion_permit=permit,retreat_permit=sink,oem_lease=sink,
-            docking_since=None,fleet_zone=None,localization_guard=SimpleNamespace(reason=''),confirmed=True,
+            dock_calibrated=False,docking_since=None,fleet_zone=None,localization_guard=SimpleNamespace(reason=''),confirmed=True,
             gyro=None,rest_gyro=deque(maxlen=24),stationary_since=time.monotonic()-.8,last_wheel=0.,wheel_distance=0.,
             encoders=None,wheel_yaw_rate=0.,joint_terminal=True,arrival=arrival,goal_xy_tolerance=.10,
-            goal_yaw_tolerance=.25,position_xy_tolerance=.035,turn_approach_radius=.022,track=deque(),
+            goal_yaw_tolerance=.25,position_xy_tolerance=.035,turn_approach_radius=.022,
+            turn_approach=turn_approach if turn_approach is not None else TurnApproach(),track=deque(),
             sequential_waypoints=True,precision_arrival=True,pose=[state[k] for k in ('x','y','a')],
             grid=SimpleNamespace(validate=check_wall),dock_localization=SimpleNamespace(arm=lambda:None),
             leg_validator=leg_validator,controller_parameters=parameters,
-            speed_limits={},speed_update=None,follow=client,get_logger=node.get_logger,plan_coordinates=RosBackend.plan_coordinates,
+            directed_lookahead=controller['FixedHeading']['lookahead_dist'],speed_limits={},speed_update=None,follow=client,get_logger=node.get_logger,plan_coordinates=RosBackend.plan_coordinates,
             raw_cmd=nav_zero,cmd=raw,last_lease=0.,request_stationary_amcl=lambda now:None)
-        b.snapshot=lambda:dict(ready=time.monotonic()>=blocked_until,stationary=b.stationary_since is not None,
+        b.snapshot=lambda:dict(charge_contact_live=False,ready=time.monotonic()>=blocked_until,stationary=b.stationary_since is not None,
                                scan_map_agreement=.99,scan_structure_verified=True)
         for name in ('gyro_received','wheel_received','begin_waypoint_heading','start_fas_spin','spin_accepted',
                      'spin_done','finish_native_cancellation','settle_waypoint_heading','should_brake_heading',
                      'navigate','send_fas_line','fas_line','stamped','send_navigation','directed_validated','directed_speed_ready',
-                     'update_line_alignment',
+                     'update_line_alignment','directed_lookahead_ready','send_directed_path',
                      'follow_directed','nav_accepted','nav_done','retry_arrival','send_arrival_retry','request_speed','stop_at_waypoint',
                      'publish_motion_permit','publish_spin_limit','zero_motion','finish_waypoint_position','complete_waypoint'):
             setattr(b,name,MethodType(getattr(RosBackend,name),b))
-        b.navigate({**goal,'fas_station':True},'waypoint')
+        b.navigate({**goal,'fas_station':fas_station},'waypoint')
         return b
     def path_goal(x,heading=0.,terminal=False):
         goal=FollowPath.Goal();goal.controller_id='PointPose' if terminal else 'FixedHeading'
@@ -234,12 +285,109 @@ def main():
             q.pose.orientation.z=math.sin(heading/2);q.pose.orientation.w=math.cos(heading/2);p.poses.append(q)
         goal.path=p
         return goal
+    corridor_executor=None;corridor_thread=None
+    def check_corridors():
+        nonlocal corridor_bridge,corridor_executor,corridor_thread
+        from rclpy.executors import SingleThreadedExecutor
+        from corridor_ros import CorridorBackend
+        from directed_route import angle_error
+        from mission import Mission
+
+        heading=math.radians(-15)
+        dock=dict(calibrated=True,map_id=fixture_grid.map_id,departure_distance=.25,
+                  robot_pose=dict(x=lane_x-.45,y=-4.5,yaw=0.),
+                  charger_approach=dict(p_x=lane_x,p_y=-4.5,orien_z=math.sin(heading/2),orien_w=math.cos(heading/2)))
+        state.update(x=lane_x-.45,y=-4.5,a=0.,v=0.,w=0.,allow=None)
+        corridor_bridge=CorridorBackend(fixture_grid,dock)
+        # The plant publishes the map, TF and pose samples. Controller, planner,
+        # smoother and collision checks use their real lifecycle and services.
+        for alias in ('amcl','map_server'):
+            corridor_bridge.lifecycle_clients.pop(alias)
+        corridor_executor=SingleThreadedExecutor();corridor_executor.add_node(corridor_bridge)
+        corridor_thread=threading.Thread(target=corridor_executor.spin,daemon=True)
+        corridor_thread.start()
+        run_for(3.)
+        corridor_bridge.confirm_localization()
+
+        def move(name, goal, kind='waypoint', *, reverse=None, obstruct=False):
+            begin=time.monotonic();first=len(samples);block=None;released=False
+            identity=corridor_bridge.navigate(goal,kind)
+            while time.monotonic()-begin<75.:
+                status=corridor_bridge.operation(identity)
+                if status['status'] in ('succeeded','failed','canceled'):
+                    break
+                if obstruct and block is None and state['v']>.038:
+                    state['obstacle']=(state['x']+.24*math.cos(state['a']),state['y']+.24*math.sin(state['a']))
+                    block=time.monotonic()
+                if block is not None and not released and time.monotonic()-block>2.2:
+                    held=[row for row in samples[first:] if block+1.1<=started+row[0]<=block+2.]
+                    if not held or any(abs(row[4])>.005 or abs(row[6])>.012 for row in held):
+                        raise AssertionError('guided leg moved through a simulated obstruction')
+                    state['obstacle']=None;released=True
+                step()
+            run_for(.55)
+            error=math.dist((state['x'],state['y']),(goal['x'],goal['y']))
+            angle=math.degrees(abs(angle_error(state['a'],goal['yaw'])))
+            forward=any(s[4]>.018 for s in samples[first:])
+            backward=any(s[4]<-.018 for s in samples[first:])
+            arrival_status=corridor_bridge.snapshot()['arrival']
+            record=dict(case=name,status=status['status'],detail=status.get('detail') or status.get('error'),
+                        position_error_m=error,yaw_error_deg=angle,forward=forward,reverse=backward,
+                        controller=arrival_status['controller'],
+                        heading_attempts=arrival_status['heading_attempts'],
+                        obstruction_cleared=released,seconds=time.monotonic()-begin)
+            results.append(record);print(json.dumps(record,ensure_ascii=False),flush=True)
+            if status['status']!='succeeded' or error>{'departure':.055,'return':.081}.get(kind,.041):
+                raise AssertionError('position not reached')
+            if kind!='departure' and angle>(10.1 if kind=='return' else 4.1):
+                raise AssertionError('heading not reached')
+            if reverse is not None and (backward!=reverse or forward==reverse):
+                raise AssertionError('guided segment used the wrong direction')
+            if obstruct and not released:
+                raise AssertionError('guided recovery was not exercised')
+            return record
+
+        move('corridor_departure',dict(x=lane_x-.20,y=-4.5,yaw=0.),'departure',reverse=False)
+        move('corridor_entry',dict(x=lane_x,y=-4.02,yaw=math.pi/2))
+        move('corridor_forward_obstacle',dict(x=lane_x,y=-3.48,yaw=math.pi/2),reverse=False,obstruct=True)
+        move('corridor_reverse',dict(x=lane_x,y=-3.80,yaw=math.pi/2),reverse=True)
+        move('corridor_cross_aisles',dict(x=lane_x+1.,y=-3.45,yaw=math.pi/2))
+        move('corridor_cross_return',dict(x=lane_x,y=-3.95,yaw=math.pi/2))
+        with tempfile.TemporaryDirectory() as directory:
+            mission=Mission(fixture_grid,corridor_bridge,directory)
+            if mission._can_handoff_dock(corridor_bridge.snapshot()):
+                raise AssertionError('dock handoff accepted missing IR')
+            mission.return_to_dock()
+            navigation=mission.operation
+            deadline=time.monotonic()+135.
+            approach=corridor_bridge.dock_approach
+            while mission.phase not in ('docking','failed') and time.monotonic()<deadline:
+                step()
+                if math.dist((state['x'],state['y']),(approach['x'],approach['y']))<=.14:
+                    state['ir']=2
+                mission.tick()
+            run_for(.45)
+            controller_id=corridor_bridge.ops[navigation].get('controller_id')
+            if controller_id!='FollowPath' or corridor_bridge.ops[navigation].get('corridor'):
+                raise AssertionError('return did not use the native controller')
+            if mission.phase!='docking' or 1 not in ir_commands:
+                raise AssertionError('native IR handoff was not requested: '+mission.message)
+            mission.stop()
+            run_for(.6)
+            if ir_commands[-1]!=0:
+                raise AssertionError('dock stop did not disable OEM drive')
+        results.append(dict(case='native_return_and_ir_handoff',passed=True,controller=controller_id,
+                            map_id=fixture_grid.map_id))
     try:
         run_for(6.)
         if not client.server_is_ready():raise RuntimeError('controller server unavailable; inspect lifecycle log')
         owners=node.get_publishers_info_by_topic('/cmd_vel')
         if len(owners)!=1 or owners[0].node_name!='navigation_motion_gate':
             raise AssertionError('final velocity must have exactly one publisher')
+        if args.corridor_only:
+            check_corridors()
+            (out/'result.json').write_text(json.dumps({'simulation_only':True,'results':results},indent=2))
+            return
         if not drive.server_is_ready():raise RuntimeError('DriveOnHeading unavailable; inspect behavior log')
         first=len(samples)
         origin=(state['x'],state['y'])
@@ -397,6 +545,36 @@ def main():
             results.append(record);print(json.dumps(record),flush=True)
             bridge.publish_spin_limit(0.);bridge=None
             if not passed:raise AssertionError('Fixed left-heading path failed: '+str(record))
+        # Same ordinary waypoint, plant and initial state. Only the second approach
+        # has independent synthetic calibration stations. Validate against plant pose.
+        for calibrated in (False,True):
+            radius=.028
+            state.update(x=-.1,y=.15,a=0.,v=0.,w=0.,turn_offset=radius,allow=None)
+            run_for(.8)
+            model=TurnApproach()
+            if calibrated:
+                for n,angle in enumerate(map(math.radians,(70,80,100,110))):
+                    before=(float(n),0.,0.)
+                    after=(n+radius*(1-math.cos(angle)),-radius*math.sin(angle),angle)
+                    model.observe(n,before,after,angle,math.radians(4),position_tolerance)
+            goal=dict(x=.51,y=.15,yaw=math.pi/2)
+            start_time=time.monotonic()
+            bridge=station_bridge(goal,start_time,fas_station=False,turn_approach=model)
+            op=bridge.ops[bridge.active]
+            while op['status'] not in ('succeeded','failed','canceled') and time.monotonic()-start_time<38.:
+                step()
+            error=math.dist((state['x'],state['y']),(goal['x'],goal['y']))
+            angle_error=abs(math.remainder(state['a']-goal['yaw'],math.tau))
+            aim=op.get('turn_aim')
+            passed=(op['status']=='succeeded' and op['heading_attempts']==1 and op['arrival_retries']==0
+                    and error<=position_tolerance and angle_error<=yaw_tolerance and aim
+                    and (math.dist(aim,(goal['x'],goal['y']))>.005)==calibrated)
+            record=dict(case='ordinary_turn_'+('calibrated' if calibrated else 'cold'),passed=bool(passed),
+                        position_error_m=error,yaw_error_deg=math.degrees(angle_error),attempts=op['heading_attempts'],
+                        position_replans=op['arrival_retries'],aim=aim,seconds=time.monotonic()-start_time)
+            results.append(record);print(json.dumps(record),flush=True)
+            bridge.publish_spin_limit(0.);bridge=None
+            if not passed:raise AssertionError('Ordinary station missed its stopped pose: '+str(record))
         state['turn_offset']=0.
         state['allow']=True
         state['x'],state['y'],state['a']=initial_pose  # Reset only between independent fixture cases.
@@ -500,6 +678,15 @@ def main():
         if not passed:raise AssertionError('OEM heartbeat loss was not revoked')
         (out/'result.json').write_text(json.dumps({'simulation_only':True,'results':results},indent=2))
     finally:
+        bridge=None
+        if corridor_bridge is not None:
+            corridor_bridge.stop()
+        if corridor_executor is not None:
+            corridor_executor.shutdown()
+            corridor_thread.join(timeout=3.)
+            corridor_bridge.destroy_node()
+        if fixture is not None:
+            fixture.cleanup()
         state['allow']=False
         run_for(.2)
         lifecycle=node.create_client(ManageLifecycleNodes,'/lifecycle_manager/manage_nodes')

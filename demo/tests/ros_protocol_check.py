@@ -26,9 +26,9 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile,DurabilityPolicy
 from ament_index_python.packages import get_package_prefix
-from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, Twist
 from lifecycle_msgs.srv import ChangeState, GetState
-from nav2_msgs.action import ComputePathToPose, DriveOnHeading, NavigateToPose, FollowPath, Spin
+from nav2_msgs.action import ComputePathToPose, NavigateToPose, FollowPath, Spin
 from nav2_msgs.srv import IsPathValid
 from rcl_interfaces.srv import SetParametersAtomically
 from nav_msgs.msg import Odometry
@@ -37,6 +37,7 @@ from std_msgs.msg import Bool, Float32, UInt8, Int8
 from tf2_ros import TransformBroadcaster
 from map_grid import MapGrid
 from mission import Mission
+from motion_gate import MotionGate
 from ros_backend import RosBackend
 
 
@@ -46,6 +47,10 @@ class Fixture(Node):
         self.group = ReentrantCallbackGroup();self.pose = [0.,0.,0.]
         self.charging = True;self.nav_calls = 0;self.plan_calls = 0;self.spin_calls=0;self.speed_limits=[]
         self.departures=[]
+        self.departure_blocked=True
+        self.departure_turn_blocked=True
+        self.departure_velocity=0.
+        self.departure_update=time.monotonic()
         self.goal_limits=[];self.speed_refresh_batches=[]
         self.heading_calls=0;self.heading_selections=[];self.position_tree_calls=0
         self.directed_calls=0;self.directed_valid=True
@@ -69,11 +74,10 @@ class Fixture(Node):
             self.create_service(GetState,f'/{name}/get_state',self.active,callback_group=self.group)
         self.create_subscription(PoseWithCovarianceStamped,'/initialpose',self.initialize,10,callback_group=self.group)
         self.create_subscription(Int8,'/robot_recharge_flag',self.charge,10,callback_group=self.group)
+        self.create_subscription(Twist,'/cmd_vel',self.velocity,1,callback_group=self.group)
         self.create_timer(.05,self.publish,callback_group=self.group)
         self.planner = ActionServer(self,ComputePathToPose,'/compute_path_to_pose',self.plan,callback_group=self.group)
         self.navigator = ActionServer(self,NavigateToPose,'/navigate_to_pose',self.navigate,
-                                     cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
-        self.departure = ActionServer(self,DriveOnHeading,'/drive_on_heading',self.drive,
                                      cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
         self.spinner=ActionServer(self,Spin,'/spin',self.spin,
                                  cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=self.group)
@@ -142,7 +146,21 @@ class Fixture(Node):
         if message.data == 1 and self.auto_charge:
             self.charging=True;self.pose=[0.,0.,0.]
 
+    def velocity(self,message):
+        self.departure_velocity=message.linear.x
+
     def publish(self):
+        now=time.monotonic()
+        elapsed=min(.10,now-self.departure_update)
+        self.departure_update=now
+        if self.departure_velocity>0:
+            distance=self.departure_velocity*elapsed
+            if not self.departures:
+                self.departures.append(0.)
+            self.departures[-1]+=distance
+            self.pose[0]+=distance*math.cos(self.pose[2])
+            self.pose[1]+=distance*math.sin(self.pose[2])
+            self.charging=self.departures[-1]<.035
         stamp=self.get_clock().now().to_msg()
         tf=TransformStamped();tf.header.stamp=stamp;tf.header.frame_id='map';tf.child_frame_id='base_footprint'
         tf.transform.translation.x,tf.transform.translation.y=self.pose[:2]
@@ -164,25 +182,33 @@ class Fixture(Node):
         y=np.floor((laser_y+np.sin(ray[:,None])*self.ray_distances-grid.origin[1])/grid.resolution).astype(int)
         in_map=(x>=0)&(x<grid.width)&(y>=0)&(y<grid.height)
         hits=in_map & self.occupied[np.clip(y,0,grid.height-1),np.clip(x,0,grid.width-1)]
-        scan.ranges=np.where(hits.any(axis=1),self.ray_distances[hits.argmax(axis=1)],np.inf).tolist()
+        ranges=np.where(hits.any(axis=1),self.ray_distances[hits.argmax(axis=1)],np.inf)
+        edges=[(-.149,-.09,.09)]
+        if self.departure_blocked:
+            edges.append((.147,-.06,.06))
+        if self.departure_turn_blocked:
+            edges.append((.51,.17,.18))
+        for edge,low,high in edges:
+            line=(edge-laser_x)/np.cos(ray)
+            lateral=laser_y+line*np.sin(ray)
+            crossing=(low<=lateral)&(lateral<=high)
+            ranges=np.where(crossing & (line>=scan.range_min),np.minimum(ranges,line),ranges)
+        scan.ranges=ranges.tolist()
         self.scan_pub.publish(scan);self.charge_pub.publish(Bool(data=self.charging));self.ir_pub.publish(UInt8(data=2))
         self.gate_pub.publish(Bool(data=True))
         self.voltage_pub.publish(Float32(data=12.));self.current_pub.publish(Float32(data=1.68 if self.charging else 0.))
-        wheel=Odometry();wheel.twist.twist.angular.z=self.wheel_rate;self.wheel_pub.publish(wheel)
+        wheel=Odometry()
+        wheel.header.stamp=stamp
+        wheel.pose.pose.position.x,wheel.pose.pose.position.y=self.pose[:2]
+        wheel.pose.pose.orientation=tf.transform.rotation
+        wheel.twist.twist.linear.x=self.departure_velocity
+        wheel.twist.twist.angular.z=self.wheel_rate
+        self.wheel_pub.publish(wheel)
 
     def plan(self,handle):
         self.plan_calls+=1;result=ComputePathToPose.Result()
         result.path.header.frame_id='map';result.path.poses=[handle.request.goal,handle.request.goal]
         handle.succeed();return result
-
-    def drive(self,handle):
-        distance=handle.request.target.x
-        self.departures.append(distance)
-        self.charging=False
-        start=list(self.pose)
-        self.pose=[start[0]+distance*math.cos(start[2]), start[1]+distance*math.sin(start[2]), start[2]]
-        self.publish();time.sleep(.25);handle.succeed()
-        return DriveOnHeading.Result()
 
     def navigate(self,handle):
         self.nav_calls+=1;self.charging=False;p=handle.request.pose.pose
@@ -203,11 +229,11 @@ class Fixture(Node):
         return NavigateToPose.Result()
 
 
-def main():
+def main(*, dock_only=False):
     process = subprocess.Popen([str(Path(get_package_prefix('nav2_map_server'))/'lib/nav2_map_server/map_server'),
         '--ros-args','-r','__node:=map_server','-p','yaml_filename:='+str(ROOT/'assets/map.yaml'),
         '-p','use_sim_time:=false'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-    rclpy.init();n=Node('map_test_setup');executor=None;backend=None;fixture=None;thread=None
+    rclpy.init();n=Node('map_test_setup');executor=None;backend=None;fixture=None;gate=None;thread=None
     try:
         c=n.create_client(ChangeState,'/map_server/change_state')
         if not c.wait_for_service(timeout_sec=8):raise RuntimeError('Native map server unavailable')
@@ -227,16 +253,37 @@ def main():
         time.sleep(.5)
         backend.confirm_localization()
         with tempfile.TemporaryDirectory() as directory:
+            gate=MotionGate();gate.hold_file=Path(directory)/'motion-hold'
+            executor.add_node(gate)
+            deadline=time.monotonic()+3
+            while not backend.departure_cmd.get_subscription_count() and time.monotonic()<deadline:time.sleep(.05)
             mission=Mission(grid,backend,directory)
             mission.save_points([{'id':'a','name':'A','x':.25,'y':-.5,'yaw':-1.57,'wait':.3},
                                  {'id':'b','name':'B','x':.25,'y':-1.,'yaw':.5,'wait':.2}])
-            mission.start(auto_return=True);deadline=time.monotonic()+40
+            mission.start(auto_return=True)
+            deadline=time.monotonic()+.8
+            while time.monotonic()<deadline:
+                mission.tick();time.sleep(.05)
+            if mission.phase!='departing' or fixture.departures or fixture.nav_calls:
+                raise RuntimeError('Guarded departure must wait for a genuine front obstacle')
+            fixture.departure_blocked=False
+            deadline=time.monotonic()+20
+            while time.monotonic()<deadline and mission.phase=='departing' and '四角' not in mission.message:
+                mission.tick();time.sleep(.05)
+            if (mission.phase!='departing' or '四角' not in mission.message or fixture.nav_calls
+                    or not backend.snapshot()['stationary']):
+                raise RuntimeError('Guarded departure must stop until the corner sweep is clear')
+            fixture.departure_turn_blocked=False
+            deadline=time.monotonic()+55
             while time.monotonic()<deadline and mission.phase not in ('docked','failed'):
                 mission.tick();time.sleep(.05)
+                if gate is not None and mission.phase=='navigating':
+                    executor.remove_node(gate);gate.destroy_node();gate=None
             proof={'result':mission.phase,'native_map_matches':backend.map_matches,
                    'unknown_cells':grid.cells.count(-1),'plan_requests':fixture.plan_calls,
                    'navigate_requests':fixture.nav_calls,'departure_distances':fixture.departures,
-                   'charging_feedback':backend.snapshot()['charging'],
+                   'charging_feedback':backend.snapshot()['charging'],'departed_after_front_obstacle_cleared':True,
+                   'navigation_waited_for_turn_clearance':True,
                    'native_spin_requests':fixture.spin_calls,'native_speed_limits':fixture.speed_limits,
                    'native_heading_requests':fixture.heading_calls,'native_heading_selections':fixture.heading_selections,
                    'position_only_tree_requests':fixture.position_tree_calls,
@@ -247,8 +294,10 @@ def main():
             (ROOT/'ros_protocol_validation.json').write_text(json.dumps(proof,ensure_ascii=False,indent=2))
             print(json.dumps(proof,ensure_ascii=False,indent=2),flush=True)
             if (mission.phase!='docked' or not backend.map_matches or fixture.nav_calls!=3
-                    or len(fixture.departures)!=1 or not .28<=fixture.departures[0]<=.32):
+                    or len(fixture.departures)!=1 or not .49<=fixture.departures[0]<=.55):
                 raise RuntimeError('ROS protocol rehearsal failed')
+            if dock_only:
+                return
             if backend.staged_arrival and (fixture.spin_calls<2 or .05 not in fixture.speed_limits):
                 raise RuntimeError('Staged native arrival or adaptive speed was not exercised')
             if backend.precision_arrival:
@@ -431,10 +480,15 @@ def main():
         if thread:thread.join(timeout=2)
         if backend:backend.destroy_node()
         if fixture:fixture.destroy_node()
+        if gate:gate.destroy_node()
         n.destroy_node();rclpy.shutdown()
         process.send_signal(signal.SIGINT)
         try:process.wait(timeout=5)
         except subprocess.TimeoutExpired:process.kill();process.wait()
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dock-only',action='store_true')
+    main(dock_only=parser.parse_args().dock_only)

@@ -5,6 +5,9 @@ param(
     [string]$CarBKnownHosts = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ssh\known_hosts_r550_b'),
     [string]$CarABindAddress,
     [string]$CarBBindAddress,
+    [switch]$StartPanels,
+    [switch]$SyncCarAClock,
+    [ValidateRange(1024,65529)][int]$RelayPort = 18890,
     [string]$Vm = 'r550-vm',
     [string]$LogPath = (Join-Path $PSScriptRoot '../state/logs/fleet-relay.log')
 )
@@ -17,12 +20,18 @@ function Report([string]$Message) {
 
 function Get-CarAddresses {
     $addresses = @{}
-    $interfaces = (netsh wlan show interfaces | Out-String) -split '(?m)^[ \t]*(?:Name|名称)[ \t]+:'
+    $adapters = @{}
+    foreach ($nic in Get-NetAdapter) {
+        $guid = ([guid]$nic.InterfaceGuid).ToString()
+        $adapters[$guid] = $nic.ifIndex
+    }
+    $interfaces = (netsh wlan show interfaces | Out-String) -split '(?m)^[ \t]*GUID[ \t]*:[ \t]*'
     foreach ($block in $interfaces | Select-Object -Skip 1) {
-        $adapter = ($block -split '\r?\n', 2)[0].Trim()
+        $guid = ($block -split '\r?\n', 2)[0].Trim().Trim('{}').ToLowerInvariant()
+        if (-not $adapters.ContainsKey($guid)) { continue }
         $ssid = [regex]::Match($block, '(?m)^[ \t]*SSID[ \t]+:[ \t]*(?<value>[^\r\n]+)').Groups['value'].Value.Trim()
         if ($ssid -notin @($CarASsid,$CarBSsid)) { continue }
-        $ip = (Get-NetIPAddress -InterfaceAlias $adapter -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        $ip = (Get-NetIPAddress -InterfaceIndex $adapters[$guid] -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -like '192.168.0.*' } |
             Select-Object -First 1).IPAddress
         if ($ip -and $addresses.ContainsKey($ssid)) { $addresses[$ssid] = $null }
@@ -55,7 +64,18 @@ function Maintain-Relay($Relay, [string]$Address, [string[]]$Arguments) {
         Report "$($Relay.Name) connection closed"
     }
     if ($Address -and -not $Relay.Process) {
-        $Relay.Process = Start-Relay ($common + $Arguments)
+        $options = $common
+        if ($StartPanels -and $Relay.StartCommand) {
+            $options = @($common | Where-Object { $_ -ne '-N' })
+            $command = $Relay.StartCommand
+            if ($Relay.SendClock) {
+                $epoch = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString(
+                    'F3', [Globalization.CultureInfo]::InvariantCulture)
+                $command = $command.Replace('{HOST_UTC}', $epoch)
+            }
+            $Arguments += $command
+        }
+        $Relay.Process = Start-Relay ($options + $Arguments)
         $Relay.Address = $Address
         Report "$($Relay.Name) connecting"
     }
@@ -72,8 +92,17 @@ $common = @('-N','-T','-oBatchMode=yes','-oConnectTimeout=6','-oConnectionAttemp
 $a = @{Name='car A'; Process=$null; Address=$null}
 $b = @{Name='car B'; Process=$null; Address=$null}
 $vmRelay = @{Name='VM'; Process=$null; Address=$null}
+$a.StartCommand = 'if cd "$HOME/r550-patrol"; then if ./kit profile select; then ./kit site; if ! curl --noproxy "*" -fs --max-time 2 http://127.0.0.1:8890/api/state >/dev/null; then ./kit nav; fi; fi; fi; exec sleep infinity'
+if ($SyncCarAClock) {
+    $a.SendClock = $true
+    $a.StartCommand = 'if cd "$HOME/r550-patrol" && ./kit profile select; then if ! curl --noproxy "*" -fs --max-time 2 http://127.0.0.1:8890/api/state >/dev/null; then if sudo -n -- /usr/local/sbin/r550-host-clock {HOST_UTC}; then ./kit nav; fi; fi; ./kit site; fi; exec sleep infinity'
+}
+$b.StartCommand = 'if cd "$HOME/lab_cruise_dual" && ! curl --noproxy "*" -fs --max-time 2 http://127.0.0.1:8892/api/state >/dev/null; then ./kit nav; fi; exec sleep infinity'
 $claimed = $false
-$mutex = [Threading.Mutex]::new($false, 'Local\R550FleetRelay-18890-18892')
+$portA=$RelayPort
+$portB=$RelayPort+2
+$siteA=$RelayPort+6
+$mutex = [Threading.Mutex]::new($false, "Local\R550FleetRelay-${portA}-${portB}")
 try {
     try { $claimed = $mutex.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $claimed = $true }
@@ -83,12 +112,12 @@ try {
         $addresses = Get-CarAddresses
         $ipA = Resolve-BindAddress $addresses[$CarASsid] $CarABindAddress
         $ipB = Resolve-BindAddress $addresses[$CarBSsid] $CarBBindAddress
-        Maintain-Relay $a $ipA @('-oCompression=yes','-b',$ipA,'-L','127.0.0.1:18890:127.0.0.1:8890',
-                          '-L','127.0.0.1:18896:127.0.0.1:8896','r550')
+        Maintain-Relay $a $ipA @('-oCompression=yes','-b',$ipA,'-L',"127.0.0.1:${portA}:127.0.0.1:8890",
+                          '-L',"127.0.0.1:${siteA}:127.0.0.1:8896",'r550')
         Maintain-Relay $b $ipB @('-oCompression=yes','-b',$ipB,"-oHostKeyAlias=$CarBHostKey","-oUserKnownHostsFile=$CarBKnownHosts",
-                          '-L','127.0.0.1:18892:127.0.0.1:8892','wheeltec@192.168.0.100')
-        Maintain-Relay $vmRelay $Vm @('-R','127.0.0.1:18890:127.0.0.1:18890',
-                          '-R','127.0.0.1:18892:127.0.0.1:18892','-R','127.0.0.1:18896:127.0.0.1:18896',$Vm)
+                          '-L',"127.0.0.1:${portB}:127.0.0.1:8892",'wheeltec@192.168.0.100')
+        Maintain-Relay $vmRelay $Vm @('-R',"127.0.0.1:${portA}:127.0.0.1:${portA}",
+                          '-R',"127.0.0.1:${portB}:127.0.0.1:${portB}",'-R',"127.0.0.1:${siteA}:127.0.0.1:${siteA}",$Vm)
         Start-Sleep -Seconds 2
     }
 } finally {

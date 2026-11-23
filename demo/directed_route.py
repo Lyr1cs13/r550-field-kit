@@ -3,6 +3,11 @@ import math
 from arrival_policy import FAS_STATION_POSITION_TOLERANCE
 
 
+DOCK_STAGING_DISTANCE = .52
+DOCK_STAGING_HALF_WIDTH = .23
+DEPARTURE_STOP_MARGIN = .018
+
+
 def angle_error(a, b):
     return math.atan2(math.sin(a-b), math.cos(a-b))
 
@@ -13,17 +18,61 @@ def dock_offset(pose, dock):
     return dx*c+dy*s, -dx*s+dy*c
 
 
-def departure_leg(pose, dock, goal, spacing=.04):
+def dock_footprint_intersects(pose, dock):
+    """Padded R550 footprint against the EC130 casing and contact strip."""
+    along, across = dock_offset(pose, dock)
+    front = -.265 / 2
+    # The reference is the centre of a vehicle seated against the strip.
+    rectangles = ((front-.091, front-.011, .192/2), (front-.011, front, .134/2))
+    if len(pose) == 2:
+        # When heading is unknown, allow for the corners during a turn.
+        radius = math.hypot(.16,.12)
+        return any(math.hypot(max(rear-along, along-face, 0.), max(abs(across)-width, 0.)) <= radius
+                   for rear,face,width in rectangles)
+    angle = pose[2] - dock[2]
+    c, s = math.cos(angle), math.sin(angle)
+    abs_c, abs_s = abs(c), abs(s)
+    along -= .005*c
+    across -= .005*s
+    # Separating axes of the padded [-.16,+.15] x [-.12,+.12] body and dock.
+    for rear,face,width in rectangles:
+        center, half_length = (rear+face)/2, (face-rear)/2
+        dx, dy = along-center, across
+        if (abs(dx) <= half_length+.155*abs_c+.12*abs_s and abs(dy) <= width+.155*abs_s+.12*abs_c
+                and abs(dx*c+dy*s) <= .155+half_length*abs_c+width*abs_s
+                and abs(-dx*s+dy*c) <= .12+half_length*abs_s+width*abs_c):
+            return True
+    return False
+
+
+def departure_goal(dock, distance):
+    x, y, heading = dock
+    return {'x':x+distance*math.cos(heading), 'y':y+distance*math.sin(heading), 'yaw':heading}
+
+
+def dock_staging_needed(pose, dock, distance):
+    along, across = dock_offset(pose, dock)
+    return -.20 <= along < distance-DEPARTURE_STOP_MARGIN and abs(across) <= DOCK_STAGING_HALF_WIDTH
+
+
+def departure_leg(pose, dock, goal, spacing=.04, *, staging=False):
     """Project the configured dock clearance onto the current forward ray."""
     if pose is None:
         raise ValueError('离桩前需要有效定位')
     along, side = dock_offset(pose, dock)
     planned, _ = dock_offset((goal['x'], goal['y']), dock)
     heading_error = angle_error(pose[2], dock[2])
-    if along < -.20 or abs(side) > .15 or abs(heading_error) > math.radians(20):
+    # Once clear of the seated car footprint, a car stopped partway out
+    # can continue along its actual outward heading without spinning.
+    partly_out = staging and along >= .27
+    width = DOCK_STAGING_HALF_WIDTH if partly_out else .15
+    heading_limit = math.radians(50 if partly_out else 20)
+    if along < -.20 or abs(side) > width or abs(heading_error) > heading_limit:
         raise ValueError('离桩前请核对车尾贴合及车头朝向')
     remaining = max(0., (planned-along)/math.cos(heading_error))
-    if remaining < .04:
+    if staging and abs(side+remaining*math.sin(heading_error)) > DOCK_STAGING_HALF_WIDTH:
+        raise ValueError('沿当前朝向继续直行将超出桩前走廊')
+    if remaining <= DEPARTURE_STOP_MARGIN:
         return {'distance':0., 'poses':[]}
     c,s = math.cos(pose[2]),math.sin(pose[2])
     count = max(1,math.ceil(remaining/spacing))
@@ -75,9 +124,9 @@ def fas_short_leg(pose, goal, spacing=.04, *, min_distance=.10, max_distance=.80
     return {'reverse':backwards,'poses':line_poses(pose,goal,reverse if backwards else forward,spacing)}
 
 
-def fas_station_leg(pose, goal):
+def fas_station_leg(pose, goal, *, min_distance=FAS_STATION_POSITION_TOLERANCE):
     """Candidate only. The bridge checks every cell, then asks Nav2 to check the live path."""
-    leg=fas_axis_leg(pose,goal) or fas_short_leg(pose,goal,min_distance=FAS_STATION_POSITION_TOLERANCE,max_distance=12.)
+    leg=fas_axis_leg(pose,goal) or fas_short_leg(pose,goal,min_distance=min_distance,max_distance=12.)
     if leg:
         distance=math.dist(pose[:2],(goal['x'],goal['y']))
         leg['clearance']=.27 if distance>.80 else .23

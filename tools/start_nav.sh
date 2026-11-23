@@ -7,7 +7,7 @@ bind=${R550_PANEL_BIND:-0.0.0.0}
 [[ ! -f "$root/state/site-mapping/owns-robot" ]] || { echo '车辆正在使用新场地页面，请在该页面切换巡航。'; exit 1; }
 [[ "$port" =~ ^[0-9]{4,5}$ ]] && (( port <= 65535 )) || { echo '无效的面板端口'; exit 2; }
 ros2 pkg prefix nav2_collision_monitor >/dev/null 2>&1 || { echo '缺少速度碰撞保护组件，请先运行 ./kit setup robot。'; exit 1; }
-if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|frontier_tasks.py|demo/server.py' >/dev/null; then
+if pgrep -f 'wheeltec_robot_node|controller_server|sync_slam_toolbox_node|async_slam_toolbox_node|frontier_tasks.py|demo/server[.]py.*--backend[ =]+ros([[:space:]]|$)' >/dev/null; then
   echo '已有底盘、建图或导航运行；先执行 ./kit stop。';exit 1
 fi
 if command -v fuser >/dev/null; then
@@ -17,6 +17,10 @@ if command -v fuser >/dev/null; then
       exit 1
     fi
   done
+fi
+if [[ -x /usr/local/sbin/r550-host-clock ]] && (( $(date +%s) < 1704067200 )); then
+  echo '车端时钟未初始化，请从上位机对时并启动巡航。' >&2
+  exit 1
 fi
 mkdir -p "$root/state/logs"
 data_dir=$(python3 - "$root" <<'PY'

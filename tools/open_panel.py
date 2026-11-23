@@ -11,11 +11,12 @@ import webbrowser
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / 'demo' / 'data' / 'desktop-panel'
+VISION = (ROOT/'demo/vision_node.py').is_file()
+DATA = ROOT / 'demo' / 'data' / ('desktop-vision' if VISION else 'desktop-panel')
 HOST = '127.0.0.1'
-PORT = 8891
+PORT = 8992 if VISION else 8891
 URL = f'http://{HOST}:{PORT}/'
-ROBOT_PANEL = 'http://192.168.0.100:8890/'
+ROBOT_PANEL = 'http://192.168.0.100:8990/' if VISION else 'http://192.168.0.100:8890/'
 
 
 def panel_ready():

@@ -24,6 +24,7 @@ import yaml
 ROOT=Path(__file__).resolve().parent.parent
 WEB=ROOT/'demo/web'
 sys.path[:0]=[str(ROOT/'tools'),str(ROOT/'demo')]
+from workspace_guard import hardware_command
 from map_grid import MapGrid, pgm
 from mapping_state import prepare
 import scene
@@ -549,7 +550,8 @@ def handler(site):
                 value=json.loads(self.rfile.read(size))
                 if not isinstance(value,dict):
                     raise ValueError('无效操作')
-                site.dispatch(value)
+                with hardware_command(site.root):
+                    site.dispatch(value)
             except (ValueError,TypeError,OSError) as error:
                 return self.reply({'error':str(error)},409)
             self.reply({'accepted':True})
@@ -565,6 +567,8 @@ def main():
     parser.add_argument('--port',type=int,default=8896)
     parser.add_argument('--nav-port',type=int,default=8890)
     args=parser.parse_args()
+    with hardware_command(ROOT):
+        pass
     site=SiteService(nav_port=args.nav_port)
     web=ThreadingHTTPServer((args.bind,args.port),handler(site))
     def shutdown(*_):

@@ -31,7 +31,8 @@ def generate_launch_description():
                       parameters=[str(here/'navigation.yaml')],output='screen'))
     return LaunchDescription([
         *platform,
-        ExecuteProcess(cmd=['python3',str(here/'motion_gate.py')],output='screen'),
+        ExecuteProcess(cmd=['python3',str(here/'motion_gate.py'),'--ros-args','-p',
+                            'dock_record:='+str(here/'assets/dock_start.json')],output='screen'),
         Node(package='nav2_map_server',executable='map_server',name='threshold_mask_server',
              parameters=[{'use_sim_time':False,'yaml_filename':str(here/'assets/threshold_keepout.yaml'),
                           'topic_name':'/threshold_keepout_mask','frame_id':'map'}],output='screen'),

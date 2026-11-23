@@ -12,7 +12,7 @@ from c5_station import C5Station, utc
 from collection import BROADCAST_MODES, BROADCAST_STATION, Collection
 from servo_car import MODE as SERVO_MODE
 from endurance import Endurance
-from directed_route import dock_offset
+from directed_route import angle_error, departure_goal, dock_footprint_intersects, dock_offset
 import yaml
 
 
@@ -163,7 +163,8 @@ class Mission:
             label='开始循环巡航' if repeat else '开始巡航'
             self.event('开始单点前往' if identity else f'{label}，共 {len(chosen)} 个点')
             health=self.backend.snapshot()
-            if health.get('charging') or health.get('dock_position_confirmed'):
+            if (health.get('charging') or health.get('dock_position_confirmed')
+                    or health.get('dock_departure_required')):
                 self._depart()
             else:
                 self._navigate_current()
@@ -176,10 +177,8 @@ class Mission:
     def _depart(self):
         self._require_motion_allowed()
         if not getattr(self.backend,'dock_calibrated',True):raise ValueError('先标定桩位，再从充电桩发车')
-        x,y,heading = self.backend.dock_pose
         distance = getattr(self.backend,'departure_distance',.30)
-        point = {'x':x+distance*math.cos(heading),
-                 'y':y+distance*math.sin(heading),'yaw':heading}
+        point = departure_goal(self.backend.dock_pose,distance)
         self.operation = self.backend.navigate(point,'departure')
         self.phase = 'departing';self.message = '先直行驶离充电桩，再前往导航点'
 
@@ -205,13 +204,26 @@ class Mission:
                     position_error_m=math.hypot(pose[0]-point['x'],pose[1]-point['y']),
                     yaw_error_deg=math.degrees(abs(math.atan2(math.sin(pose[2]-point['yaw']),math.cos(pose[2]-point['yaw'])))),
                     approach_seconds=timing.get('elapsed'),heading_attempts=timing.get('heading_attempts'),
+                    yaw_tolerance_deg=timing.get('yaw_tolerance_deg'),position_tolerance_m=timing.get('position_tolerance_m'),
                     position_retries=timing.get('position_retries'),controller=timing.get('controller'),
                     travel_direction=timing.get('travel_direction'),heading_refinement_seconds=timing.get('heading_refinement_seconds'),
                     covariance=health.get('localization_covariance'),scan_map_agreement=health.get('scan_map_agreement'))
+                if timing.get('last_turn'):
+                    record.update(last_turn=timing['last_turn'],approach_aim=timing.get('approach_aim'))
+                if timing.get('first_terminal_turn'):
+                    record['first_terminal_turn']=timing['first_terminal_turn']
                 with (self.directory/'arrival_measurements.jsonl').open('a',encoding='utf-8') as f:
                     f.write(json.dumps(record,ensure_ascii=False)+'\n')
         now = self.clock()
         if returning:
+            if getattr(self.backend,'dock_handoff_ready',None) and not self._can_handoff_dock(self.backend.snapshot()):
+                if self.phase != 'settling_return':
+                    self.phase='settling_return';self.until=now+10.
+                if now >= self.until:
+                    self._fail('回充接管前未取得有效位姿和红外，保持停车')
+                else:
+                    self.message='桩前已停稳，等待位姿与红外复核'
+                return
             self.backend.begin_docking();self.until = now+getattr(self.backend,'docking_timeout',90.)
             self.phase = 'docking';self.message = '桩前到达，等待红外对接及充电反馈'
         else:
@@ -258,6 +270,8 @@ class Mission:
         if not (health.get('ready') and health.get('localization_confirmed')
                 and health.get('stationary') and health.get('ir') and pose):
             return False
+        if check := getattr(self.backend,'dock_handoff_ready',None):
+            return check(health)
         angle = math.atan2(math.sin(pose[2]-self.backend.dock_pose[2]),
                            math.cos(pose[2]-self.backend.dock_pose[2]))
         home=self.backend.dock_pose;dx=pose[0]-home[0];dy=pose[1]-home[1]
@@ -394,6 +408,13 @@ class Mission:
         health=self.backend.snapshot()
         if health.get('charging_stable',health.get('charging')) or health.get('charge_contact_live'):
             self._hold_dock_contact(health);return
+        pose=health.get('pose')
+        if (self.return_via is None and health.get('mode')=='robot' and pose
+                and dock_footprint_intersects(pose,self.backend.dock_pose)):
+            try:
+                self.return_via=self._unpowered_dock_exit(health)
+            except ValueError as error:
+                self._fail(str(error));return
         if self.return_via is None and self._can_handoff_dock(health):
             self.operation=None;self.pending=None
             self.event('已在有效红外接管区域，直接使用厂家对接')
@@ -501,6 +522,19 @@ class Mission:
         self.message='检测到充电接触，停车复核电流'
         if self.phase=='failed':self._retry_docking_if_needed(health,self.clock())
 
+    def _unpowered_dock_exit(self,health):
+        pose=health.get('pose')
+        if not (health.get('ready') and health.get('localization_confirmed') and health.get('stationary')
+                and health.get('charge_telemetry_fresh') and pose and (health.get('scan_map_agreement') or 0.)>=.80):
+            raise ValueError('未确认充电，停轮、定位或充电反馈不足，保持停车')
+        dock=self.backend.dock_pose
+        along,side=dock_offset(pose,dock)
+        if along>.27:
+            return None
+        if along<-.16 or abs(side)>.12 or abs(angle_error(pose[2],dock[2]))>math.radians(15):
+            raise ValueError('未通电，车辆姿态超出可安全离桩的范围，保持停稳')
+        return {**departure_goal(dock,.34),'name':'回充重试离桩','wait':0.,'dock_retry_exit':True}
+
     def _retry_docking_if_needed(self,health,now):
         if self.phase in ('failed','idle') and self.dock_failure_reconcile and health.get('stationary') and health.get('charging_stable',health.get('charging')):
             self.dock_retry_pending=False;self.dock_failure_reconcile=False;self.phase='docked';self.message='停车复核已稳定充电，无需再次移动';self.event(self.message);return True
@@ -518,26 +552,13 @@ class Mission:
             self.message='重新贴合后仍未确认通电，已停轮并保留任务'
             self.event(self.message)
             return True
-        pose=health.get('pose')
-        dock=self.backend.dock_pose
-        along,side=dock_offset(pose,dock) if pose else (None,None)
-        if not (health.get('ready') and health.get('localization_confirmed')
-                and health.get('charge_telemetry_fresh') and pose and (health.get('scan_map_agreement') or 0.)>=.80):
+        try:
+            via=self._unpowered_dock_exit(health)
+        except ValueError as error:
             self.dock_retry_pending=False
-            self.message='停车复核后仍未通电，定位或充电反馈不可用于重试'
+            self.message=str(error)
             self.event(self.message)
             return True
-        via=None
-        if along<=.27:
-            x,y,heading=dock
-            angle=abs(math.remainder(pose[2]-heading,2*math.pi))
-            if along<-.16 or abs(side)>.12 or angle>math.radians(15):
-                self.dock_retry_pending=False
-                self.message='未通电，车辆姿态超出可安全离桩的范围，保持停稳'
-                self.event(self.message)
-                return True
-            via={'x':x+.34*math.cos(heading),'y':y+.34*math.sin(heading),'yaw':heading,
-                 'name':'回充重试离桩','wait':0.,'dock_retry_exit':True}
         self.dock_retry_pending=False;self.dock_retry_count+=1
         self.event('贴合后持续无电流，已停轮复核，重试回充（1/1）')
         self.return_to_dock(automatic=True,via=via);return True
@@ -633,8 +654,8 @@ class Mission:
                 elif action == 'dock_handoff':
                     if contact:
                         self._hold_dock_contact(health)
-                    elif self._can_handoff_dock(health):
-                        self.event('导航取消已确认，切换厂家红外对接')
+                    elif self._can_handoff_dock(health) or getattr(self.backend,'dock_handoff_ready',None):
+                        self.event('导航取消已确认，复核红外接管条件')
                         self._begin_arrival(True)
                     else:
                         self._fail('桩前接管条件已改变，保持停车，请核对位置与红外')
@@ -650,6 +671,8 @@ class Mission:
                     self.phase = 'idle';self.message = '任务已停止'
             elif self.phase in ('navigating','returning','departing'):
                 result = self.backend.operation(self.operation)
+                if self.phase=='departing' and result.get('detail'):
+                    self.message=result['detail']
                 if self.phase=='navigating':
                     name=self.run[self.index]['name'];stage=result.get('stage')
                     self.message=(f'{name}：'+(result.get('detail') or '等待通路恢复，随后自动继续') if stage=='waiting' else
