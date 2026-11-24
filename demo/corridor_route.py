@@ -442,6 +442,18 @@ class CorridorRoute:
                     inputs.append((source, u, v, target))
                 else:
                     inputs.extend((source, u, (u[0], y), (v[0], y), v, target) for y in self.links)
+            # A stopped car can already be partway across a surveyed connector.
+            # Continue from its measured pose to the destination aisle.
+            left, right = sorted(lane[0] for lane in self.lanes)
+            if self.includes(goal) and left-.14 <= source[0] <= right+.14:
+                for link_y in self.links:
+                    if abs(source[1]-link_y) <= .14:
+                        junction = (self.lanes[end][0], link_y)
+                        inputs.append((source, junction, target))
+                        if not self.entry_clear(source, junction):
+                            dx = max(-.15, min(.15, junction[0]-source[0]))
+                            rejoin = (max(left, min(right, source[0]+dx)), link_y)
+                            inputs.append((source, rejoin, junction, target))
         for vertices in inputs:
             vertices = self.compact(vertices)
             edges = tuple(zip(vertices, vertices[1:]))

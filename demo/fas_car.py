@@ -219,7 +219,7 @@ class FasCar:
             self.lease.owner = saved['owner']
             self.operator_hold = saved.get('paused',False)
         self.backend.fas_lease = self.lease
-        if self.motion_only and self.pose_checkpoint.is_file():
+        if self.pose_checkpoint.is_file():
             try:
                 saved=json.loads(self.pose_checkpoint.read_text(encoding='utf-8'))
                 pose,stamp=saved['pose'],float(saved['saved_at'])
@@ -289,7 +289,7 @@ class FasCar:
             if not checking_stop:
                 self.mission.stop()
         now=time.monotonic()
-        if (self.motion_only and not self.lease.live and self.mission.phase in QUIET
+        if ((self.motion_only or self.lease.owner) and not self.lease.live and self.mission.phase in QUIET
                 and now-self.pose_checkpoint_at>=5.):
             self.pose_checkpoint_at=now
             h=self.backend.snapshot()

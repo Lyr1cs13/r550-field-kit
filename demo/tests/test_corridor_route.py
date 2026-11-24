@@ -55,6 +55,36 @@ class CorridorRouteTests(unittest.TestCase):
             self.assertEqual(path[2].end, (goal['x'], goal['y']))
             self.assertTrue(all(self.profile.line_clear(leg.start, leg.end) for leg in path))
 
+    def test_resume_from_either_connector_without_returning_to_its_entrance(self):
+        for link_y in self.settings['links']:
+            for x, destination in ((.46, 1.), (.54, 0.), (-.036, 1.)):
+                for heading in (0., math.pi):
+                    with self.subTest(link=link_y, x=x, destination=destination, heading=heading):
+                        start = (x, link_y+.005, heading)
+                        goal = {'x': destination, 'y': -4.5, 'yaw': math.pi/2}
+                        path = self.profile.routes(start, goal)[0]
+                        self.assertEqual([leg.end for leg in path], [(destination, link_y), (destination, -4.5)])
+                        self.assertEqual(path[0].start, start[:2])
+                        self.assertEqual(path[0].reverse, (destination-x)*math.cos(heading) < 0.)
+
+    def test_connector_rejoin_checks_the_surveyed_strip_and_entire_clearance(self):
+        goal = {'x': 1., 'y': -4.5, 'yaw': math.pi/2}
+        self.assertFalse(self.profile.routes((.48, -3.25, 0.), goal, entry_offset=.10))
+        start = (.48, -3.03, 0.)
+        self.assertTrue(self.profile.routes(start, goal, entry_offset=.10))
+        with patch.object(self.profile, 'clearance_at', side_effect=lambda p: .18 if .70 < p[0] < .80 else .34):
+            self.assertFalse(self.profile.routes(start, goal, entry_offset=.10))
+
+    def test_resume_from_connector_margin_rejoins_before_the_long_leg(self):
+        start = (.48, -3.07, 0.)
+        goal = {'x': 1., 'y': -4.5, 'yaw': math.pi/2}
+        with patch.object(self.profile, 'clearance_at', side_effect=lambda p: .32-abs(p[1]+3.) if .40 < p[0] < .70 else .36):
+            path = self.profile.routes(start, goal, entry_offset=.10)[0]
+            self.assertLess(path[0].length, .22)
+            self.assertEqual(path[0].end[1], -3.)
+            self.assertGreater(path[0].end[0], start[0])
+            self.assertTrue(all(self.profile.line_clear(leg.start, leg.end) for leg in path[1:]))
+
     def test_unknown_start_and_mismatched_scene_get_no_reference(self):
         with self.assertRaisesRegex(ValueError, '地图不匹配'):
             CorridorRoute(self.grid, {**self.settings, 'map_id': 'other-map'})

@@ -59,6 +59,38 @@ class AisleClearanceTests(TestCase):
 
 
 class ConnectedTransmitterTests(TestCase):
+    def test_formal_capture_restores_only_a_fresh_measured_stationary_reference(self):
+        with TemporaryDirectory() as directory:
+            config = Path(directory)/'fas_robot.json'
+            config.write_text(json.dumps({
+                'car':'A', 'map_id':'scene', 'ws63_mode':'connected',
+                'ws63_device':'/dev/serial/by-path/ws63', 'c5_device':'/dev/serial/by-path/c5',
+                'c5_mac':LINKS['c5']['A'],
+            }), encoding='utf-8')
+            measured = [.25, .30, .08]
+            health = {'stationary':True, 'ready':True, 'localization_confirmed':True,
+                      'pose':measured, 'pose_age_s':.04, 'scan_map_agreement':.95,
+                      'localization_covariance':(.001,.001,.002)}
+            mission = SimpleNamespace(grid=SimpleNamespace(map_id='scene'), phase='idle')
+            backend = SimpleNamespace(snapshot=lambda:health)
+            car = FasCar(backend, mission, config)
+            car.tick()
+            self.assertFalse(car.pose_checkpoint.exists())
+            car.lease.owner = uuid.uuid4().hex
+            with patch('fas_car.time.time', return_value=1000.):
+                car.tick()
+                snapshot = json.loads(car.pose_checkpoint.read_text())
+            self.assertEqual(snapshot['pose'], measured)
+            for stamp, map_id, expect in ((1010., 'scene', True), (1200., 'scene', False), (1010., 'old', False)):
+                with self.subTest(stamp=stamp, map_id=map_id):
+                    car.pose_checkpoint.write_text(json.dumps({**snapshot, 'map_id':map_id}))
+                    restarted = SimpleNamespace(fas_saved_pose=None, confirmed=False)
+                    with patch('fas_car.time.time', return_value=stamp):
+                        new_car = FasCar(restarted, mission, config)
+                    self.assertEqual(restarted.fas_saved_pose, (tuple(measured), 1000.) if expect else None)
+                    self.assertFalse(restarted.confirmed)
+                    self.assertFalse(new_car.lease.live)
+
     def test_connected_mode_uses_base_managed_transmitters(self):
         with TemporaryDirectory() as directory:
             config = Path(directory)/'fas_robot.json'
