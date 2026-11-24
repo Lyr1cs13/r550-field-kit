@@ -18,7 +18,7 @@ import yaml
 
 TERMINAL = {'succeeded', 'failed', 'canceled'}
 QUIET = {'idle', 'completed', 'failed', 'docked'}
-DOCK_RECHECK_SECONDS = 18.
+DOCK_RECHECK_SECONDS = 6.
 
 
 class Mission:

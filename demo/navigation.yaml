@@ -227,7 +227,7 @@ controller_server:
     CorridorTrack:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 0.085
-      lookahead_dist: 0.30
+      lookahead_dist: 0.48
       use_velocity_scaled_lookahead_dist: false
       max_angular_accel: 0.4
       use_rotate_to_heading: false

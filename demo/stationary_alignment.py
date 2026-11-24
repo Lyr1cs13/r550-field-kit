@@ -8,6 +8,26 @@ from scipy.ndimage import convolve, distance_transform_edt, map_coordinates
 from scipy.optimize import minimize
 
 
+class ScanWallAgreement:
+    """Precompute each map cell's scan-score contribution."""
+    def __init__(self,grid):
+        self.origin=grid.origin[:2]
+        self.resolution=grid.resolution
+        self.width,self.height=grid.width,grid.height
+        cells=np.asarray(grid.cells).reshape(self.height,self.width)
+        distance=distance_transform_edt(cells<65)*self.resolution
+        self.support=np.where(cells<0,-1,distance<=.15).astype(np.int8)
+
+    def score(self,points):
+        if len(points)==0:
+            return 0,None
+        x,y=np.floor((np.asarray(points)-self.origin)/self.resolution).T
+        inside=(x>=0)&(x<self.width)&(y>=0)&(y<self.height)
+        matches=self.support[y[inside].astype(np.intp),x[inside].astype(np.intp)]
+        known=int(np.count_nonzero(matches>=0))
+        return known,float(np.count_nonzero(matches==1)/known) if known else None
+
+
 def _rotation(angle):
     c,s=math.cos(angle),math.sin(angle)
     return np.array([[c,s],[-s,c]])

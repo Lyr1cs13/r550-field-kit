@@ -8,6 +8,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from directed_route import angle_error
+from motion_health import PADDED_FRONT, PADDED_REAR, PADDED_HALF_WIDTH
 
 
 def rollout_turn(error, expected_rollout):
@@ -46,6 +47,11 @@ class Leg:
         dx, dy = self.end[0] - self.start[0], self.end[1] - self.start[1]
         t = min(1., max(0., self.progress(point)/self.length))
         return math.dist(point[:2], (self.start[0]+t*dx, self.start[1]+t*dy))
+
+
+@dataclass(frozen=True)
+class EscapeLeg(Leg):
+    """Short move away from an edge along the current body heading."""
 
 
 @dataclass(frozen=True)
@@ -244,6 +250,76 @@ class CorridorRoute:
         return (margins[0] >= self.gap-.035 and margins[-1] >= self.gap
                 and all(b >= a for a, b in zip(margins, margins[1:])))
 
+    def footprint_clear(self, position, heading, *, include_keepout=True):
+        c, s = math.cos(heading), math.sin(heading)
+        a, b = abs(c), abs(s)
+        length = (PADDED_FRONT+PADDED_REAR)/2
+        width = PADDED_HALF_WIDTH
+        offset = (PADDED_FRONT-PADDED_REAR)/2
+        px, py = position[0]+offset*c, position[1]+offset*s
+        ix, iy = self.grid.cell_xy(*position)
+        radius = math.ceil(.24 / self.grid.resolution)
+        half = self.grid.resolution/2
+        for i in range(ix-radius, ix+radius+1):
+            for j in range(iy-radius, iy+radius+1):
+                if self.grid.value(i,j) == 0 and (not include_keepout or not self.grid.forbidden(i,j)):
+                    continue
+                x, y = self.grid.world(i,j)
+                dx, dy = x-px, y-py
+                if (abs(dx) <= half+length*a+width*b and abs(dy) <= half+length*b+width*a
+                        and abs(dx*c+dy*s) <= length+half*(a+b)
+                        and abs(-dx*s+dy*c) <= width+half*(a+b)):
+                    return False
+        return True
+
+    def escape_clear(self, leg):
+        samples = leg.samples(.025)
+        margins = [self.clearance_at(point) for point in samples]
+        # A padded footprint already crossing the planning boundary can
+        # withdraw, but surveyed obstacles remain checked from the first pose.
+        starts_clear = self.footprint_clear(leg.start,leg.yaw)
+        return (leg.length <= .57 and margins[0] > 0. and min(margins) >= margins[0]-.01
+                and margins[-1] >= margins[0]+.04
+                and all(self.footprint_clear(point,leg.yaw,include_keepout=starts_clear or math.dist(leg.start,point)>.035)
+                        for point in samples))
+
+    def escape_routes(self, pose, goal):
+        if self.clearance_at(pose[:2]) >= self.gap:
+            return []
+        x,y,heading = pose
+        c,s = math.cos(heading),math.sin(heading)
+        for distance in (.22,.38,.55):
+            for sign in (-1,1):
+                end = x+sign*distance*c,y+sign*distance*s
+                leg = EscapeLeg((x,y),end,heading,sign<0)
+                if self.escape_clear(leg):
+                    routes = self.routes((*end,heading),goal,entry_offset=.85)
+                    if routes:
+                        return [(leg,*route) for route in routes]
+        return []
+
+    def outward_retreat(self, pose, distance):
+        x, y, heading = pose
+        if (self.clearance_at((x,y)) >= self.gap
+                or not any(abs(x-lane) <= .55 and lo <= y <= hi for lane,lo,hi in self.lanes)):
+            return None
+        end = (x-distance*math.cos(heading), y-distance*math.sin(heading))
+        points = Leg((x,y),end,heading,True).samples(.025)
+        margins = [self.clearance_at(p) for p in points]
+        if (margins[-1] < margins[0]+.04 or any(b+.01 < a for a,b in zip(margins,margins[1:]))
+                or not all(self.footprint_clear(p,heading,include_keepout=False) for p in points)):
+            return None
+        return [list(point) for point in points]
+
+    def native_path_clear(self, path, *, dock=None):
+        def clear(point):
+            return ((dock is not None and math.dist(point[:2],dock[:2]) <= .90)
+                    or self.clearance_at(point) >= self.gap)
+
+        return (bool(path) and clear(path[0])
+                and all(clear(point) for first,last in zip(path,path[1:])
+                        for point in Leg(tuple(first[:2]),tuple(last[:2]),0.,False).samples()))
+
     def lookahead_end(self, leg):
         """Find a clear tangent extension for the controller's lookahead."""
         if isinstance(leg, CurveLeg):
@@ -261,6 +337,19 @@ class CorridorRoute:
     def includes(self, point):
         x, y = point['x'], point['y']
         return any(abs(x-lane) <= .02 and lo-.01 <= y <= hi+.01 for lane, lo, hi in self.lanes)
+
+    def short_approach(self, pose, goal):
+        """Prefer a checked local manoeuvre when the target is already in this aisle."""
+        return (pose is not None and self.includes(goal)
+                and abs(pose[0]-goal['x']) <= .26
+                and math.dist(pose[:2],(goal['x'],goal['y'])) <= .80)
+
+    def reverse_preferred(self, pose, goal):
+        if pose is None or not self.includes(goal) or abs(pose[0]-goal['x']) > .14:
+            return False
+        if abs(angle_error(pose[2],goal['yaw'])) > math.radians(35):
+            return False
+        return (goal['y']-pose[1])*math.sin(goal['yaw']) < -.12
 
     def station_curve(self, pose, goal, reverse):
         """Stay in the station's own aisle and check the entire curve before use."""
@@ -281,15 +370,18 @@ class CorridorRoute:
 
     def motion_routes(self, pose, goal):
         routes = self.routes(pose, goal)
-        if not routes or not self.includes(goal):
+        if not self.includes(goal):
             return routes
+        if not routes:
+            return self.escape_routes(pose,goal)
         if not routes[0]:
             return routes
         direct = routes[0][0]
         if (len(routes[0]) == 1 and abs(angle_error(direct.yaw, pose[2])) <= math.radians(3)
                 and abs(angle_error(direct.yaw, goal['yaw'])) <= math.radians(3)):
             return routes
-        curves = [curve for reverse in (False, True) if (curve := self.station_curve(pose, goal, reverse))]
+        directions = (True,) if self.reverse_preferred(pose,goal) else (False,True)
+        curves = [curve for reverse in directions if (curve := self.station_curve(pose, goal, reverse))]
         if curves:
             return [(min(curves, key=lambda curve: curve.length),), *routes]
         # A few centimetres sideways cannot be fixed by pivoting through 90 degrees
@@ -305,9 +397,9 @@ class CorridorRoute:
                         return [(Leg(pose[:2], end, yaw, reverse), curve), *routes]
         return routes
 
-    def joins(self, point, lane, *, allow_offset):
+    def joins(self, point, lane, *, allow_offset, offset_limit=.56):
         x, lo, hi = self.lanes[lane]
-        if abs(point[0]-x) > .56 or not lo-.60 <= point[1] <= hi+.60:
+        if abs(point[0]-x) > offset_limit or not lo-.60 <= point[1] <= hi+.60:
             return ()
         y = min(hi, max(lo, point[1]))
         if not allow_offset or abs(point[0]-x) <= .025:
@@ -329,7 +421,7 @@ class CorridorRoute:
             points.append(vertex)
         return points
 
-    def routes(self, start, goal):
+    def routes(self, start, goal, *, entry_offset=.56):
         target = (goal['x'], goal['y'])
         if math.dist(start[:2], target) < .017:
             return [()]
@@ -343,7 +435,8 @@ class CorridorRoute:
             inputs = [(source, target)]
         else:
             inputs = []
-            for u, v in itertools.product(self.joins(source, begin, allow_offset=not same_lane),
+            for u, v in itertools.product(self.joins(source, begin, allow_offset=not same_lane,
+                                                     offset_limit=entry_offset),
                                           self.joins(target, end, allow_offset=not same_lane)):
                 if same_lane:
                     inputs.append((source, u, v, target))

@@ -11,9 +11,10 @@ from rcl_interfaces.srv import SetParametersAtomically
 from rclpy.parameter import Parameter
 
 from arrival_policy import StationCheck
-from corridor_route import CorridorRoute, CurveLeg, Leg, rollout_turn
+from corridor_route import CorridorRoute, CurveLeg, EscapeLeg, Leg, rollout_turn
 from directed_route import angle_error, departure_goal, departure_leg, straight_approach_speed
-from ros_backend import RosBackend
+from guarded_retreat import RETREAT_DISTANCE
+from ros_backend import RosBackend, record_stopped_turn
 
 
 NO_MOTION_STATES = {
@@ -38,14 +39,34 @@ class CorridorBackend(RosBackend):
         if .25 <= departure < self.departure_distance:
             self.departure_distance = departure
 
+    def aisle_dock_return(self, point, kind):
+        lease = getattr(self,'fas_lease',None)
+        return kind == 'return' and lease is not None and lease.owner and self.corridors.includes(point)
+
     def guided(self, point, kind):
         fallback = getattr(self,'reference_retry',None)
-        return (kind in ('waypoint', 'move') and self.corridors.includes(point)
-                and (not fallback or fallback[:2] != (point['x'],point['y']) or time.monotonic() >= fallback[2]))
+        follows_aisle = (kind in ('waypoint','move') and self.corridors.includes(point)) or (
+            self.aisle_dock_return(point,kind) and self.pose and math.dist(self.pose[:2],self.dock_pose[:2]) > .90)
+        return (follows_aisle
+                and (not fallback or fallback[0] != (point['x'],point['y']) or time.monotonic() >= fallback[2]
+                     or (self.pose and math.dist(self.pose[:2],fallback[1])>.12)))
+
+    def planning_edge_retreat(self):
+        if self.pose and self.confirmed and self.route_retreat.available(self.pose,limit=3):
+            return self.corridors.outward_retreat(self.pose,RETREAT_DISTANCE)
+        return None
 
     def preview_route(self, point, kind, health):
-        if not self.guided(point, kind):
-            return super().preview_route(point, kind, health)
+        if self.guided(point, kind):
+            path = self.preview_corridors(point,kind,health)
+            if path:
+                return path
+        path = super().preview_route(point, kind, health)
+        if self.aisle_dock_return(point,kind) and not self.corridors.native_path_clear(path,dock=self.dock_pose):
+            raise ValueError('当前没有可走的回充路线，原生预览净空不足')
+        return path
+
+    def preview_corridors(self, point, kind, health):
         pose = tuple(health['pose'])
         prefix = [pose[:2]]
         if kind == 'move' and any(health.get(key) for key in
@@ -54,41 +75,66 @@ class CorridorBackend(RosBackend):
             path = departure_leg(pose, self.dock_pose, goal, staging=True)
             prefix.extend((p['x'], p['y']) for p in path['poses'])
             pose = (*prefix[-1], pose[2])
+        if kind=='move' and self.corridors.short_approach(pose,point):
+            return None
         routes = self.corridors.motion_routes(pose, point)
         if not routes:
-            return super().preview_route(point, kind, health)
+            return None
         prefix.extend(p for leg in routes[0] for p in leg.samples()[1:])
+        if kind=='return':
+            prefix.append(self.dock_pose[:2])
         return prefix
 
     def send_fas_line(self, identity):
         op = self.ops[identity]
-        if op.get('corridor_fallback') or (op['kind']=='waypoint' and self.corridors.includes(op['goal'])):
-            return False
+        if op['kind']=='waypoint' and self.corridors.includes(op['goal']):
+            if not self.corridors.short_approach(self.pose,op['goal']):
+                return False
+            op['local_station_approach'] = True
         return super().send_fas_line(identity)
 
     def plan_navigation(self, identity):
         op = self.ops[identity]
-        if op.get('corridor_fallback') or not self.guided(op['goal'], op['kind']):
+        if not self.guided(op['goal'], op['kind']):
             return super().plan_navigation(identity)
-        op.update(corridor=True, sequential=True, corridor_legs=None, corridor_check=None, corridor_rollout=0.)
-        op.setdefault('stop_xy_tolerance',self.arrival.get('final_position_tolerance', .05))
+        op.update(corridor=True, corridor_fallback=False, sequential=True, corridor_legs=None,
+                  corridor_check=None, corridor_rollout=0.)
+        op.setdefault('stop_xy_tolerance', .08 if op['kind']=='return' else self.arrival.get('final_position_tolerance', .05))
         self.corridor_state(op, 'corridor_prepare')
+
+    def navigation_path_allowed(self, op, path):
+        if self.aisle_dock_return(op['goal'],op['kind']):
+            return self.corridors.native_path_clear(path,dock=self.dock_pose)
+        return (not (op.get('fas_station') and self.corridors.includes(op['goal']))
+                or self.corridors.native_path_clear(path))
 
     def corridor_state(self, op, state, timeout=35.):
         op.update(status=state, started=time.monotonic(), timeout=timeout, handle=None)
 
     def corridor_retry(self, op, reason):
         goal = op['goal']
-        self.reference_retry = (goal['x'],goal['y'],time.monotonic()+30.)
-        op.update(corridor=False,corridor_fallback=True,corridor_legs=None)
         self.path = []
+        if (self.pose and op.get('fas_station') and op['status'] in ('navigating','corridor_stopped')
+                and math.dist(self.pose[:2],(goal['x'],goal['y'])) <= op['stop_xy_tolerance']):
+            op.update(corridor_legs=(),corridor_check=None,corridor_turns=0)
+            self.corridor_state(op, 'corridor_prepare')
+            return
+        if op.get('fas_station') and not op.get('reverse_retried') and self.corridors.reverse_preferred(self.pose,goal):
+            self.reference_retry = None
+            op.update(corridor=False,corridor_fallback=False,corridor_legs=None,reverse_retried=True)
+            self.retry_arrival(op, reason+'，先复核沿中线倒车')
+            return
+        if self.pose:
+            self.reference_retry = ((goal['x'],goal['y']),tuple(self.pose[:2]),time.monotonic()+30.)
+        op.update(corridor=False,corridor_fallback=True,corridor_legs=None)
         self.retry_arrival(op, reason+'，按实时地图重新规划')
 
     def corridor_lease_ok(self, op, health, path):
         if self.fleet_zone and self.fleet_motion_reason(path):
             return False
         fas = getattr(self, 'fas_lease', None)
-        return not (fas and fas.owner) or fas.allows('move', health, path)
+        kind = 'return' if op['kind']=='return' else 'move'
+        return not (fas and fas.owner) or fas.allows(kind, health, path)
 
     def update(self):
         super().update()
@@ -121,9 +167,12 @@ class CorridorBackend(RosBackend):
                     and self.pose is not None and health['pose_age_s'] is not None
                     and health['pose_age_s'] <= .4 and now-self.last_scan < .35):
                 return
+            if state == 'corridor_turn_done':
+                record_stopped_turn(op, self.pose)
             if state == 'corridor_stopped':
-                intermediate = len(op['corridor_legs']) > 1 and isinstance(op['corridor_legs'][1], CurveLeg)
-                tolerance = .055 if intermediate else op['stop_xy_tolerance']
+                intermediate = len(op['corridor_legs']) > 1
+                careful_stop = intermediate and (op['kind']=='return' or isinstance(op['corridor_legs'][1],CurveLeg))
+                tolerance = .055 if careful_stop else op['stop_xy_tolerance']
                 if math.dist(self.pose[:2], op['corridor_leg'].end) > tolerance:
                     self.corridor_retry(op, '参考线停稳后的位置超差，保持当前目标')
                     return
@@ -143,6 +192,12 @@ class CorridorBackend(RosBackend):
             goal = op['goal']
             at_position = math.dist(self.pose[:2], (goal['x'], goal['y'])) <= op['stop_xy_tolerance']
             routes = [()] if at_position else self.corridors.motion_routes(self.pose, goal)
+            now = time.monotonic()
+            blocked = [part for part in op.get('blocked_aisle_legs',[]) if now-part[2] < 25.]
+            op['blocked_aisle_legs'] = blocked
+            routes = [route for route in routes if not route or not any(
+                math.dist(route[0].start,start) < .15 and math.dist(route[0].end,end) < .20
+                for start,end,_ in blocked)]
             available = [route for route in routes if self.corridor_lease_ok(
                 op, health, [self.pose[:2]] + [p for leg in route for p in leg.samples()[1:]])]
             if not available:
@@ -169,6 +224,13 @@ class CorridorBackend(RosBackend):
             leg = self.corridors.station_curve(self.pose, target, original.reverse)
             if leg is None:
                 self.corridor_retry(op, '停稳位置已改变，重新核对走廊曲线')
+                return
+        elif isinstance(original, EscapeLeg):
+            bearing = math.atan2(original.end[1]-start[1], original.end[0]-start[0])
+            heading = math.remainder(bearing+(math.pi if original.reverse else 0.),math.tau)
+            leg = EscapeLeg(start,original.end,heading,original.reverse)
+            if abs(angle_error(heading,self.pose[2])) > math.radians(8) or not self.corridors.escape_clear(leg):
+                self.corridor_retry(op, '靠边退出位姿变化，停车复核')
                 return
         else:
             if not self.corridors.entry_clear(start, original.end):
@@ -221,11 +283,17 @@ class CorridorBackend(RosBackend):
                     if op['corridor_lookahead']:
                         self.validate_corridor_leg(identity, op, leg, leg.end)
                     else:
-                        self.corridor_retry(op, '实时障碍占用参考线，等待或检查另一条连接线')
+                        op['blocked_aisle_legs'].append((leg.start,leg.end,time.monotonic()))
+                        op.update(corridor_legs=None,corridor_turns=0)
+                        self.path=[]
+                        self.corridor_state(op, 'corridor_prepare')
                     return
                 error = angle_error(leg.yaw, self.pose[2])
                 predicted = angle_error(leg.yaw, self.pose[2] + op['corridor_rollout'])
                 if min(abs(error), abs(predicted)) > math.radians(10):
+                    if isinstance(leg, EscapeLeg):
+                        self.corridor_retry(op, '靠边退出需要保留当前朝向')
+                        return
                     turn, residual = rollout_turn(error, self.rollout_bias[leg.reverse])
                     op['corridor_rollout'] = residual
                     self.corridor_spin(op, turn)
@@ -359,6 +427,14 @@ class CorridorBackend(RosBackend):
             self.zero_motion()
 
     def finish_corridor_goal(self, op):
+        if op.get('fas_station'):
+            # Use one stopped-pose check and one terminal turn log for both
+            # corridor arrivals and short approaches.
+            op['corridor'] = False
+            self.path = [list(self.pose[:2])]
+            self.corridor_state(op, 'position_settling', 15.)
+            return
+
         goal = op['goal']
         distance = math.dist(self.pose[:2], (goal['x'], goal['y']))
         error = angle_error(goal['yaw'], self.pose[2])

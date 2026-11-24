@@ -1,10 +1,12 @@
 from contextlib import redirect_stdout
 from collections import Counter
+from http.client import HTTPResponse, IncompleteRead
 import importlib.util
 import io
 import json
 import math
 from pathlib import Path
+from random import Random
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -13,12 +15,14 @@ from unittest.mock import patch
 import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from aisle_clearance import AisleClearance
 from directed_route import uniform_route
 from fas_car import CorridorLease, FasCar, WS63_CONNECTED_IDS, WS63_IDS, obstruction_clear
-from fas_experiment import (C5Sample, Journal, PROTOCOL, RecoveryWait, ScanEvidence, Stations, aggregate,
+from fas_experiment import (C5Sample, Journal, PROTOCOL, PairObservation, RecoveryWait, ScanEvidence, Stations, aggregate,
                             capture_request, evaluate, move_batches, parallel_bounds, phase_state, position_rounds,
                             scan_confirmed, search, station_ids, stopped_station_arrival, sweep_pairs)
 from guarded_retreat import slip_obstruction
+from map_grid import MapGrid
 
 
 LINKS = station_ids({'sle':WS63_IDS,'c5':{'A':'02:00:00:00:01:AA','B':'0200000001bb'}})
@@ -31,6 +35,26 @@ def receipt(request, sle=(-55.,-61.), c5=(-64.,-70.), n=30):
     output['data'] = {key:{'epoch':8,'rssi_dbm':dict(zip(('A','B'),values)),'samples':{'A':n,'B':n}}
                       for key,values in zip(RECEIVERS,(sle,c5))}
     return output
+
+
+class AisleClearanceTests(TestCase):
+    def test_keeps_away_from_keepout_edge_and_allows_only_outward_rejoin(self):
+        grid = MapGrid(Path(__file__).resolve().parents[2] / 'scenes/demo-room')
+        ix, iy = grid.cell_xy(0., -4.5)
+        mask = bytearray(grid.mask)
+        for j in range(iy-4, iy+5):
+            mask[(grid.height-1-j)*grid.width+ix] = 0
+        grid.mask = bytes(mask)
+        x, y = grid.world(ix, iy)
+        aisle = AisleClearance(grid.info(), grid.png(), .26)
+
+        near, center = (x+.20, y), (x+.47, y)
+        self.assertAlmostEqual(aisle.distance(near), .20-grid.resolution/2)
+        self.assertFalse(aisle.allows([near, center]))
+        self.assertTrue(aisle.allows([near, center], rejoin=True))
+        self.assertFalse(aisle.allows([near, (x+.14,y), center], rejoin=True))
+        self.assertFalse(aisle.allows([(x+.47,y-.4), near, (x+.47,y+.4)]))
+        self.assertTrue(aisle.allows([(x+.47,y-.4), center, (x+.47,y+.4)]))
 
 
 class ConnectedTransmitterTests(TestCase):
@@ -207,6 +231,22 @@ class FasMotionTests(TestCase):
         with self.assertRaisesRegex(ValueError,'收回行驶许可'):
             lease.supervise(epoch,unsynced,())
         self.assertFalse(lease.live)
+
+    def test_pose_uncertainty_can_recover_without_discarding_the_goal(self):
+        now=[0.]
+        lease=CorridorLease(lambda:now[0]);lease.owner='run'
+        health={'ready':True,'localization_confirmed':True,'pose':(0.,0.,0.),
+                'pose_age_s':.03,'localization_covariance':(.001,.001,.002),'scan_map_agreement':.91}
+        uncertain={**health,'localization_covariance':(.14**2,.002,.003)}
+        epoch=uuid.uuid4().hex
+        lease.reserve(epoch,'move',(-.6,2.5,-.6,.6))
+        now[0]=.5
+        lease.supervise(epoch,uncertain,())
+        self.assertTrue(lease.live)
+        self.assertFalse(lease.allows('move',uncertain))
+        now[0]=.8
+        lease.supervise(epoch,health,())
+        self.assertTrue(lease.allows('move',health))
 
     def test_independent_structural_match_can_verify_weak_raw_scan_but_requires_fresh_pose(self):
         lease=CorridorLease(lambda:0.);lease.owner='run'
@@ -404,6 +444,27 @@ class MotionSimulationTests(TestCase):
         self.assertEqual(driver.place_once(('a','b')),('a','b'))
         self.assertEqual(calls,[('plan','B'),('drive',('B',))])
 
+    def test_return_replans_when_the_controller_oscillates_without_travel(self):
+        driver=self.driver((0.,3.),{'a':1.5,'b':3.})
+        driver.command=lambda car,action,**kwargs:None
+        stops=[]
+        driver.stop=stops.append
+        for car,state in driver.states.items():
+            state.update(phase='returning' if car=='A' else 'idle',fas={'operator_hold':False},dock=(1.5,0.,0.))
+            state['health'].update(ready=True,localization_confirmed=True,stationary=car=='B',charging_stable=False)
+
+        def sync(**kwargs):
+            health=driver.states['A']['health']
+            health.update(pose=(-health['pose'][0] or .022,0.,0.),arrival={'status':'navigating'})
+            return driver.states
+
+        driver.sync=sync
+        times=iter(range(0,45,3))
+        with patch.object(self.host.time,'monotonic',side_effect=lambda:next(times)), patch.object(self.host.time,'sleep'):
+            with self.assertRaisesRegex(self.host.RouteRetry,'无有效位移'):
+                driver.drive_batch(('A',),{'A':[(0.,0.),(1.5,0.)]},{'A':None},{},returning=True)
+        self.assertEqual(stops,[('A',)])
+
     def test_control_release_uses_parked_state_after_stop_and_release_replies_drop(self):
         driver = self.driver((0.,2.),{'a':0.,'b':2.4})
         driver.journal = SimpleNamespace(run_id='run')
@@ -456,6 +517,364 @@ class MotionSimulationTests(TestCase):
                 self.assertEqual(now[0],104.)
             finally:
                 journal.close()
+
+    def test_charge_plateau_rejects_rising_voltage_and_resets_after_contact_or_telemetry_loss(self):
+        window=self.host.ChargePlateau()
+        health={'stationary':True,'charging_stable':True,'localization_confirmed':True,
+                'dock_localization':{'status':'confirmed'}}
+
+        def observe(now,voltage):
+            health.update(charging_elapsed_s=now,voltage=voltage)
+            window.observe(now,health,11.4)
+
+        for now in range(0,241,5):
+            observe(now,11.5+now*.000055)
+        self.assertFalse(window.ready)
+        for now in range(245,365,5):
+            observe(now,11.54+(.005 if now%10 else -.005))
+        self.assertFalse(window.ready)
+        for now in range(365,486,5):
+            observe(now,11.54+(.005 if now%10 else -.005))
+        self.assertTrue(window.ready)
+        observe(500,11.54)
+        self.assertFalse(window.ready)
+        for now in range(505,740,5):
+            observe(now,11.54)
+        self.assertFalse(window.ready)
+        observe(740,11.54)
+        self.assertTrue(window.ready)
+        observe(741,11.565)
+        self.assertFalse(window.ready)
+        health['charging_stable']=False
+        observe(746,11.54)
+        self.assertFalse(window.ready)
+        self.assertFalse(window.samples)
+
+    def test_near_full_requires_taper_and_can_retain_a_verified_charge_at_the_same_dock(self):
+        window=self.host.ChargePlateau(near_full=12.1)
+        health={'stationary':True,'charging_stable':True,'localization_confirmed':True,
+                'dock_localization':{'status':'confirmed'},'current':1.54,
+                'pose':[1.,2.,0.], 'pose_age_s':.1}
+        def step(t, voltage):
+            health.update(charging_elapsed_s=300.+t,voltage=voltage)
+            window.observe(t,health,11.4)
+        for t in range(0,361,5):
+            step(t,11.46)
+        self.assertFalse(window.ready)
+        health['current']=.42
+        for t in range(365,486,5):
+            step(t,12.12)
+        self.assertTrue(window.ready)
+        health['charging_stable']=False
+        step(486,12.03)
+        self.assertTrue(window.retained)
+        health['pose'][0]+=.08
+        step(487,12.03)
+        self.assertFalse(window.ready)
+
+    def test_lower_charge_plateau_requires_sustained_current_taper(self):
+        window=self.host.ChargePlateau(near_full=12.1)
+        health={'stationary':True,'charging_stable':True,'localization_confirmed':True,
+                'dock_localization':{'status':'confirmed'},'current':.42,'voltage':11.49}
+        for t in range(0,361,5):
+            health['charging_elapsed_s']=t
+            window.observe(t,health,11.4)
+        self.assertFalse(window.ready)
+        for t in range(365,426,5):
+            health.update(current=1.55,charging_elapsed_s=t)
+            window.observe(t,health,11.4)
+        for t in range(430,796,5):
+            health.update(current=.42,charging_elapsed_s=t)
+            window.observe(t,health,11.4)
+        self.assertTrue(window.ready)
+        self.assertIn('平台',window.reason)
+
+    def test_bulk_evidence_survives_a_link_gap_or_restart_only_for_the_same_onboard_charge(self):
+        health={'stationary':True,'charging_stable':True,'localization_confirmed':True,
+                'dock_localization':{'status':'confirmed'},'pose':[0.,0.,0.],'voltage':11.67}
+        def observe(window, stamp, elapsed, current, *, clock_offset=0.):
+            health.update(current=current,charging_elapsed_s=elapsed)
+            window.observe(stamp+clock_offset,health,11.4,12.2,wall_stamp=100000.+stamp)
+
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'charge.sqlite'
+            first=Journal(path,{'order':'pair-first'})
+            try:
+                live=self.host.ChargePlateau(12.1,first.bulk_charge_start('A'))
+                for t in range(0,331,5):
+                    observe(live,t,600.+t,1.52 if t<135 else .42)
+                self.assertIsNotNone(live.bulk_charge_start)
+                self.assertFalse(live.ready)
+                first.set_bulk_charge_start('A',live.bulk_charge_start)
+            finally:
+                first.close()
+            reopened=Journal(path,{'order':'pair-first'})
+            try:
+                self.assertIsNone(reopened.bulk_charge_start('B'))
+                restored=self.host.ChargePlateau(12.1,reopened.bulk_charge_start('A'))
+                reseated=self.host.ChargePlateau(12.1,reopened.bulk_charge_start('A'))
+                for t in range(355,716,5):
+                    observe(live,t,600.+t,.42)
+                    observe(restored,t,600.+t,.42,clock_offset=-355.)
+                    observe(reseated,t,t-355.,.42,clock_offset=-355.)
+                    self.assertEqual((live.ready,restored.ready),(t>=715,t>=715))
+                    self.assertFalse(reseated.ready)
+                self.assertIsNone(reseated.bulk_charge_start)
+                reopened.set_bulk_charge_start('A',None)
+                self.assertIsNone(reopened.bulk_charge_start('A'))
+            finally:
+                reopened.close()
+
+    def test_short_return_needs_a_recent_clear_plan_and_keeps_fast_low_voltage_trigger(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.near_return_voltage_by_car={'A':10.3}
+        for car,state in driver.states.items():
+            state['fas']={'energy':{'low_voltage':10.4,'resume_voltage':11.4,'low_hold_seconds':20.}}
+            state['health'].update(voltage=10.36 if car=='A' else 10.7,stationary=True)
+        driver.short_return_checks['A']=(100.,{'A':(0.,0.),'B':(2.,0.)},True)
+        now=[100.]
+        with patch.object(self.host.time,'monotonic',side_effect=lambda:now[0]):
+            self.assertEqual(driver.low_cars(),[])
+            now[0]=121.
+            self.assertEqual(driver.low_cars(),[])
+            driver.states['B']['health']['pose'][0]=2.1
+            self.assertEqual(driver.low_cars(),[])
+            now[0]=141.
+            self.assertEqual(driver.low_cars(),['A'])
+            now[0]=142.
+            driver.states['A']['health']['voltage']=10.48
+            self.assertEqual(driver.low_cars(),[])
+            now[0]=143.
+            driver.states['A']['health']['voltage']=10.19
+            self.assertEqual(driver.low_cars(),[])
+            now[0]=146.
+            self.assertEqual(driver.low_cars(),['A'])
+
+    def test_contact_release_at_start_does_not_requeue_a_qualified_departure(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.motion_only=False
+        driver.charge_plateaus={'A':self.host.ChargePlateau(12.1)}
+        for car,state in driver.states.items():
+            state.update(phase='departing' if car=='A' else 'completed',dock=[0.,0.,0.],
+                         fas={'lease_live':car=='A', 'energy':{'low_voltage':10.4,'resume_voltage':11.4,
+                                                              'low_hold_seconds':20.}})
+            state['health'].update(stationary=True,charging_stable=False,voltage=11.7)
+        a=driver.states['A']
+        a['health']['pose']=[.03,0.,0.]
+        self.assertEqual(driver.low_cars(),[])
+        a['health']['charging_stable']=True
+        self.assertEqual(driver.low_cars(),[])
+        a['fas']['lease_live']=False
+        self.assertEqual(driver.low_cars(),['A'])
+        a['fas']['lease_live']=True
+        a['health'].update(charging_stable=False,voltage=10.15)
+        self.assertEqual(driver.low_cars(),['A'])
+        a['health']['voltage']=11.7
+        a['phase']='idle'
+        self.assertEqual(driver.low_cars(),['A'])
+
+    def test_early_launch_requires_both_confirmed_docks_and_keeps_return_margin(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.early_launch_voltage=11.25
+        for car,state in driver.states.items():
+            state['fas']={'energy':{'low_voltage':10.4,'resume_voltage':11.4}}
+            state['health'].update(voltage=11.29 if car=='A' else 11.86,stationary=True,
+                ready=True,charging_stable=True,localization_confirmed=True,
+                dock_localization={'status':'confirmed'},pose_age_s=.1,scan_window_agreement=.92)
+        driver.check_early_launch()
+        self.assertEqual(driver.initial_departure,{'A':11.25,'B':11.25})
+        driver.states['B']['health']['charging_stable']=False
+        with self.assertRaisesRegex(ValueError,'B 车未达到'):
+            driver.check_early_launch()
+        driver.early_launch_voltage=10.8
+        with self.assertRaisesRegex(ValueError,'0.70 V'):
+            driver.check_early_launch()
+
+    def test_joint_charge_waits_for_both_and_rechecks_after_a_contact_drop(self):
+        driver = self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.motion_only=False
+        driver.charge_plateaus={car:self.host.ChargePlateau() for car in ('A','B')}
+        driver.wait_parked=lambda:None
+        driver.recover_obstruction=lambda:None
+        driver.low_cars=lambda:['A']
+        docking=[]
+        def dock(car, *, allow_yield=None):
+            docking.append((car,allow_yield))
+            if len(docking)==1:
+                raise self.host.DockRouteConflict('B blocks A')
+        driver.ensure_charging_dock=dock
+        batches=[]
+
+        def queue(todo, manual, *, joint):
+            self.assertTrue(joint)
+            self.assertFalse(manual)
+            self.assertEqual(driver.journal.charging(),['A','B'])
+            batches.append(tuple(todo))
+            for car in todo:
+                driver.charge_plateaus[car].ready=True
+                driver.states[car]['health']['charging_elapsed_s']=120.
+                driver.states[car]['fas']={'energy':{'min_charge_seconds':120.}}
+
+        def sync():
+            if len(batches)==1:
+                driver.charge_plateaus['A'].ready=False
+            return driver.states
+
+        driver.service_charge_queue=queue
+        driver.sync=sync
+        with TemporaryDirectory() as directory:
+            journal=Journal(Path(directory)/'charge.sqlite',{'motion_only':False})
+            try:
+                driver.journal=journal
+                driver.service_energy()
+                self.assertEqual(docking,[('A',None),('B',None),('A',True),('A',None)])
+                self.assertEqual(batches,[('A','B'),('A',)])
+                self.assertTrue(driver.dual_departure_pending)
+                self.assertEqual(journal.charging(),['A','B'])
+            finally:
+                journal.close()
+
+    def test_joint_charge_detects_peer_contact_loss_while_first_car_still_charges(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.charge_timeout=120.
+        driver.charge_plateaus={car:self.host.ChargePlateau(12.1) for car in ('A','B')}
+        driver.ensure_charging_dock=lambda car:None
+        driver.journal=SimpleNamespace(set_activity=lambda *args:None)
+        for state in driver.states.values():
+            state.update(fas={'energy':{'resume_voltage':11.4,'charge_hold_seconds':15.,'min_charge_seconds':300.}},
+                         health={'charging_stable':True,'stationary':True,'voltage':11.,
+                                 'localization_confirmed':True,'dock_localization':{'status':'confirmed'}})
+        now=[0.]
+        def sync():
+            if now[0]==10.:
+                raise OSError('missing telemetry')
+            # Lost contact at t=1, brief recontact at 8; a qualified full peer can stop charging.
+            driver.states['B']['health']['charging_stable']=now[0] in (0.,8.)
+            driver.charge_plateaus['B'].retained=12.<=now[0]<15.
+        driver.sync=sync
+        clock=SimpleNamespace(monotonic=lambda:now[0],sleep=lambda dt:now.__setitem__(0,now[0]+dt))
+        with patch.object(self.host,'time',clock),self.assertRaisesRegex(RecoveryWait,'B 车充电中断'):
+            driver.service_charge_queue(['A','B'],False,joint=True)
+        self.assertEqual(now[0],27.)
+
+    def test_live_capture_recovers_link_or_station_drift_without_losing_the_pair(self):
+        driver = self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.motion_only=False
+        events=[]
+        driver.check_pause=lambda:None
+        driver.stop=lambda:events.append('stop')
+        driver.off=lambda:events.append('radio-off')
+        driver.wait_retry=lambda delay:events.append(delay)
+        driver.recover_capture_pose=lambda:None
+        driver.wait_parked=lambda:events.append('both-parked')
+        results=iter((self.host.VehicleLinkInterrupted('车辆通信暂时中断'), None, None))
+        pose_checks=iter((self.host.RouteRetry('停靠位置需要复核'), None))
+        with TemporaryDirectory() as directory:
+            journal=Journal(Path(directory)/'capture.sqlite',{'motion_only':False})
+            try:
+                driver.journal=journal
+                with journal.connection:
+                    journal.connection.execute("INSERT INTO pair_sweeps VALUES ('a','b','a','b','active')")
+
+                def collect():
+                    pair=tuple(journal.connection.execute("SELECT a,b FROM pair_sweeps WHERE status='active'").fetchone())
+                    driver.place_once=lambda pair, **kwargs: next_pose(pair)
+                    reached=driver.place(pair)
+                    fault=next(pose_checks)
+                    if fault:
+                        raise fault
+                    return reached
+
+                def next_pose(pair):
+                    events.append(pair)
+                    result=next(results)
+                    if result:
+                        raise result
+                    return 'resumed'
+
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.host.continuous_capture(driver,collect),'resumed')
+                self.assertEqual(events,[('a','b'),'stop','radio-off',2.,'both-parked',
+                                         ('a','b'),'stop','radio-off',4.,'both-parked',('a','b')])
+            finally:
+                journal.close()
+
+    def test_capture_timeout_confirms_close_before_requesting_retry(self):
+        events = []
+        base = SimpleNamespace(post=lambda *_: events.append('open'),
+                               cancel=lambda _: events.append('close'))
+        driver = SimpleNamespace(base=base, wait_parked=lambda: None, parallel=lambda *_: None,
+                                 off=lambda: events.append('radio-off'))
+        request = {'cars': {'A': {'point_id': 'a'}, 'B': {'point_id': 'b'}}, 'window_s': 1.}
+        with patch.object(self.host.time, 'monotonic', side_effect=[0., 25.]):
+            with self.assertRaisesRegex(RecoveryWait, '基站采样超时'):
+                self.host.Live.capture(driver, request)
+        self.assertEqual(events, ['open', 'close', 'radio-off'])
+
+    def test_wait_for_dock_fit_observes_peer_before_another_return(self):
+        driver = self.driver((0., 2.), {'a': 0., 'b': 2.})
+        driver.motion_only = False
+        for state in driver.states.values():
+            state.update(phase='idle', fas={'lease_live': False})
+            state['health']['stationary'] = True
+        phase = driver.states['A']['health']
+        phase.update(charging_stable=True, dock_localization={'status': 'applying'})
+        checks = []
+
+        def poll():
+            checks.append(phase['dock_localization']['status'])
+            if len(checks) == 2:
+                phase['dock_localization']['status'] = 'confirmed'
+
+        driver.sync = poll
+        with patch.object(self.host, 'fleet_pose_ready', return_value=True), patch.object(self.host.time, 'sleep'):
+            driver.wait_parked(wait_for_dock_fit=True)
+        self.assertEqual(checks, ['applying', 'applying'])
+
+    def test_base_busy_retries_while_protocol_conflicts_still_stop(self):
+        base = self.host.Base.__new__(self.host.Base)
+        base.headers = {}
+        for reason, exception in (('基站已在采样', RecoveryWait), ('协议或 A/B 发端身份不匹配', ValueError)):
+            with self.subTest(reason=reason):
+                def reject(*_args, **_kw):
+                    raise ValueError(reason)
+                base.api = SimpleNamespace(fetch=reject)
+                with self.assertRaises(exception) as failure:
+                    base.post('/fas/capture', {})
+                self.assertIs(type(failure.exception), exception)
+
+    def test_truncated_http_payload_is_recoverable_while_complete_invalid_json_is_rejected(self):
+        endpoint=self.host.Endpoint('http://127.0.0.1:5100')
+        for length,error in ((40,OSError),(5,ValueError)):
+            with self.subTest(length=length):
+                wire=io.BytesIO(f'HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n'.encode()+b'{"x":')
+                response=HTTPResponse(SimpleNamespace(makefile=lambda *_:wire))
+                response.begin()
+                with patch.object(self.host,'urlopen',return_value=response),self.assertRaises(error) as caught:
+                    endpoint.fetch('/api/fas/state')
+                if error is OSError:
+                    self.assertIsInstance(caught.exception.__cause__,IncompleteRead)
+
+    def test_live_recovery_only_reclaims_after_stationary_alignment_verification(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.journal=SimpleNamespace(run_id='run',pending=lambda:None,set_activity=lambda *_:None)
+        driver.sync=lambda:driver.states
+        driver.car_state=lambda car:driver.states[car]
+        events=[]
+        for car,state in driver.states.items():
+            state.update(phase='idle',fas={'owner':'run','lease_live':False,'recovery':'available'},control_token='token')
+            state['health'].update(ready=True,stationary=True,map_matches=True,pose_age_s=.1,
+                                   localization_confirmed=car=='B',scan_map_agreement=.9 if car=='B' else .68)
+
+        def command(car, action, **_):
+            events.append((car,action))
+            driver.states[car]['fas']['owner']=None if action=='fas_release' else 'run'
+
+        driver.command=command
+        driver.cars['A']=SimpleNamespace(fetch=lambda path,data,headers,timeout:events.append(('A',data['action'])))
+        driver.verify_capture_alignment=lambda car,pose:events.append((car,'verified'))
+        driver.recover_capture_pose()
+        self.assertEqual(events,[('A','fas_release'),('A','align_pose'),('A','verified'),('A','fas_claim')])
 
     def test_unattended_recovers_network_localization_and_charge_across_batches(self):
         stations=Stations({'map_id':'a'*64,'points':uniform_route([(0.,0.),(8.,0.)],50,0.)})
@@ -580,11 +999,39 @@ class FasSearchTests(TestCase):
         self.assertEqual(second.charging(),['B'])
         self.assertEqual(second.report(),[])
 
+    def test_pair_selected_for_travel_survives_link_loss_before_arrival(self):
+        config={'order':'pair-first'}
+        route=self.stations.pairs
+        pair=route[4]
+        self.stations.pair_candidates=lambda *_args,**_kwargs: iter((pair,))
+        journal=Journal(self.path,config)
+        try:
+            place=self.driver.place
+            def disconnected(_):
+                raise ConnectionError('vehicle link lost')
+            self.driver.place=disconnected
+            with self.assertRaises(ConnectionError):
+                sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=1,max_pairs=1)
+            self.assertEqual(journal.positioning_pair(),pair)
+            self.assertEqual(journal.report(),[])
+        finally:
+            journal.close()
+        self.driver.place=place
+        self.stations.pair_candidates=lambda *_args,**_kwargs: iter((route[-1],))
+        journal=Journal(self.path,config)
+        self.addCleanup(journal.close)
+        with redirect_stdout(io.StringIO()):
+            history=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=1,max_pairs=1)
+        self.assertEqual(tuple(history[0]['pair']),pair)
+        self.assertIsNone(journal.positioning_pair())
+
     def test_pair_sweep_resumes_at_missing_state_and_stops_at_first_joint_hit(self):
         self.driver.bad={0}
         self.driver.interrupt=2
         capture=self.driver.capture
+        timing=[]
         def alternating(request):
+            timing.append((request['window_s'],request.get('c5_window_s'),request.get('parallel_radios',False)))
             result=capture(request)
             if request['state_id']==1:
                 return receipt(request,c5=(-68,-62))
@@ -604,11 +1051,60 @@ class FasSearchTests(TestCase):
         journal=Journal(self.path,config)
         self.addCleanup(journal.close)
         with redirect_stdout(io.StringIO()):
-            records=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=2)
+            records=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=2,
+                                window_s=1.4,c5_window_s=.8,parallel_radios=True)
         self.assertEqual(self.driver.calls,[0,1,2,2,0,1,2])
+        self.assertEqual(timing,[(1.,None,False)]*4+[(1.4,.8,True)]*3)
         self.assertEqual(records[0]['pair'],pair)
         self.assertEqual(len({frozenset(row['pair']) for row in records}),2)
         self.assertTrue(all(row['status']=='hit' and row['hits']==[2] for row in records))
+
+    def test_pair_draw_shuffles_unvisited_pairs_and_car_assignments(self):
+        eligible = [pair for pair in self.stations.pairs if pair[0] < pair[1]]
+        visited = {eligible[0]}
+        with patch('fas_experiment.random.shuffle', side_effect=Random(7).shuffle):
+            candidates = list(self.stations.pair_candidates(visited))
+        draws = [tuple(sorted(pair)) for pair in candidates[::2]]
+        self.assertCountEqual(draws, eligible[1:])
+        self.assertNotEqual(draws, eligible[1:])
+        self.assertTrue(any(a > b for a,b in candidates[::2]))
+        self.assertEqual([pair[::-1] for pair in candidates[::2]], candidates[1::2])
+
+    def test_evidence_sampling_avoids_recent_anchors_and_stays_random(self):
+        coords={'a':(0.,0.),'b':(.25,0.),'c':(2.,0.),'d':(3.,0.),
+                'e':(5.,0.),'f':(6.,0.),'g':(8.,0.),'h':(9.,0.)}
+        stations=Stations({'map_id':'a'*64,'points':[
+            {'id':key,'x':x,'y':y,'yaw':0.} for key,(x,y) in coords.items()]})
+        observations=[PairObservation(('a','e'),'hit',7.),PairObservation(('a','f'),'hit',8.)]
+        choices=set()
+        for seed in range(12):
+            rng=Random(seed)
+            with patch.multiple('fas_experiment.random', shuffle=rng.shuffle,expovariate=rng.expovariate,random=rng.random):
+                picks=stations.pair_candidates({('a','e'),('a','f')},minimum_spacing=.9,observations=observations)
+                pair=next(picks)
+                self.assertTrue(set(pair).isdisjoint('abef'))
+                self.assertEqual(next(picks),pair[::-1])
+                choices.add(tuple(sorted(pair)))
+        self.assertGreater(len(choices),1)
+
+    def test_local_signal_prior_uses_only_matching_direction_and_verified_results(self):
+        coords={'a':(0.,0.),'b':(.5,0.),'c':(3.,0.),'d':(3.5,0.)}
+        distances={(a,b):math.dist(first,second) for a,first in coords.items() for b,second in coords.items()}
+        self.assertGreater(Stations.signal_weight(('b','d'),[PairObservation(('a','c'),'hit',6.2)],distances),1.)
+        self.assertLess(Stations.signal_weight(('b','d'),[PairObservation(('a','c'),'no_hit',.2)],distances),1.)
+        self.assertEqual(Stations.signal_weight(('d','b'),[PairObservation(('a','c'),'no_hit',.2)],distances),1.)
+        self.assertEqual(Stations.signal_weight(('b','d'),[PairObservation(('a','c'),'incomplete',None)],distances),1.)
+
+    def test_pair_evidence_uses_the_same_state_in_both_radios(self):
+        journal=Journal(self.path,{'order':'pair-first'})
+        self.addCleanup(journal.close)
+        pair=('a','b')
+        with journal.connection:
+            journal.connection.execute("INSERT INTO pair_sweeps VALUES ('a','b','a','b','no_hit')")
+        for state,values in enumerate(((8.,0.),(0.,8.),(3.,4.))):
+            journal.start(pair,state,{'trial_id':str(state)})
+            journal.finish(journal.pending(),{},dict(zip(RECEIVERS,values)),mark_state=False)
+        self.assertEqual(journal.completed_pairs(RECEIVERS),[PairObservation(pair,'no_hit',3.)])
 
     def test_pair_without_joint_hit_tests_every_state(self):
         self.driver.bad=set(range(4))
@@ -618,6 +1114,57 @@ class FasSearchTests(TestCase):
             rows=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=1)
         self.assertEqual(self.driver.calls,[0,1,2,3])
         self.assertEqual((rows[0]['status'],rows[0]['tested_states'],rows[0]['hits']),('no_hit',4,[]))
+
+    def test_coverage_prioritizes_wide_pairs_and_rejects_near_duplicates_in_either_order(self):
+        coords={'a':(0.,0.),'b':(0.,2.),'c':(0.,2.25),'d':(3.,0.),'e':(0.,4.)}
+        stations=Stations({'map_id':'a'*64,'points':[
+            {'id':key,'x':x,'y':y,'yaw':0.} for key,(x,y) in coords.items()]})
+        choices=list(stations.pair_candidates({('b','d')},minimum_spacing=.9,preferred_span=2.4))
+        self.assertNotIn(('c','d'),choices)
+        self.assertNotIn(('d','c'),choices)
+        spans=[math.dist(coords[a],coords[b]) for a,b in choices]
+        self.assertGreaterEqual(spans[0],2.4)
+        self.assertLess(spans[-1],2.4)
+
+    def test_pair_sweep_extends_only_c5_for_one_underfilled_state(self):
+        windows=[]
+
+        def capture(request):
+            windows.append((request['state_id'],request['window_s'],request['c5_window_s']))
+            if windows[-1]==(0,1.4,.8):
+                return {**receipt(request), 'status':'incomplete',
+                        'error':'C5 当前状态的 A/B 有效样本不足'}
+            return receipt(request,sle=(-70,-60) if request['state_id']==0 else (-62,-68))
+
+        self.driver.capture=capture
+        journal=Journal(self.path,{'order':'pair-first'})
+        self.addCleanup(journal.close)
+        with redirect_stdout(io.StringIO()):
+            rows=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=2,max_pairs=1,
+                             window_s=1.4,c5_window_s=.8,parallel_radios=True)
+        self.assertEqual(windows,[(0,1.4,.8),(0,1.4,5.),(1,1.4,.8)])
+        self.assertEqual(rows[0]['hits'],[1])
+
+    def test_persistent_missing_frames_do_not_become_a_no_hit_or_stop_other_pairs(self):
+        first_pair=None
+        def capture(request):
+            nonlocal first_pair
+            pair=tuple(request['cars'][car]['point_id'] for car in ('A','B'))
+            if first_pair is None:
+                first_pair=pair
+            if pair==first_pair:
+                return {**receipt(request),'status':'incomplete','error':'C5 当前状态的 A/B 有效样本不足'}
+            return receipt(request,sle=(-60,-68),c5=(-60,-68))
+
+        self.driver.capture=capture
+        journal=Journal(self.path,{'order':'pair-first'})
+        self.addCleanup(journal.close)
+        with redirect_stdout(io.StringIO()):
+            rows=sweep_pairs(journal,self.stations,CODES,LINKS,RECEIVERS,self.driver,count=4,max_pairs=2,
+                             window_s=1.4,c5_window_s=.8,defer_underfilled=True)
+        self.assertEqual([row['status'] for row in rows],['incomplete','hit'])
+        self.assertEqual(rows[0]['tested_states'],0)
+        self.assertEqual(journal.connection.execute("SELECT COUNT(*) FROM trials WHERE status='invalid'").fetchone()[0],6)
 
     def test_motion_round_retains_pair_through_interruption_and_queues_one_charge(self):
         journal=Journal(self.path,{'motion_only':True})

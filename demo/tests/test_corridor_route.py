@@ -7,7 +7,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'demo'))
 
-from corridor_route import CorridorRoute, CurveLeg, Leg, rollout_turn, tangent_lane_shift
+from corridor_route import CorridorRoute, CurveLeg, EscapeLeg, Leg, rollout_turn, tangent_lane_shift
 from map_grid import MapGrid
 
 
@@ -28,6 +28,20 @@ class CorridorRouteTests(unittest.TestCase):
             self.assertEqual(path[0].end, (0., y))
             self.assertEqual(path[0].reverse, reverse)
             self.assertAlmostEqual(path[0].yaw, start[2])
+
+    def test_local_recovery_uses_nearby_same_aisle_positions_only(self):
+        target = {'x':0., 'y':-4.65, 'yaw':math.pi/2}
+        self.assertTrue(self.profile.short_approach((.12,-4.4,-math.pi/2),target))
+        self.assertFalse(self.profile.short_approach((1.,-4.4,0.),target))
+        self.assertFalse(self.profile.short_approach((0.,-5.6,0.),target))
+
+    def test_aligned_station_behind_stays_in_reverse_preference(self):
+        target = {'x':0.,'y':-5.2,'yaw':math.pi/2}
+        self.assertTrue(self.profile.reverse_preferred((.045,-4.,math.radians(78)),target))
+        self.assertFalse(self.profile.reverse_preferred((.045,-4.,-math.pi/2),target))
+        self.assertFalse(self.profile.reverse_preferred((.3,-4.,math.pi/2),target))
+        self.assertFalse(self.profile.reverse_preferred((0.,-5.4,math.pi/2),target))
+        self.assertTrue(self.profile.motion_routes((.045,-4.,math.radians(78)),target)[0][0].reverse)
 
     def test_opposite_aisle_stays_on_one_of_the_explicit_connectors(self):
         start = (0., -4.5, math.pi/2)
@@ -54,6 +68,58 @@ class CorridorRouteTests(unittest.TestCase):
             self.assertFalse(self.profile.entry_clear((0., -4.), (-.02, -4.)))
         with patch.object(self.profile, 'clearance_at', side_effect=lambda point: .25-point[0] if point[0] < .07 else .36):
             self.assertFalse(self.profile.entry_clear((0., -4.), (.12, -4.)))
+
+    def test_escape_backs_out_before_turning_for_a_sampling_station(self):
+        start=(.45,-4.4,0.)
+        goal={'x':0.,'y':-5.2,'yaw':math.pi/2}
+        with patch.object(self.profile,'clearance_at',side_effect=lambda p: .34-.4*p[0]):
+            leg, *following = self.profile.motion_routes(start,goal)[0]
+            self.assertIsInstance(leg, EscapeLeg)
+            self.assertTrue(leg.reverse)
+            self.assertEqual(leg.yaw,start[2])
+            self.assertEqual(following[0].start,leg.end)
+            self.assertFalse(self.profile.escape_clear(EscapeLeg(start[:2],(.7,-4.4),0.,False)))
+
+    def test_native_replan_checks_between_sparse_waypoints(self):
+        with patch.object(self.profile,'clearance_at',side_effect=lambda p: .19 if 0.32<p[0]<0.58 and -4.6<p[1]<-4.2 else .34):
+            self.assertTrue(self.profile.native_path_clear([(0.,-4.4),(0.,-4.),(1.,-4.),(1.,-4.4)]))
+            self.assertFalse(self.profile.native_path_clear([(0.,-4.4),(1.,-4.4)]))
+
+    def test_return_guard_keeps_clearance_until_the_dock_approach(self):
+        dock=(1.,-3.2)
+        with patch.object(self.profile,'clearance_at',side_effect=lambda p: .17 if p[0]>.32 else .32):
+            self.assertFalse(self.profile.native_path_clear([(0.,-4.6),(1.,-4.6),dock],dock=dock))
+            self.assertTrue(self.profile.native_path_clear([(0.,-4.6),(0.,-3.2),(.18,-3.2),dock],dock=dock))
+            self.assertFalse(self.profile.native_path_clear([(0.,-4.6),(0.,-3.2),(.18,-3.2),dock]))
+
+    def test_withdrawal_from_planning_edge_still_checks_occupied_cells(self):
+        ix,iy = self.grid.cell_xy(.6,-4.5)
+        x,y = self.grid.world(ix,iy)
+        mask = bytearray(self.grid.mask)
+        for j in range(iy-4,iy+5):
+            mask[(self.grid.height-1-j)*self.grid.width+ix] = 0
+        self.grid.mask = bytes(mask)
+        profile = CorridorRoute(self.grid,self.settings)
+        start = (x-self.grid.resolution/2-.133,y)
+        retreat = EscapeLeg(start,(start[0]-.22,y),0.,True)
+        self.assertFalse(profile.footprint_clear(start,0.))
+        self.assertTrue(profile.escape_clear(retreat))
+        self.grid.cells[iy*self.grid.width+ix] = 100
+        self.assertFalse(profile.escape_clear(retreat))
+
+    def test_short_reverse_can_only_leave_a_virtual_boundary_through_free_raw_cells(self):
+        ix,iy = self.grid.cell_xy(.6,-4.5)
+        x,y = self.grid.world(ix,iy)
+        mask = bytearray(self.grid.mask)
+        for row in range(iy-4,iy+5):
+            mask[(self.grid.height-1-row)*self.grid.width+ix] = 0
+        self.grid.mask = bytes(mask)
+        profile = CorridorRoute(self.grid,self.settings)
+        path = profile.outward_retreat((x,y,0.),.20)
+        self.assertAlmostEqual(path[-1][0],x-.20)
+        self.assertIsNone(profile.outward_retreat((x-.05,y,math.pi),.20))
+        self.grid.cells[iy*self.grid.width+ix-4] = 100
+        self.assertIsNone(profile.outward_retreat((x,y,0.),.20))
 
     def test_lookahead_does_not_change_the_stop_point_or_pass_a_wall(self):
         leg = Leg((0., -4.), (0., -4.5), math.pi/2, True)

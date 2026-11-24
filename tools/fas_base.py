@@ -1,6 +1,7 @@
 """Serial bridge for the WS63 one-shot receiver and ESP32-C5 fixed-state receiver."""
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -11,17 +12,29 @@ import re
 import threading
 import time
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 
 PROTOCOL = 'FAS_PAIR_1'
 WS_IDS = {'A': '11:22:33:44:55:61', 'B': '11:22:33:44:55:62'}
 RECEIVERS = ['sle/main', 'c5/main']
+SERIAL_CLOSE_FAULT = '接收板关窗未确认'
 ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
 MAC = re.compile(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}')
 
 
 class Canceled(Exception):
     pass
+
+
+def retry_file_access(operation):
+    """Allow short-lived Windows file sharing conflicts during atomic replacement."""
+    for delay in (.02,.04,.08,.16,.32):
+        try:
+            return operation()
+        except PermissionError:
+            time.sleep(delay)
+    return operation()
 
 
 class Port:
@@ -33,6 +46,11 @@ class Port:
         self.serial.open()
         self.pending = bytearray()
         self.log = None
+
+    def reconnect(self):
+        self.serial.close()
+        self.pending.clear()
+        self.serial.open()
 
     def send(self, command):
         if self.log:
@@ -141,7 +159,8 @@ def sample_c5(port, request, cancel, session):
     state=request['radios']['c5']
     main,sub=state&0xfff,state>>12
     config=request['tx']['c5']
-    lease=min(60000,math.ceil(request['window_s']*1000)+7000)
+    window_s=request.get('c5_window_s',request['window_s'])
+    lease=min(60000,math.ceil(window_s*1000)+7000)
     port.request(f'SESSIONARM,{session},{lease}', lambda line:line.startswith(f'Y,armed,{session},'),cancel=cancel)
     selection=f"CLIENTCFG,2,{config['A']},{config['B']}"
     selected=lambda line:line.startswith('W,whitelist,') and 'selection_applied' in line
@@ -170,8 +189,8 @@ def sample_c5(port, request, cancel, session):
     port.request(f'SESSIONSTART,{session}',lambda line:line.startswith(f'Y,streaming,{session},'),cancel=cancel)
     samples=defaultdict(dict)
     epoch_start=None
-    epochs=math.ceil(request['window_s']*100)
-    for line in port.lines(time.monotonic()+request['window_s']+5,cancel):
+    epochs=math.ceil(window_s*100)
+    for line in port.lines(time.monotonic()+window_s+5,cancel):
         if line.startswith('Y,armed,'):
             raise ValueError('C5 会话在采样完成前结束')
         if not line.startswith('C,'):
@@ -208,13 +227,14 @@ class Station:
         self.ws,self.c5,self.directory,self.links=ws,c5,directory,links
         self.lock=threading.RLock()
         self.cancel=threading.Event()
+        self.closing=threading.Event()
         self.done=threading.Event()
         self.done.set()
         self.active=None
         self.fault=None
         self.directory.mkdir(parents=True,exist_ok=True)
 
-    def prepare(self):
+    def prepare_ports(self):
         if stop_ws(self.ws).get('oneshot_api')!='1':
             raise ValueError('请烧录 WS63-BASE-ONCE.fwpkg 后重启')
         status=self.c5.request('SESSIONSTATUS',lambda line:line.startswith('Y,') and line.endswith(',query'))
@@ -223,10 +243,34 @@ class Station:
             stop_c5(self.c5,session)
         elif status.startswith(('Y,streaming,','Y,armed,')):
             raise ValueError('先关闭 C5 正在运行的采集会话')
+
+    def prepare(self):
+        self.prepare_ports()
         for path in self.directory.glob('*/receipt.json'):
-            record=json.loads(path.read_text(encoding='utf-8'))
-            if record['status']=='running':
+            record=self.receipt(path.parent.name)
+            if record and record['status']=='running':
                 self.save(path,dict(record,status='incomplete',error='基站重启，旧窗口已关闭'))
+
+    def recover_ports(self):
+        delay=1.
+        while not self.closing.wait(delay):
+            with self.lock:
+                fault=self.fault
+                if self.active or not fault or not fault.startswith(SERIAL_CLOSE_FAULT):
+                    return
+            try:
+                self.ws.reconnect()
+                self.c5.reconnect()
+                self.prepare_ports()
+            except (OSError,ValueError,IndexError) as error:
+                print(f'基站串口重连未通过：{error}',flush=True)
+                delay=min(30.,max(3.,2.5*delay))
+                continue
+            with self.lock:
+                if self.fault == fault:
+                    self.fault=None
+            print('基站接收链已重连并确认关闭旧采样窗口。',flush=True)
+            return
 
     def save(self, path, data):
         tmp=path.with_suffix('.tmp')
@@ -234,13 +278,24 @@ class Station:
             json.dump(data,f,ensure_ascii=False,allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(path)
+        retry_file_access(lambda:tmp.replace(path))
 
     def receipt(self, trial):
         if not ID.fullmatch(trial):
             raise ValueError('采样编号无效')
         path=self.directory/trial/'receipt.json'
-        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+        with self.lock:
+            try:
+                return json.loads(retry_file_access(lambda:path.read_text(encoding='utf-8')))
+            except FileNotFoundError:
+                return None
+
+    def wait_receipt(self, trial, timeout):
+        with self.lock:
+            pending = bool(self.active and self.active[1] == trial)
+        if pending and timeout:
+            self.done.wait(timeout)
+        return self.receipt(trial)
 
     def validate(self, request):
         if request['protocol']!=PROTOCOL or request['tx']!=self.links:
@@ -252,9 +307,12 @@ class Station:
         if (type(state) is not int or not 0<=state<4096 or radios['sle']!=list(divmod(state,64))
                 or type(radios['c5']) is not int or radios['c5']!=c5_word(state)):
             raise ValueError('实验状态与硬件状态映射不匹配')
-        if (type(request['window_s']) not in (int,float) or not .2<=request['window_s']<=5
+        windows=(request['window_s'],request.get('c5_window_s',request['window_s']))
+        if (any(type(window) not in (int,float) or not .2<=window<=5 for window in windows)
                 or type(request['min_samples']) is not int or not 1<=request['min_samples']<=500):
             raise ValueError('基站窗口支持 0.2–5 秒和 1–500 样本')
+        if type(request.get('parallel_radios',False)) is not bool:
+            raise ValueError('并行窗口选项须为布尔值')
         poses=request['cars']
         if set(poses)!={'A','B'} or poses['A']['map_id']!=poses['B']['map_id']:
             raise ValueError('A/B 位姿须来自同一张地图')
@@ -288,23 +346,27 @@ class Station:
         error=None
         status='incomplete'
         session='fas_'+uuid.uuid4().hex[:20]
+
+        def record(port, filename, sample, *args):
+            with (path/filename).open('w',encoding='ascii',errors='replace') as log:
+                port.log=log
+                try:
+                    return sample(port,request,self.cancel,*args)
+                finally:
+                    port.log=None
+                    log.flush()
+                    os.fsync(log.fileno())
+
         try:
-            with (path/'ws63.log').open('w',encoding='ascii',errors='replace') as ws_log:
-                self.ws.log=ws_log
-                try:
-                    data['sle/main']=sample_ws(self.ws,request,self.cancel)
-                finally:
-                    self.ws.log=None
-                    ws_log.flush()
-                    os.fsync(ws_log.fileno())
-            with (path/'c5.log').open('w',encoding='ascii',errors='replace') as c5_log:
-                self.c5.log=c5_log
-                try:
-                    data['c5/main']=sample_c5(self.c5,request,self.cancel,session)
-                finally:
-                    self.c5.log=None
-                    c5_log.flush()
-                    os.fsync(c5_log.fileno())
+            if request.get('parallel_radios'):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    ws=pool.submit(record,self.ws,'ws63.log',sample_ws)
+                    c5=pool.submit(record,self.c5,'c5.log',sample_c5,session)
+                    data['sle/main']=ws.result()
+                    data['c5/main']=c5.result()
+            else:
+                data['sle/main']=record(self.ws,'ws63.log',sample_ws)
+                data['c5/main']=record(self.c5,'c5.log',sample_c5,session)
             status='complete'
         except Canceled:
             status='canceled'
@@ -321,7 +383,7 @@ class Station:
                 elif current.startswith('Y,streaming,'):
                     raise ValueError('C5 仍有未关闭的会话')
             except (OSError,ValueError,IndexError) as exc:
-                self.fault='接收板关窗未确认，请重连基站：'+str(exc)
+                self.fault=SERIAL_CLOSE_FAULT+'，正在复核基站串口：'+str(exc)
                 status,error='incomplete',self.fault
             with self.lock:
                 if self.cancel.is_set() and not self.fault:
@@ -333,6 +395,8 @@ class Station:
                 finally:
                     self.active=None
                     self.done.set()
+            if self.fault and self.fault.startswith(SERIAL_CLOSE_FAULT):
+                threading.Thread(target=self.recover_ports,daemon=True).start()
 
     def abort(self, request):
         with self.lock:
@@ -373,10 +437,15 @@ def make_handler(station,key):
                 return self.reply(403,{'error':'基站授权失败'})
             if self.path=='/fas/health':
                 return self.reply(200,{'protocol':PROTOCOL,'ready':station.fault is None,
-                                       'tx_configured':station.links,'receivers':RECEIVERS,'error':station.fault})
+                                       'tx_configured':station.links,'receivers':RECEIVERS,'error':station.fault,
+                                       'separate_c5_window':True,'parallel_radios':True,'receipt_wait':True})
             try:
-                if self.path.startswith('/fas/capture/'):
-                    record=station.receipt(self.path.split('/')[-1])
+                path=urlsplit(self.path)
+                if path.path.startswith('/fas/capture/'):
+                    timeout=float(parse_qs(path.query).get('wait',['0'])[0])
+                    if not 0. <= timeout <= .5:
+                        raise ValueError('采样回执等待范围为 0–0.5 秒')
+                    record=station.wait_receipt(path.path.split('/')[-1],timeout)
                     if record is not None:
                         return self.reply(200,record)
             except (OSError,ValueError) as exc:
@@ -429,6 +498,7 @@ def main():
                 try:
                     server.serve_forever()
                 except KeyboardInterrupt:
+                    station.closing.set()
                     station.cancel.set()
                     station.done.wait(10)
         finally:

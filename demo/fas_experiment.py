@@ -2,10 +2,11 @@
 from collections import Counter, deque
 from dataclasses import dataclass
 import hashlib
-from itertools import permutations
+from itertools import chain, permutations
 import json
 import math
 from pathlib import Path
+import random
 import re
 import sqlite3
 from statistics import median
@@ -27,6 +28,9 @@ PARKED_PEER_CLEARANCE = .60
 MAX_FLEET_SIGMA = .13
 MIN_SCAN_AGREEMENT = .80
 RECOVERY_STATE = -3
+POSITIONING_PAIR = -4
+BULK_CHARGE_CYCLE = {'A': -5, 'B': -6}
+UNDERFILLED_WINDOWS = {'C5 当前状态的 A/B 有效样本不足','WS63 当前状态的 A/B 有效样本不足'}
 
 
 class RecoveryWait(ValueError):
@@ -57,6 +61,13 @@ def point_xy(point):
 
 def yaw_error(first, second):
     return abs(math.remainder(first-second, 2*math.pi))
+
+
+@dataclass(frozen=True)
+class PairObservation:
+    pair: tuple
+    status: str
+    joint_db: float | None
 
 
 class Stations:
@@ -109,8 +120,76 @@ class Stations:
 
         return sorted((pair for pair in self.pairs if pair!=last_pair), key=rank)
 
-    def pair_candidates(self, positions, visited):
-        return (pair for pair in self.ranked(positions, set()) if tuple(sorted(pair)) not in visited)
+    def pair_candidates(self, visited, *, minimum_spacing=0., preferred_span=0., observations=None):
+        pairs = [pair for pair in self.pairs if pair[0] < pair[1] and pair not in visited]
+        random.shuffle(pairs)
+        if minimum_spacing or preferred_span or observations is not None:
+            coords = {key:point_xy(point) for key,point in self.points.items()}
+            distances = {(a,b):math.dist(first,second) for a,first in coords.items()
+                         for b,second in coords.items()}
+
+            def novelty(pair):
+                a,b=pair
+                return min((min(max(distances[a,c],distances[b,d]),max(distances[a,d],distances[b,c]))
+                            for c,d in visited),default=math.inf)
+
+            if observations is not None:
+                eligible=[pair for pair in pairs if not minimum_spacing or novelty(pair)>=minimum_spacing]
+                yield from self.observed_pair_candidates(eligible,observations,distances,preferred_span)
+                return
+            diverse=[]
+            for pair in pairs:
+                spacing=novelty(pair)
+                if spacing>=minimum_spacing:
+                    # Shuffle breaks ties within each coverage band.
+                    diverse.append((pair,distances[pair]>=preferred_span,min(4,math.floor(spacing/minimum_spacing))
+                                    if minimum_spacing and math.isfinite(spacing) else 4))
+            diverse.sort(key=lambda entry:entry[1:],reverse=True)
+            pairs=[entry[0] for entry in diverse]
+        for pair in pairs:
+            assignments = [pair, pair[::-1]]
+            random.shuffle(assignments)
+            yield from assignments
+
+    def observed_pair_candidates(self, pairs, observations, distances, preferred_span):
+        nearby=.55
+        usage=Counter(point for entry in observations for point in entry.pair)
+        reuse={point:1+sum(count*(.7 if other==point else .25)
+                           for other,count in usage.items() if distances[point,other]<=nearby)
+               for point in self.points}
+        neighbors=[{point for point in self.points if any(distances[point,prior]<=nearby for prior in entry.pair)}
+                   for entry in observations[-2:]]
+        ranked=[]
+        for a,b in pairs:
+            recency=sum(bool({a,b} & prior) for prior in neighbors)
+            coverage=(1.45 if preferred_span and distances[a,b]>=preferred_span else 1.)/(reuse[a]*reuse[b])
+            forward=coverage*self.signal_weight((a,b),observations,distances)
+            reverse=coverage*self.signal_weight((b,a),observations,distances)
+            total=forward+reverse
+            rank=random.expovariate(total)
+            first,second=((a,b),(b,a)) if random.random()*total<forward else ((b,a),(a,b))
+            ranked.append((recency,rank,first,second))
+        for _,_,first,second in sorted(ranked):
+            yield first
+            yield second
+
+    @staticmethod
+    def signal_weight(pair, observations, distances):
+        positive=negative=0.
+        for entry in observations:
+            if entry.joint_db is None:
+                continue
+            a,b=pair
+            c,d=entry.pair
+            # Restrict evidence to the measured A/B assignment and locally similar endpoints.
+            deviation=max(distances[a,c],distances[b,d])
+            support=max(0.,1-(deviation/2.)**2)
+            if entry.status=='hit':
+                positive=max(positive,support)
+            elif entry.status=='no_hit':
+                deficit=min(1.,max(0.,(MIN_DELTA_DB-entry.joint_db)/MIN_DELTA_DB))
+                negative=max(negative,support*deficit)
+        return (1+1.5*positive)/(1+3*negative)
 
 
 def sample_box(path, pad=LOCALIZATION_PAD):
@@ -242,9 +321,15 @@ def phase_state(index, c5_codes):
     return {'sle': list(divmod(index, 64)), 'c5': c5_codes[index]}
 
 
-def capture_request(run_id, trial_id, index, poses, state, links, *, min_samples=30, window_s=1.):
-    return {'protocol':PROTOCOL, 'run_id':run_id, 'trial_id':trial_id, 'state_id':index,
-            'radios':state, 'tx':links, 'cars':poses, 'min_samples':min_samples, 'window_s':window_s}
+def capture_request(run_id, trial_id, index, poses, state, links, *, min_samples=30, window_s=1.,
+                    c5_window_s=None, parallel_radios=False):
+    request = {'protocol':PROTOCOL, 'run_id':run_id, 'trial_id':trial_id, 'state_id':index,
+               'radios':state, 'tx':links, 'cars':poses, 'min_samples':min_samples, 'window_s':window_s}
+    if c5_window_s is not None:
+        request['c5_window_s'] = c5_window_s
+    if parallel_radios:
+        request['parallel_radios'] = True
+    return request
 
 
 def evaluate(request, receipt, receivers):
@@ -373,10 +458,34 @@ class Journal:
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO states VALUES (-1,'charging',?)",(canonical(cars),))
 
+    def bulk_charge_start(self, car):
+        row = self.state(BULK_CHARGE_CYCLE[car])
+        return json.loads(row['details']) if row else None
+
+    def set_bulk_charge_start(self, car, stamp):
+        with self.connection:
+            if stamp is None:
+                self.connection.execute('DELETE FROM states WHERE state_id=?', (BULK_CHARGE_CYCLE[car],))
+            else:
+                self.connection.execute("INSERT OR REPLACE INTO states VALUES (?,'bulk_charge',?)",
+                                        (BULK_CHARGE_CYCLE[car], canonical(stamp)))
+
     def set_activity(self, stage, message):
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO states VALUES (?,?,?)",
                                     (RECOVERY_STATE,stage,canonical({'message':message})))
+
+    def positioning_pair(self):
+        row = self.connection.execute('SELECT details FROM states WHERE state_id=?',(POSITIONING_PAIR,)).fetchone()
+        return tuple(json.loads(row['details'])) if row else None
+
+    def set_positioning_pair(self, pair):
+        with self.connection:
+            if pair is None:
+                self.connection.execute('DELETE FROM states WHERE state_id=?',(POSITIONING_PAIR,))
+            else:
+                self.connection.execute('INSERT OR REPLACE INTO states VALUES (?,?,?)',
+                                        (POSITIONING_PAIR,'positioning',canonical(pair)))
 
     def motion_completed(self):
         return self.connection.execute("SELECT COUNT(*) FROM states WHERE state_id>=0 AND status='arrived'").fetchone()[0]
@@ -398,6 +507,21 @@ class Journal:
     def prior_winners(self):
         rows = self.connection.execute("SELECT a,b,COUNT(*) AS n FROM trials WHERE status='pass' GROUP BY a,b")
         return {(r['a'],r['b']):r['n'] for r in rows}
+
+    def completed_pairs(self, receivers):
+        observations=[]
+        rows=self.connection.execute("SELECT a,b,status FROM pair_sweeps WHERE status<>'active' ORDER BY rowid")
+        for a,b,status in rows:
+            best=None
+            if status in ('hit','no_hit'):
+                samples=self.connection.execute("SELECT delta FROM trials WHERE a=? AND b=? AND status IN ('pass','miss')",(a,b))
+                for (encoded,) in samples:
+                    values=json.loads(encoded or '{}')
+                    if all(key in values and math.isfinite(values[key]) for key in receivers):
+                        joint=min(values[key] for key in receivers)
+                        best=joint if best is None else max(best,joint)
+            observations.append(PairObservation((a,b),status,best))
+        return observations
 
     def state(self, state_id):
         return self.connection.execute('SELECT * FROM states WHERE state_id=?', (state_id,)).fetchone()
@@ -460,7 +584,8 @@ class Journal:
 
 
 def sweep_pairs(journal, stations, c5_codes, links, receivers, driver, *, start=0, count=STATE_COUNT,
-                max_pairs=0, window_s=1., min_samples=30):
+                max_pairs=0, window_s=1., c5_window_s=None, parallel_radios=False, min_samples=30,
+                minimum_spacing=0., preferred_span=0., defer_underfilled=False, use_pair_evidence=False):
     """Keep both cars parked until the first joint hit or all states have been tested."""
     pending=journal.pending()
     if pending:
@@ -481,46 +606,85 @@ def sweep_pairs(journal, stations, c5_codes, links, receivers, driver, *, start=
             pair=tuple(active)
             poses=driver.place(pair)
             if poses is None:
-                raise ValueError('无法返回未完成的位置对，保留该对已采状态')
+                raise RecoveryWait('暂时无法返回未完成的位置对，保留该对已采状态')
         else:
             poses=None
-            for pair in stations.pair_candidates(driver.positions(),visited):
+            has_candidates=False
+            observations=journal.completed_pairs(receivers) if use_pair_evidence else None
+            positioning=journal.positioning_pair()
+            retry=(positioning,) if positioning in stations.pairs and tuple(sorted(positioning)) not in visited else ()
+            candidates=stations.pair_candidates(visited,minimum_spacing=minimum_spacing,preferred_span=preferred_span,
+                                                observations=observations)
+            tried=set()
+            for pair in chain(retry,candidates):
+                if pair in tried:
+                    continue
+                tried.add(pair)
+                has_candidates=True
+                journal.set_positioning_pair(pair)
                 poses=driver.place(pair)
                 if poses is not None:
                     break
+                journal.set_positioning_pair(None)
             if poses is None:
-                if len(visited)==len({tuple(sorted(pair)) for pair in stations.pairs}):
+                if not has_candidates:
                     return journal.report()
-                raise ValueError('目前没有可达的新位置对，已保存采集进度')
+                raise RecoveryWait('目前没有可达的新位置对，已保存采集进度')
             with db:
                 db.execute("INSERT INTO pair_sweeps VALUES (?,?,?,?,'active')",(*sorted(pair),*pair))
+                db.execute('DELETE FROM states WHERE state_id=?',(POSITIONING_PAIR,))
+        first=db.execute('SELECT request FROM trials WHERE a=? AND b=? ORDER BY created_utc LIMIT 1',pair).fetchone()
+        sampling=dict(window_s=window_s,c5_window_s=c5_window_s,parallel_radios=parallel_radios)
+        if first:
+            saved=json.loads(first['request'])
+            sampling={key:saved.get(key) for key in sampling}
         tested={row[0] for row in db.execute(
             "SELECT state_id FROM trials WHERE a=? AND b=? AND status IN ('pass','miss')",pair)}
+        consecutive_gaps=0
         for state in range(start,start+count):
             if state in tested:
                 continue
+            state_sampling = dict(sampling)
             for retry in range(2):
                 if hasattr(driver,'sweep_pose'):
                     poses=driver.sweep_pose(pair)
                 trial=capture_request(journal.run_id,uuid.uuid4().hex,state,poses,phase_state(state,c5_codes),
-                                      links,min_samples=min_samples,window_s=window_s)
+                                      links,min_samples=min_samples,**state_sampling)
                 journal.start(pair,state,trial)
                 receipt=driver.capture(trial)
                 try:
                     deltas=evaluate(trial,receipt,receivers)
                 except (ValueError,KeyError) as exc:
-                    journal.abandon(journal.pending(),str(exc),receipt)
+                    reason = receipt.get('error') if receipt.get('status') == 'incomplete' else None
+                    journal.abandon(journal.pending(),reason or str(exc),receipt)
                     if retry:
-                        raise ValueError('当前点对连续两次采样无效，保留未完成状态') from exc
+                        if defer_underfilled and reason in UNDERFILLED_WINDOWS:
+                            status='incomplete'
+                            print(f'状态 {state} 两次有效帧不足，保留原始回执。',flush=True)
+                            break
+                        raise ValueError(f'状态 {state} 连续两次采样无效，保留断点。{reason or exc}') from exc
+                    if (state_sampling['c5_window_s'] is not None and state_sampling['c5_window_s'] < 5.
+                            and reason == 'C5 当前状态的 A/B 有效样本不足'):
+                        state_sampling['c5_window_s'] = 5.
+                        print(f'状态 {state} 的 C5 样本不足，延长到 5 秒重测一次。',flush=True)
+                    if (state_sampling['c5_window_s'] is not None and state_sampling['window_s'] < 2.
+                            and reason == 'WS63 当前状态的 A/B 有效样本不足'):
+                        state_sampling['window_s'] = 2.
+                        print(f'状态 {state} 的 WS63 样本不足，延长到 2 秒重测一次。',flush=True)
                     continue
                 status=journal.finish(journal.pending(),receipt,deltas,mark_state=False)
+                tested.add(state)
                 print(f'位置对 {pair[0]} / {pair[1]} · 状态 {state:04d} · {status} · {deltas}',flush=True)
                 break
             if status=='pass':
                 break
-        else:
+            consecutive_gaps=consecutive_gaps+1 if status=='incomplete' else 0
+            if consecutive_gaps>=3:
+                break  # This pair cannot currently sustain RF capture.
+        if not db.execute("SELECT 1 FROM pair_sweeps WHERE a=? AND b=? AND status='hit'",pair).fetchone():
+            result='no_hit' if all(state in tested for state in range(start,start+count)) else 'incomplete'
             with db:
-                db.execute("UPDATE pair_sweeps SET status='no_hit' WHERE a=? AND b=? AND status='active'",pair)
+                db.execute("UPDATE pair_sweeps SET status=? WHERE a=? AND b=? AND status='active'",(result,*pair))
 
 
 def position_rounds(journal, stations, driver, *, start, count, max_pairs, recharge_after=None, order_pairs=None):
@@ -571,7 +735,7 @@ def position_rounds(journal, stations, driver, *, start, count, max_pairs, recha
 
 
 def search(journal, stations, c5_codes, links, receivers, driver, *, start=0, count=STATE_COUNT,
-           max_pairs=12, window_s=1., min_samples=30):
+           max_pairs=12, window_s=1., c5_window_s=None, parallel_radios=False, min_samples=30):
     """Run a signed, state-first search. An interrupted window remains retryable."""
     preferred = None
     pending = journal.pending()
@@ -605,7 +769,8 @@ def search(journal, stations, c5_codes, links, receivers, driver, *, start=0, co
                 continue
             trial_id=uuid.uuid4().hex
             request=capture_request(journal.run_id,trial_id,state,poses,phase,links,
-                                    min_samples=min_samples,window_s=window_s)
+                                    min_samples=min_samples,window_s=window_s,c5_window_s=c5_window_s,
+                                    parallel_radios=parallel_radios)
             journal.start(pair,state,request)
             receipt=driver.capture(request)
             try:

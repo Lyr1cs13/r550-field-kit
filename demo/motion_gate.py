@@ -16,7 +16,7 @@ from std_msgs.msg import Bool, Int8, String
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import Buffer, TransformListener
-from motion_health import (DEPARTURE_SPEED, StopFeedback, VelocityLease, OemLease, cautious_twist,
+from motion_health import (DEPARTURE_SPEED, NativeStopFeedback, StopFeedback, VelocityLease, OemLease, cautious_twist,
                            departure_twist, scan_points_in_base, swept_dock_clear, swept_footprint_clear)
 from guarded_retreat import GuardedRetreat
 
@@ -45,6 +45,7 @@ class MotionGate(Node):
         self.last_tick=self.last_motion;self.last_linear=0.
         self.hold_file=Path(__file__).resolve().parent.parent/'state'/'motion-hold'
         self.stop_feedback=StopFeedback()
+        self.native_stop=NativeStopFeedback()
         self.last_scan=-math.inf
         self.oem=OemLease();self.disable_burst=0
         config=Path(__file__).resolve().parent.parent/'config/vehicle.yaml'
@@ -121,10 +122,12 @@ class MotionGate(Node):
         if msg.data and not self.oem.active:self.last_motion=now
         if self.oem.receive(now,msg.data):
             self.disable_burst=OEM_STOP_CYCLES
+            self.native_stop.start()
 
     def firmware_oem_state(self,msg):
         if msg.data and not self.oem.active:
             self.disable_burst=OEM_STOP_CYCLES
+            self.native_stop.start()
 
     def scan(self, msg):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
@@ -167,7 +170,7 @@ class MotionGate(Node):
         departing=order is not None and now-order[0]<=.18
         fresh=now-self.last_retreat_odom<=.25 and self.retreat_odom is not None
         if retreating:
-            if self.oem.active or self.disable_burst or any(v) or departing:
+            if self.oem.active or self.disable_burst or self.native_stop.active or any(v) or departing:
                 self.retreat.status='canceled';v=(0.,0.,0.)
             else:
                 points=self.scan_in_base() if now-self.last_scan<=.30 else ()
@@ -176,15 +179,17 @@ class MotionGate(Node):
         elif self.retreat_identity and self.retreat.status in ('idle','backing'):
             self.retreat.status='canceled'
         self.retreat_status.publish(String(data=f'{self.retreat_identity}:{self.retreat.status}'))
-        if self.oem.expired(now):self.disable_burst=OEM_STOP_CYCLES
+        if self.oem.expired(now):
+            self.disable_burst=OEM_STOP_CYCLES
+            self.native_stop.start()
         disabling_oem=bool(self.disable_burst)
         if disabling_oem:
             self.ir_disable.publish(Int8(data=0));self.disable_burst-=1
             self.last_motion=now;v=(0.,0.,0.)
-        if self.oem.active:v=(0.,0.,0.)
+        if self.oem.active or self.native_stop.active:v=(0.,0.,0.)
         if now-self.last_scan>.4:v=(0.,0.,0.)
         if departing:
-            if (not any(v) and not self.oem.active and not disabling_oem and not retreating
+            if (not any(v) and not self.oem.active and not disabling_oem and not self.native_stop.active and not retreating
                     and not self.hold_file.exists() and now-self.last_scan<=.25 and fresh
                     and self.retreat_odom[3]>=-.01 and abs(self.retreat_odom[4])<=.10):
                 v=departure_twist(order[1],self.scan_in_base(),order[2],self.last_linear,dt)
@@ -204,12 +209,22 @@ class MotionGate(Node):
                     v=(0.,0.,0.)
         if any(v) and not departing and not self.dock_motion_clear(v):
             v=(0.,0.,0.)
-        self.last_linear=v[0]
         # An accepted cancellation says nothing about the wheels. Keep braking
         # until chassis feedback settles, even if the velocity source is gone.
-        feedback=self.retreat_odom if fresh and not self.oem.active else None
-        if (not self.hold_file.exists() and self.stop_feedback.still_moving(
-                now,v,feedback,lambda: self.turn_clear_for_braking(now))):
+        native_braking=self.native_stop.active
+        feedback=self.retreat_odom if fresh and (native_braking or not self.oem.active) else None
+        if native_braking:
+            if not disabling_oem:
+                self.ir_disable.publish(Int8(data=0))
+            v=(0.,0.,0.)
+            persistent=self.native_stop.update(now,feedback)
+            self.stop_feedback.still_moving(now,v,None)
+        else:
+            persistent=self.stop_feedback.still_moving(
+                now,v,feedback,lambda: self.turn_clear_for_braking(now),
+                lambda: self.travel_clear_for_braking(now,feedback))
+        self.last_linear=v[0]
+        if persistent and not self.hold_file.exists():
             self.hold_file.parent.mkdir(parents=True,exist_ok=True)
             self.hold_file.touch()
             self.get_logger().error(f'零速指令后车轮持续运动，已锁定底盘：v={feedback[3]:.3f}, w={feedback[4]:.3f}')
@@ -219,7 +234,7 @@ class MotionGate(Node):
             self.last_linear=0.
             return
         if any(v):self.last_motion=now
-        elif self.oem.active and now-self.last_motion>.5:
+        elif self.oem.active and not native_braking and now-self.last_motion>.5:
             return  # Do not continuously send velocity frames during OEM IR docking.
         msg = Twist();msg.linear.x, msg.linear.y, msg.angular.z = v
         self.output.publish(msg)
@@ -227,6 +242,11 @@ class MotionGate(Node):
     def turn_clear_for_braking(self, now):
         points=self.scan_in_base() if now-self.last_scan<=.25 else ()
         return len(points)>=10 and swept_footprint_clear((0.,0.,.20),points)
+
+    def travel_clear_for_braking(self, now, feedback):
+        points=self.scan_in_base() if now-self.last_scan<=.25 else ()
+        velocity=(feedback[3],0.,feedback[4])
+        return len(points)>=10 and swept_footprint_clear(velocity,points) and self.dock_motion_clear(velocity)
 
 
 def main():

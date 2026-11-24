@@ -6,13 +6,39 @@ import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from directed_route import (DOCK_STAGING_DISTANCE, departure_goal, departure_leg, dock_staging_needed,
                             fas_axis_leg, fas_short_leg, straight_approach_speed, straight_leg, uniform_route)
-from motion_health import (LocalizationGuard, StopFeedback, VelocityLease, OemLease, cautious_twist, departure_twist,
+from motion_health import (LocalizationGuard, NativeStopFeedback, StopFeedback, VelocityLease, OemLease, cautious_twist, departure_twist,
                            swept_dock_clear, swept_footprint_clear)
 from self_return_geometry import rear_center_glint_indices
 from endurance import Endurance
 
 
 class StopFeedbackTests(unittest.TestCase):
+    def test_native_stop_settles_a_bounded_backward_coast(self):
+        stop=NativeStopFeedback()
+        stop.start()
+        for now, x, speed in ((0.,0.,-.047),(.65,-.028,-.047),(.85,-.036,-.018),(1.1,-.038,0.)):
+            self.assertFalse(stop.update(now,(x,0.,0.,speed,-.05)))
+            self.assertEqual(stop.active,now<1.1)
+
+    def test_native_stop_retains_braking_and_escalates_continued_motion(self):
+        for x,speed,ending in ((-.052,-.047,.9),(-.015,-.035,1.55),(-.031,-.095,.7)):
+            with self.subTest(x=x,speed=speed):
+                stop=NativeStopFeedback()
+                stop.start()
+                self.assertFalse(stop.update(0.,(0.,0.,0.,speed,0.)))
+                self.assertTrue(stop.update(ending,(x,0.,0.,speed,0.)))
+                self.assertTrue(stop.active)
+
+    def test_native_stop_does_not_clear_on_missing_feedback(self):
+        stop=NativeStopFeedback()
+        stop.start()
+        self.assertFalse(stop.update(0.,(0.,0.,0.,0.,0.)))
+        self.assertFalse(stop.update(.21,None))
+        self.assertTrue(stop.active)
+        stop.update(.22,(0.,0.,0.,0.,0.))
+        stop.update(.45,(0.,0.,0.,0.,0.))
+        self.assertFalse(stop.active)
+
     def test_same_direction_spin_coast_can_settle(self):
         stops=StopFeedback()
         stops.still_moving(1., (0.,0.,.21), (0.,0.,0.,0.,.2))
@@ -33,6 +59,32 @@ class StopFeedbackTests(unittest.TestCase):
         stops.still_moving(1.,(0.,0.,-.2),(0.,0.,0.,0.,-.2))
         stops.still_moving(1.05,(0.,0.,0.),(0.,0.,0.,0.,-.2))
         self.assertTrue(stops.still_moving(1.85,(0.,0.,0.),(0.,0.,-.25,0.,-.13)))
+
+    def test_measured_short_straight_coast_does_not_latch_the_chassis(self):
+        stops=StopFeedback()
+        stops.still_moving(0.,(.08,0.,0.),(0.,0.,0.,.08,0.))
+        for now, x, speed in ((.05,.003,.055),(.72,.026,.030),(.95,.030,.011)):
+            self.assertFalse(stops.still_moving(now,(0.,0.,0.),(x,0.,.01,speed,.017),
+                                               travel_clear=lambda: True))
+
+    def test_travel_coast_escalates_on_persisting_or_unsafe_motion(self):
+        for now, x, speed, clear in ((1.22,.02,.03,True),(.72,.042,.03,True),
+                                     (.72,.028,-.03,True),(.72,.028,.03,False)):
+            with self.subTest(now=now, x=x, speed=speed, clear=clear):
+                stops=StopFeedback()
+                stops.still_moving(0.,(.08,0.,0.),(0.,0.,0.,.08,0.))
+                stops.still_moving(.05,(0.,0.,0.),(.003,0.,0.,.055,0.))
+                self.assertTrue(stops.still_moving(now,(0.,0.,0.),(x,0.,.01,speed,.017),
+                                                  travel_clear=lambda: clear))
+
+    def test_measured_twelve_centimetre_per_second_stop_requires_deceleration(self):
+        for initial, expect_lock in ((.122, False), (.038, True)):
+            with self.subTest(initial=initial):
+                stops = StopFeedback()
+                stops.still_moving(0., (.12, 0., -.05), (0., 0., 0., initial, .017))
+                stops.still_moving(.04, (0., 0., 0.), (0., 0., 0., initial, .017))
+                self.assertEqual(stops.still_moving(.85, (0., 0., 0.), (.052, 0., .01, .036, .017),
+                                                    travel_clear=lambda: True), expect_lock)
 
 
 class DockFootprintTests(unittest.TestCase):

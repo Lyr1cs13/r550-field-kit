@@ -23,6 +23,7 @@ class StopFeedbackTests(unittest.TestCase):
         backend.ops={'move':operation}
         backend.retry_arrival=Mock()
         backend.path=[(0.,0.)]
+        backend.pose=[0.,0.,0.]
         backend.corridor_retry(operation,'blocked')
         self.assertIs(operation['goal'],target)
         self.assertFalse(backend.guided(target,'move'))
@@ -64,7 +65,7 @@ class StopFeedbackTests(unittest.TestCase):
         bridge=SimpleNamespace(lock=threading.RLock(),pending_scans=scans,fas_lease=True,
             fas_scan_stamp=None,fas_scans=frames,last_scan=1000.,
             tf=SimpleNamespace(lookup_transform=lambda *_:SimpleNamespace(transform=transform)),
-            wall_distances={(0,0):.03},grid=SimpleNamespace(cell_xy=lambda *_:(0,0),value=lambda *_:0),
+            scan_wall_agreement=SimpleNamespace(score=lambda points:(len(points),1.)),
             map_matches=True)
         with patch('ros_backend.time.time',return_value=1000.), patch('ros_backend.time.monotonic',return_value=1000.):
             RosBackend.update_laser(bridge)
@@ -75,14 +76,14 @@ class StopFeedbackTests(unittest.TestCase):
 
     def test_cancel_keeps_braking_and_latches_wheels_that_keep_turning(self):
         from motion_gate import MotionGate
-        from motion_health import OemLease, StopFeedback
+        from motion_health import NativeStopFeedback, OemLease, StopFeedback
         with tempfile.TemporaryDirectory() as directory:
             hold = Path(directory) / 'motion-hold'
             gate = SimpleNamespace(alive=Mock(), output=Mock(), ir_disable=Mock(), retreat_status=Mock(),
                 lease=Mock(), oem=OemLease(), disable_burst=0, retreat_identity='',
                 retreat_lease=-math.inf, last_scan=0., last_tick=0., last_motion=0.,
                 retreat=SimpleNamespace(status='idle'), last_linear=0., hold_file=hold, departure_order=None,
-                stop_feedback=StopFeedback(), get_logger=Mock())
+                stop_feedback=StopFeedback(), native_stop=NativeStopFeedback(), get_logger=Mock())
             gate.lease.output.return_value=(0.,0.,0.)
             for i in range(25):
                 now=1.+i*.05
@@ -100,7 +101,7 @@ class StopFeedbackTests(unittest.TestCase):
             self.assertEqual(gate.output.publish.call_args.args[0].linear.x,0.)
             self.assertEqual(gate.ir_disable.publish.call_args.args[0].data,0)
 
-    def test_dock_collision_blocks_navigation_and_retreat_even_with_pose_drift(self):
+    def test_dock_contact_inhibits_navigation_without_persistent_lock(self):
         from ros_backend import RosBackend
         import threading
         for kind, status in [('waypoint','navigating'), ('survey','heading'), ('retreat','retreating')]:
@@ -116,28 +117,56 @@ class StopFeedbackTests(unittest.TestCase):
                         publish_spin_limit=Mock(), retreat_permit=Mock(), oem_lease=Mock())
                     with patch('ros_backend.__file__',str(Path(folder)/'demo/ros_backend.py')):
                         RosBackend.publish_motion_permit(bridge)
-                    self.assertEqual((Path(folder)/'state/motion-hold').exists(),unsafe)
+                    self.assertFalse((Path(folder)/'state/motion-hold').exists())
                     self.assertEqual(bridge.motion_permit.publish.call_args.args[0].data,
                                      not unsafe and kind!='retreat')
                     self.assertEqual(bridge.retreat_permit.publish.call_args.args[0].data,
                                      'task' if not unsafe and kind=='retreat' else '')
 
+    def test_oem_coast_stays_at_zero_without_latching_after_verified_stop(self):
+        from motion_gate import MotionGate
+        from motion_health import NativeStopFeedback, OemLease, StopFeedback
+        with tempfile.TemporaryDirectory() as directory:
+            hold=Path(directory)/'motion-hold'
+            gate=SimpleNamespace(alive=Mock(),output=Mock(),ir_disable=Mock(),retreat_status=Mock(),
+                lease=Mock(),oem=OemLease(),disable_burst=0,retreat_identity='',retreat_lease=-math.inf,
+                last_scan=0.,last_tick=0.,last_motion=0.,retreat=SimpleNamespace(status='idle'),
+                last_linear=0.,hold_file=hold,departure_order=None,stop_feedback=StopFeedback(),
+                native_stop=NativeStopFeedback(),get_logger=Mock(),scan_in_base=lambda:[(1.,0.)]*12,
+                dock_motion_clear=lambda _:True,dock_departure=-math.inf)
+            gate.lease.output.return_value=(.05,0.,0.)
+            gate.oem.receive(0.,True)
+            with patch('motion_gate.time.monotonic',return_value=.01):
+                MotionGate.oem_state(gate,SimpleNamespace(data=False))
+            for i in range(22):
+                now=(i+1)*.05
+                gate.last_retreat_odom=gate.last_scan=now
+                gate.retreat_odom=(-.047*min(now,.8),0.,0.,-.047 if now<.8 else 0.,0.)
+                with patch('motion_gate.time.monotonic',return_value=now):
+                    MotionGate.tick(gate)
+                if not gate.native_stop.active:
+                    break
+            self.assertFalse(gate.native_stop.active)
+            self.assertFalse(hold.exists())
+            self.assertTrue(all(c.args[0].linear.x==0. for c in gate.output.publish.call_args_list))
+
     def test_explicit_oem_release_starts_only_one_stop_burst(self):
         from motion_gate import MotionGate, OEM_STOP_CYCLES
-        from motion_health import OemLease
-        gate=SimpleNamespace(oem=OemLease(),last_motion=0.,disable_burst=0)
+        from motion_health import NativeStopFeedback, OemLease
+        gate=SimpleNamespace(oem=OemLease(),last_motion=0.,disable_burst=0,native_stop=NativeStopFeedback())
         MotionGate.oem_state(gate,SimpleNamespace(data=True))
         self.assertEqual(gate.disable_burst,0)
         MotionGate.oem_state(gate,SimpleNamespace(data=False))
         self.assertEqual(gate.disable_burst,OEM_STOP_CYCLES)
+        self.assertTrue(gate.native_stop.active)
         gate.disable_burst-=1
         MotionGate.oem_state(gate,SimpleNamespace(data=False))
         self.assertEqual(gate.disable_burst,OEM_STOP_CYCLES-1)
 
     def test_native_mode_without_a_lease_restarts_ir_stop_burst(self):
         from motion_gate import MotionGate, OEM_STOP_CYCLES
-        from motion_health import OemLease
-        gate=SimpleNamespace(oem=OemLease(),disable_burst=0)
+        from motion_health import NativeStopFeedback, OemLease
+        gate=SimpleNamespace(oem=OemLease(),disable_burst=0,native_stop=NativeStopFeedback())
         MotionGate.firmware_oem_state(gate,SimpleNamespace(data=True))
         self.assertEqual(gate.disable_burst,OEM_STOP_CYCLES)
         gate.oem.receive(1.,True)

@@ -9,6 +9,6 @@ set -u
 mkdir -p "$root/state/navigation-recordings"
 exec ros2 bag record --storage-preset-profile resilient \
   -o "$root/state/navigation-recordings/$(date +%Y%m%d-%H%M%S)" \
-  /scan /odom /odom_combined /amcl_pose /tf /tf_static /plan /plan_smoothed \
+  /scan /odom /imu/data_raw /odom_combined /amcl_pose /tf /tf_static /plan /plan_smoothed \
   /nav_cmd_vel /collision_cmd_vel /guard_cmd_vel /cmd_vel /navigation_motion_permit /navigation_spin_limit \
   /PowerVoltage /robot_charging_flag /robot_charging_current /robot_red_flag

@@ -1,17 +1,44 @@
 """Exercise the real bridge update with fake publishers; never creates a ROS node."""
 import importlib.util
 from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 import sys
 import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 
 @unittest.skipUnless(importlib.util.find_spec('rclpy'),'Requires installed ROS message types')
 class BridgeContactTests(unittest.TestCase):
+
+    def test_lifecycle_reprobes_a_lost_request_and_ignores_its_late_reply(self):
+        from ros_backend import RosBackend
+
+        first, replacement = Future(), Future()
+        client = Mock()
+        client.call_async.side_effect = (first, replacement)
+        state = SimpleNamespace(lock=threading.RLock(), get_node_names=lambda: [], lifecycle={},
+                                lifecycle_clients={'amcl': client}, lifecycle_requests={})
+        state.lifecycle_result = lambda future, name: RosBackend.lifecycle_result(state, future, name)
+        with patch('ros_backend.time.monotonic', side_effect=[0., 2., 4., 6., 6.1]):
+            RosBackend.probe(state)
+            RosBackend.probe(state)
+            self.assertEqual(client.call_async.call_count, 1)
+            client.service_is_ready.return_value = False
+            RosBackend.probe(state)
+            client.remove_pending_request.assert_called_once_with(first)
+            client.service_is_ready.return_value = True
+            RosBackend.probe(state)
+            first.set_result(SimpleNamespace(current_state=SimpleNamespace(id=2)))
+            self.assertEqual(state.lifecycle, {})
+            self.assertIs(state.lifecycle_requests['amcl'][0], replacement)
+            replacement.set_result(SimpleNamespace(current_state=SimpleNamespace(id=3)))
+            self.assertEqual(state.lifecycle, {'amcl': (3, 6.1)})
+            self.assertEqual(state.lifecycle_requests, {})
 
     def test_terminal_acceptance_uses_stopped_pose_and_preserves_strict_boundary(self):
         import math

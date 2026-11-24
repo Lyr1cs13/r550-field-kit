@@ -12,6 +12,7 @@ from fas_experiment import (CARS, MAX_FLEET_SIGMA, PROTOCOL, clear_of_parked_pee
 LEASE_SECONDS = 1.0
 SCAN_HOLD_SECONDS = 2.5
 SCAN_UNSTABLE = '雷达或定位数据尚不稳定'
+POSITION_UNCERTAIN = '定位不确定性超过走廊预约上限'
 NOT_PARKED = '实验接管前两车须各自停稳、定位就绪并标好桩位'
 PATH_KINDS = ('move','return','retreat')
 WS63_IDS = {'A': '52:35:35:30:00:a1', 'B': '52:35:35:30:00:b1'}
@@ -71,7 +72,7 @@ class CorridorLease:
         if not self.live or epoch != self.epoch:
             raise ValueError('行驶许可已过期，请停稳后重新预约')
         reason = None if verifying_dock else self.motion_error(self.kind,health,route)
-        if self.kind in ('move','return') and not docking and reason == SCAN_UNSTABLE:
+        if self.kind in ('move','return') and not docking and reason in (SCAN_UNSTABLE,POSITION_UNCERTAIN):
             # The velocity gate stays closed. A fresh supervisor heartbeat can
             # keep the reserved corridor while the observation recovers.
             now=self.clock()
@@ -105,7 +106,7 @@ class CorridorLease:
                 or not (rotation or docking or scan_confirmed(health))):
             return SCAN_UNSTABLE
         if sigma is None or sigma > MAX_FLEET_SIGMA:
-            return '定位不确定性超过走廊预约上限'
+            return POSITION_UNCERTAIN
         if self.parked_peer is not None:
             clearance=peer_clearance(sigma,self.parked_peer_sigma)
             if (not clear_of_parked_peer([pose],self.parked_peer,clearance)
@@ -232,6 +233,10 @@ class FasCar:
     def state(self):
         recovery=getattr(self.backend,'fas_localization_state',None)
         blocked=getattr(self.backend,'fas_obstruction',None)
+        route_blocked=getattr(self.backend,'route_start_blocked',lambda:False)()
+        outward=getattr(self.backend,'planning_edge_retreat',None)
+        edge_blocked=(outward and self.lease.owner and not self.lease.live and not blocked
+                      and self.mission.phase in ('idle','completed','failed') and outward())
         return {'protocol':PROTOCOL,'car':self.car,'owner':self.lease.owner,
                 'lease_epoch':self.lease.epoch,'lease_live':self.lease.live,
                 'scan_hold':self.lease.live and self.lease.scan_hold_since is not None,
@@ -242,7 +247,8 @@ class FasCar:
                 'tx':self.links,'energy':dict(self.mission.endurance.config),
                 'dock_retry_pending':self.mission.dock_retry_pending,
                 'recovery':recovery() if recovery else None,
-                'retreat_available':bool(blocked and blocked['direction']=='front' and not blocked['attempted'])}
+                'route_start_blocked':route_blocked,
+                'retreat_available':bool(edge_blocked or route_blocked or (blocked and blocked['direction']=='front' and not blocked['attempted']))}
 
     def usb_ready(self):
         try:
@@ -405,7 +411,7 @@ class FasCar:
             return {}
         health = self.require_parked()
         kind = data['kind']
-        if kind not in PATH_KINDS or (kind=='retreat' and not self.motion_only):
+        if kind not in PATH_KINDS:
             raise ValueError('预约类型无效')
         if action == 'fas_preview':
             if kind=='retreat':

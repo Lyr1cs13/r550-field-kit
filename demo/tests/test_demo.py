@@ -159,9 +159,9 @@ class DemoTests(unittest.TestCase):
         m.phase='docking';m._fail('对接超时，未收到充电反馈，已停止')
         m.tick();self.clock.advance(3);m.tick()
         self.assertFalse(self.backend.docking_started)
-        self.clock.advance(15.1);m.tick()
+        self.clock.advance(3.1);m.tick()
         self.assertEqual(m.dock_retry_count,1);self.assertEqual(m.phase,'docking')
-        m._fail('对接超时，未收到充电反馈，已停止');m.tick();self.clock.advance(18.1);m.tick()
+        m._fail('对接超时，未收到充电反馈，已停止');m.tick();self.clock.advance(6.1);m.tick()
         self.assertEqual(m.phase,'failed');self.assertFalse(m.dock_retry_pending)
 
     def test_late_stable_charge_does_not_push_again(self):
@@ -182,7 +182,7 @@ class DemoTests(unittest.TestCase):
         raw=False;self.clock.advance(4.);m.tick()
         self.assertFalse(self.backend.docking_started)
         self.assertTrue(m.dock_retry_pending)
-        self.clock.advance(9.5);m.tick()
+        self.clock.advance(5.5);m.tick()
         self.assertFalse(self.backend.docking_started)
         self.backend.charging=True;m.tick()
         self.assertEqual(m.phase,'docked')
@@ -192,7 +192,7 @@ class DemoTests(unittest.TestCase):
         original=self.backend.snapshot
         self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.93}
         m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
-        m.tick();self.clock.advance(18.1);m.tick()
+        m.tick();self.clock.advance(6.1);m.tick()
         self.assertFalse(m.dock_retry_pending)
         self.assertEqual(m.dock_retry_count,1)
         goal,kind=self.backend.calls[-1]
@@ -226,7 +226,7 @@ class DemoTests(unittest.TestCase):
         original=self.backend.snapshot
         self.backend.snapshot=lambda:{**original(),'charge_telemetry_fresh':True,'scan_map_agreement':.93}
         m.phase='docking';m._fail('桩旁轮程已达到保护上限但未检测到充电，已停止对接')
-        m.tick();self.clock.advance(18.1);m.tick()
+        m.tick();self.clock.advance(6.1);m.tick()
         self.assertFalse(m.dock_retry_pending)
         self.assertEqual(self.backend.calls,[])
 
@@ -398,7 +398,7 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.mission.phase,'docked')
         self.clock.advance(6.);self.mission.tick()
         self.assertEqual(self.mission.phase,'failed');self.assertTrue(self.mission.dock_retry_pending)
-        self.clock.advance(18.1);self.mission.tick()
+        self.clock.advance(6.1);self.mission.tick()
         self.assertEqual(self.mission.phase,'returning')
         self.assertTrue(self.backend.calls[-1][0]['dock_retry_exit'])
 

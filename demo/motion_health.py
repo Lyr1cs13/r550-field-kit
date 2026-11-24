@@ -5,6 +5,7 @@ from directed_route import dock_footprint_intersects
 
 DEPARTURE_SPEED = .07
 SPIN_CLEARANCE_RADIUS = .195
+PADDED_FRONT, PADDED_REAR, PADDED_HALF_WIDTH = .15, .16, .12
 
 
 def scan_points_in_base(scan, x, y, heading):
@@ -44,7 +45,7 @@ def swept_footprint_clear(velocity, scan_points):
         dy=0. if abs(wz)<1e-6 else vx*(1.-c)/wz
         for x,y in nearby:
             rx=c*(x-dx)+s*(y-dy);ry=-s*(x-dx)+c*(y-dy)
-            if -.16<=rx<=.15 and abs(ry)<=.12:
+            if -PADDED_REAR<=rx<=PADDED_FRONT and abs(ry)<=PADDED_HALF_WIDTH:
                 return False
     return True
 
@@ -156,26 +157,79 @@ class LocalizationGuard:
 
 
 class StopFeedback:
-    """Distinguish a bounded coast after spin cancellation from unintended travel."""
+    """Distinguish bounded braking after a command from unintended motion."""
     def __init__(self):
         self.last_turn = None
+        self.last_travel = None
         self.since = None
+        self.origin = None
+        self.initial_linear_speed = 0.
 
-    def still_moving(self, now, command, odometry, turn_clear=lambda: False):
+    def still_moving(self, now, command, odometry, turn_clear=lambda: False, travel_clear=lambda: False):
         if any(command):
             self.last_turn = (now, command[2]) if abs(command[0]) < .01 and command[2] else None
+            self.last_travel = (now, command[0]) if abs(command[0]) >= .025 else None
         if any(command) or odometry is None or (abs(odometry[3]) <= .025 and abs(odometry[4]) <= .10):
-            self.since = None
+            self.since = self.origin = None
             return False
 
         if self.since is None:
             self.since = now
+            self.origin = odometry[:3]
+            self.initial_linear_speed = abs(odometry[3])
         if now-self.since < .65:
             return False
         linear_speed, yaw_rate = odometry[3:]
-        return not (self.last_turn and now-self.last_turn[0] < 2.5
-                    and abs(linear_speed) <= .025 and yaw_rate*self.last_turn[1] > 0.
-                    and turn_clear())
+        if (self.last_turn and now-self.last_turn[0] < 2.5
+                and abs(linear_speed) <= .025 and yaw_rate*self.last_turn[1] > 0. and turn_clear()):
+            return False
+        if not self.last_travel:
+            return True
+        # A measured stop from 12 cm/s may coast about 5.5 cm. Only allow the
+        # longer tail at higher approach speeds and when the wheels decelerate.
+        grace_distance = min(.06, .035 + .625 * max(0., abs(self.last_travel[1]) - .08))
+        slowing = abs(linear_speed) <= min(.055, self.initial_linear_speed * .65)
+        return not (now-self.last_travel[0] < 1.20 and linear_speed*self.last_travel[1] > 0.
+                    and slowing and abs(yaw_rate) <= .12
+                    and math.dist(odometry[:2],self.origin[:2]) < grace_distance
+                    and abs(math.remainder(odometry[2]-self.origin[2],2*math.pi)) < .06 and travel_clear())
+
+
+class NativeStopFeedback:
+    """Keep braking after STM32 handoff until fresh wheel readings settle."""
+    def __init__(self):
+        self.active = False
+        self.origin = self.moving_since = self.still_since = None
+
+    def start(self):
+        if not self.active:
+            self.active = True
+            self.origin = self.moving_since = self.still_since = None
+
+    def update(self, now, odometry):
+        if not self.active:
+            return False
+        if odometry is None:
+            self.still_since = self.moving_since = None
+            return False
+        x,y,yaw,speed,turn = odometry
+        if self.origin is None:
+            self.origin = (x,y,yaw)
+        if abs(speed)<=.025 and abs(turn)<=.10:
+            self.moving_since=None
+            if self.still_since is None:
+                self.still_since=now
+            if now-self.still_since>=.20:
+                self.active=False
+            return False
+        self.still_since=None
+        if self.moving_since is None:
+            self.moving_since=now
+        elapsed=now-self.moving_since
+        dx,dy,heading=self.origin
+        return (math.hypot(x-dx,y-dy)>=.050 or abs(math.remainder(yaw-heading,2*math.pi))>=.15
+                or (elapsed>=.65 and (abs(speed)>=.075 or abs(turn)>=.30))
+                or elapsed>=1.5)
 
 
 class VelocityLease:

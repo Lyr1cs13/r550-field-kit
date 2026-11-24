@@ -7,6 +7,26 @@ RETREAT_DISTANCE = .20
 RETREAT_SPEED = .05
 
 
+class RouteRetreat:
+    """Allow one escape, then one more only after a verified change of position."""
+    def __init__(self):
+        self.starts = []
+
+    def available(self, pose, *, limit=2):
+        if not self.starts or math.dist(self.starts[0][:2], pose[:2])>limit*RETREAT_DISTANCE+.15:
+            return True
+        x,y,heading=self.starts[-1]
+        dx,dy=pose[0]-x,pose[1]-y
+        c,s=math.cos(heading),math.sin(heading)
+        return (len(self.starts)<limit and -.27<=dx*c+dy*s<=-.15 and abs(-dx*s+dy*c)<=.055
+                and abs(math.remainder(pose[2]-heading,math.tau))<=math.radians(8))
+
+    def record(self, pose):
+        if self.starts and math.dist(self.starts[0][:2],pose[:2])>.55:
+            self.starts.clear()
+        self.starts.append(tuple(pose))
+
+
 def slip_obstruction(anchor, odom_start, odom_end):
     dx,dy=odom_end[0]-odom_start[0],odom_end[1]-odom_start[1]
     c,s=math.cos(odom_start[2]),math.sin(odom_start[2])

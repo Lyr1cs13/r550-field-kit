@@ -59,15 +59,15 @@ def main():
     arrival=config['demo_arrival']['ros__parameters']
     position_tolerance=arrival['final_position_tolerance']
     yaw_tolerance=arrival.get('final_yaw_tolerance',controller['goal_checker']['yaw_goal_tolerance'])
-    controller['controller_plugins']=(['CorridorTrack','CorridorBend','FollowPath'] if args.corridor_only else
-                                      ['FixedHeading'] if args.safety_only else ['FixedHeading','PointPose'])
-    controller['goal_checker_plugins']=(['point_position_checker'] if args.safety_only else
-                                         ['point_position_checker','point_pose_checker'])
-    controller['goal_checker_plugins'].extend(['directed_position_checker','fas_turn_position_checker'])
     if args.corridor_only:
-        controller['goal_checker_plugins'].append('goal_checker')
-    controller['goal_checker_plugin']='goal_checker' if args.corridor_only else 'point_position_checker'
-    controller['point_position_checker']['xy_goal_tolerance']=controller['directed_position_checker']['xy_goal_tolerance']
+        controller['controller_plugins']=['FollowPath','PointPosition','FixedHeading','CorridorTrack','CorridorBend']
+    else:
+        controller['controller_plugins']=(['FixedHeading'] if args.safety_only else ['FixedHeading','PointPose'])
+        controller['goal_checker_plugins']=(['point_position_checker'] if args.safety_only else
+                                             ['point_position_checker','point_pose_checker'])
+        controller['goal_checker_plugins'].extend(['directed_position_checker','fas_turn_position_checker'])
+        controller['goal_checker_plugin']='point_position_checker'
+        controller['point_position_checker']['xy_goal_tolerance']=controller['directed_position_checker']['xy_goal_tolerance']
     local=config['local_costmap']['local_costmap']['ros__parameters']
     local.pop('filters',None)
     local['voxel_layer']['observation_sources']='scan'
@@ -291,6 +291,7 @@ def main():
         from rclpy.executors import SingleThreadedExecutor
         from corridor_ros import CorridorBackend
         from directed_route import angle_error
+        from fas_car import CorridorLease
         from mission import Mission
 
         heading=math.radians(-15)
@@ -299,6 +300,7 @@ def main():
                   charger_approach=dict(p_x=lane_x,p_y=-4.5,orien_z=math.sin(heading/2),orien_w=math.cos(heading/2)))
         state.update(x=lane_x-.45,y=-4.5,a=0.,v=0.,w=0.,allow=None)
         corridor_bridge=CorridorBackend(fixture_grid,dock)
+        corridor_bridge.fas_lease=CorridorLease()
         # The plant publishes the map, TF and pose samples. Controller, planner,
         # smoother and collision checks use their real lifecycle and services.
         for alias in ('amcl','map_server'):
@@ -311,6 +313,8 @@ def main():
 
         def move(name, goal, kind='waypoint', *, reverse=None, obstruct=False):
             begin=time.monotonic();first=len(samples);block=None;released=False
+            if kind=='waypoint':
+                goal={**goal,'fas_station':True}
             identity=corridor_bridge.navigate(goal,kind)
             while time.monotonic()-begin<75.:
                 status=corridor_bridge.operation(identity)
@@ -337,7 +341,8 @@ def main():
                         heading_attempts=arrival_status['heading_attempts'],
                         obstruction_cleared=released,seconds=time.monotonic()-begin)
             results.append(record);print(json.dumps(record,ensure_ascii=False),flush=True)
-            if status['status']!='succeeded' or error>{'departure':.055,'return':.081}.get(kind,.041):
+            limit={'departure':.055,'return':.081}.get(kind,FAS_STATION_POSITION_TOLERANCE+.001)
+            if status['status']!='succeeded' or error>limit:
                 raise AssertionError('position not reached')
             if kind!='departure' and angle>(10.1 if kind=='return' else 4.1):
                 raise AssertionError('heading not reached')
@@ -352,31 +357,39 @@ def main():
         move('corridor_forward_obstacle',dict(x=lane_x,y=-3.48,yaw=math.pi/2),reverse=False,obstruct=True)
         move('corridor_reverse',dict(x=lane_x,y=-3.80,yaw=math.pi/2),reverse=True)
         move('corridor_cross_aisles',dict(x=lane_x+1.,y=-3.45,yaw=math.pi/2))
-        move('corridor_cross_return',dict(x=lane_x,y=-3.95,yaw=math.pi/2))
         with tempfile.TemporaryDirectory() as directory:
             mission=Mission(fixture_grid,corridor_bridge,directory)
             if mission._can_handoff_dock(corridor_bridge.snapshot()):
                 raise AssertionError('dock handoff accepted missing IR')
+            from fas_experiment import sample_box
+            lease=corridor_bridge.fas_lease
+            lease.owner='fixture'
+            approach=corridor_bridge.dock_approach
+            planned=corridor_bridge.preview_route(approach,'return',corridor_bridge.snapshot())
+            if not any(abs(point[1]+3.) < .025 for point in planned):
+                raise AssertionError('return did not preview the aisle connector')
+            epoch='1'*32
+            lease.reserve(epoch,'return',sample_box(planned,pad=.6))
             mission.return_to_dock()
             navigation=mission.operation
             deadline=time.monotonic()+135.
-            approach=corridor_bridge.dock_approach
             while mission.phase not in ('docking','failed') and time.monotonic()<deadline:
+                lease.renew(epoch)
                 step()
                 if math.dist((state['x'],state['y']),(approach['x'],approach['y']))<=.14:
                     state['ir']=2
                 mission.tick()
             run_for(.45)
             controller_id=corridor_bridge.ops[navigation].get('controller_id')
-            if controller_id!='FollowPath' or corridor_bridge.ops[navigation].get('corridor'):
-                raise AssertionError('return did not use the native controller')
+            if controller_id!='CorridorTrack':
+                raise AssertionError('return did not use the aisle controller')
             if mission.phase!='docking' or 1 not in ir_commands:
                 raise AssertionError('native IR handoff was not requested: '+mission.message)
             mission.stop()
             run_for(.6)
             if ir_commands[-1]!=0:
                 raise AssertionError('dock stop did not disable OEM drive')
-        results.append(dict(case='native_return_and_ir_handoff',passed=True,controller=controller_id,
+        results.append(dict(case='aisle_return_and_native_ir_handoff',passed=True,controller=controller_id,
                             map_id=fixture_grid.map_id))
     try:
         run_for(6.)

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>304 双车采集</title>
+<style>
+:root{color-scheme:dark;--bg:#101a24;--surface:#192835;--line:#304656;--text:#eef5f7;--muted:#a8bac8;--a:#50d3ce;--b:#d1aaff;--hit:#8bd7a1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1380px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:18px}h1,h2,p{margin:0}h1{font-size:26px}h2{font-size:15px}a{color:var(--a);text-decoration:none}header a{padding:8px 12px;border:1px solid var(--line);border-radius:8px;white-space:nowrap}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}.card{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px;min-width:0}.card header{margin-bottom:12px}.map{display:block;width:100%;height:min(68vh,630px);background:#12202b;border-radius:8px}.status{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:16px}.status>div{background:var(--surface);padding:12px 16px}.value{display:block;font-variant-numeric:tabular-nums;font-weight:700;font-size:21px}.cars{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:12px}.chip{font-weight:700}.a{color:var(--a)}.b{color:var(--b)}.hit{color:var(--hit)}.table{max-height:52vh;overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:var(--surface);color:var(--muted);font-weight:500}tbody tr:not(:has(td[colspan])){cursor:pointer}tbody tr:hover,tbody tr.selected{background:#263d4b}.activity{min-height:26px;margin:12px 0;font-size:13px}.point{paint-order:stroke;stroke:#f4f6f2;stroke-width:.8;fill:#233b4a;font-size:3.6px;font-weight:bold;text-anchor:middle;dominant-baseline:middle}.car-label{paint-order:stroke;stroke:#132332;stroke-width:1.1;fill:#fff;font-size:5px;font-weight:bold;text-anchor:middle}@media(max-width:840px){main{padding:16px}.grid{grid-template-columns:1fr}.map{height:55vh}.status>div{padding:9px}.value{font-size:16px}}
+button{font:inherit;cursor:pointer;background:#254456;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 11px}button:disabled{opacity:.5;cursor:default}.actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.recent{margin-top:16px}.recent .table{max-height:250px}.legend{font-size:12px;margin-top:8px}
+</style>
+</head>
+<body><main>
+<header><div><h1>304 双车采集</h1><p id="run" class="muted"></p></div><div class="actions"><button id="pause" disabled>暂停采集</button><button id="resume" disabled>断点续采</button><a href="/trials.csv">下载全部试次 CSV</a></div></header>
+<div class="status"><div><span class="muted">当前点位对</span><strong class="value" id="pair">—</strong></div><div><span class="muted">本对有效状态</span><strong class="value" id="progress">—</strong></div><div><span class="muted">命中 / 已扫完无命中</span><strong class="value" id="counts">0 / 0</strong></div></div>
+<div class="grid">
+<section class="card"><header><h2>现场地图</h2><span class="muted" id="map-status"></span></header><svg class="map" id="map" role="img" aria-label="304 实验室底图、采集点及双车位置"></svg><div class="cars"><span id="car-a" class="chip a"></span><span id="car-b" class="chip b"></span></div><p class="legend muted"><span class="hit">●</span> 已访问点位 · A/B 色环为所选点对</p></section>
+<section class="card"><header><div><h2>位置对结果</h2><p class="muted">星闪和 C5 同时满足 A − B ≥ 6 dB</p></div><a href="#" id="follow">跟随当前</a></header>
+<div id="activity" class="activity muted" aria-live="polite"></div><div class="table"><table><thead><tr><th>A / B 点位</th><th>结果</th><th>命中状态</th><th>星闪 / C5</th></tr></thead><tbody id="results"></tbody></table></div></section>
+</div><section class="card recent"><header><h2>最近采集状态</h2><span class="muted" id="control-message" aria-live="polite"></span></header><div class="table"><table><thead><tr><th>A / B 点位</th><th>状态</th><th>结果</th><th>星闪差值</th><th>C5 差值</th></tr></thead><tbody id="recent"></tbody></table></div></section></main>
+<script>
+'use strict';
+const el=id=>document.getElementById(id);
+const phases={idle:'停稳',docked:'桩上',departing:'离桩',settling_departure:'离桩复核',navigating:'导航',settling:'到点确认',dwelling:'停留',completed:'到点',returning:'回充',docking:'贴桩',failed:'任务停止',offline:'离线'};
+const label=id=>id ? String(Number(id.split('-').at(-1))) : '—';
+const key=p=>p?.join('/')||'';
+let meta,data,selected;
+const round=n=>n==null?'—':n.toFixed(2);
+const attempts={pending:'采样中',pass:'命中',miss:'未达标',invalid:'无效样本'};
+const read=async url=>{const r=await fetch(url);if(!r.ok)throw Error(await r.text());return r.json()};
+function render(){
+  const active=data.active;
+  const target=selected || active;
+  const last=data.last;
+  const open=active || null;
+  el('run').textContent=(data.run||'尚未启动')+' · '+({running:'采集中',paused:'已暂停',completed:'已完成',waiting:'等待启动'}[data.status]||data.status);
+  el('pair').textContent=open ? `A ${label(open[0])} / B ${label(open[1])}` : '—';
+  el('progress').textContent=open ? `${data.tested} / ${data.limit}` : '—';
+  el('counts').textContent=`${data.counts?.hit||0} / ${data.counts?.no_hit||0}`;
+  el('pause').disabled=data.status!=='running'||!data.pause_supported;
+  el('resume').disabled=data.status!=='paused';
+  el('activity').textContent=[data.activity,last ? `最近一次 · ${label(last.a)} / ${label(last.b)} · 状态 ${last.state_id} · ${attempts[last.status]||last.status}` : ''].filter(Boolean).join(' · ');
+  el('results').replaceChildren();
+  if (!data.pairs?.length){const td=el('results').insertRow().insertCell();td.colSpan=4;td.textContent='等待首组位置对';}
+  for(const entry of data.pairs||[]){
+    const tr=el('results').insertRow();
+    const pair=[entry.a,entry.b];
+    if(key(pair)===key(target))tr.className='selected';
+    const delta=entry.delta ? JSON.parse(entry.delta) : {};
+    [pair.map(label).join(' / '),{hit:'命中',active:'扫描中',no_hit:'已扫完',incomplete:'部分状态缺样'}[entry.status],entry.state_id??'—',entry.delta ? `${round(delta['sle/main'])} / ${round(delta['c5/main'])} dB` : '—'].forEach((v,i)=>{const td=tr.insertCell();td.textContent=v;if(i===1&&entry.status==='hit')td.className='hit'});
+    tr.addEventListener('click',()=>{selected=pair;render()});
+  }
+  for(const name of ['A','B']){
+    const car=data.cars[name];
+    el('car-'+name.toLowerCase()).textContent=`${name} 车 · ${car.charging?'充电':(phases[car.phase]||car.phase)}${car.voltage==null?'':` · ${car.voltage.toFixed(2)} V`}`;
+  }
+  el('recent').replaceChildren();
+  for(const row of data.recent||[]){
+    const tr=el('recent').insertRow();
+    const delta=row.delta ? JSON.parse(row.delta):{};
+    [[row.a,row.b].map(label).join(' / '),row.state_id,attempts[row.status],round(delta['sle/main']),round(delta['c5/main'])]
+      .forEach(value=>{tr.insertCell().textContent=value});
+    tr.addEventListener('click',()=>{selected=[row.a,row.b];render()});
+  }
+  if(!data.recent?.length){const td=el('recent').insertRow().insertCell();td.colSpan=5;td.textContent='暂无正式采集试次';}
+  draw(target);
+}
+function draw(pair){
+  if(!meta)return;
+  const pos=([x,y])=>[(meta.max_y-y)/meta.resolution,(meta.max_x-x)/meta.resolution];
+  const svg=el('map');
+  svg.setAttribute('viewBox',`0 0 ${meta.height} ${meta.width}`);
+  const points=new Map(data.points.map(p=>[p.id,pos([p.x,p.y])]));
+  const colors=['#50d3ce','#d1aaff'];
+  const visited=new Set((data.pairs||[]).flatMap(p=>[p.a,p.b]));
+  const shapes=[...points].map(([id,[x,y]])=>`${visited.has(id)?`<circle cx="${x}" cy="${y}" r="3" fill="#8bd7a1"/>`:''}<text class="point" x="${x}" y="${y}">${label(id)}</text>`);
+  if(pair)pair.forEach((id,i)=>{
+    const xy=points.get(id);if(!xy)return;
+    const [x,y]=xy;shapes.push(`<circle cx="${x}" cy="${y}" r="4.2" fill="none" stroke="${colors[i]}" stroke-width="1.1"/><text class="car-label" x="${x}" y="${y-5}">${i?'B':'A'} · ${label(id)}</text>`);
+  });
+  ['A','B'].forEach((name,i)=>{
+    const pose=data.cars[name].pose;if(!pose)return;
+    const [x,y]=pos(pose),yaw=-pose[2]*180/Math.PI;
+    shapes.push(`<path d="M0 -3.2 L2.4 2.2 L-2.4 2.2 Z" fill="${colors[i]}" stroke="#112534" stroke-width="0.7" transform="translate(${x} ${y}) rotate(${yaw})"/>`);
+  });
+  const image=svg.querySelector('image');
+  if(!image)svg.innerHTML=`<image href="/map.png" width="${meta.height}" height="${meta.width}" image-rendering="pixelated"/><g></g>`;
+  svg.querySelector('g').innerHTML=shapes.join('');
+}
+el('follow').addEventListener('click',event=>{event.preventDefault();selected=null;if(data)render()});
+async function control(action){
+  if(action==='resume'&&!confirm('确认通道可通行，允许两车从当前进度续采并发车？'))return;
+  const button=el(action);button.disabled=true;
+  try {
+    const response=await fetch('/api/'+action,{method:'POST',headers:{'X-Dashboard-Token':data.control_token}});
+    if(!response.ok)throw Error(await response.text());
+    el('control-message').textContent=action==='pause'?'已请求停稳和关窗':'正在核对定位、设备和控制权';
+  } catch(error){el('control-message').textContent=error.message;button.disabled=false}
+}
+el('pause').addEventListener('click',()=>control('pause'));
+el('resume').addEventListener('click',()=>control('resume'));
+async function poll(){
+  try {data=await read('/api/progress');if(!meta)meta=await read('/api/map');el('map-status').textContent='实时更新';render()}
+  catch(err){el('map-status').textContent='数据暂时不可用';el('activity').textContent=err.message}
+  setTimeout(poll,2600);
+}
+poll();
+</script></body></html>

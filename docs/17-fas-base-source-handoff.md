@@ -38,3 +38,5 @@ python3 application/samples/custom/sle_rssi_dual_server/tools/build_roles.py CLI
 ```
 
 主机需要 Python 和 `pyserial`。在源码包根目录运行 `python -m unittest discover -s demo/tests -p test_fas_base.py`，可离线核对单窗、取消、重复请求及重启恢复。实际板卡验收先让两车停在原地，确认基站能分辨 A/B，再测状态 200、201 和取消后重采。
+
+基站关窗回执超时会保留原始日志并标记该窗无效。基站自动重开两路串口，重新确认 WS63 停止和 C5 会话关闭后开放采样。主控在此期间保留断点，等待旧窗口关闭后重采。

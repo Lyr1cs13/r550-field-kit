@@ -1,10 +1,12 @@
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from threading import Barrier, Thread
 from unittest import TestCase
+from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
-from fas_base import Canceled, Station, WS_IDS, c5_word
+from fas_base import Canceled, SERIAL_CLOSE_FAULT, Station, WS_IDS, c5_word
 
 
 class Receiver:
@@ -57,7 +59,7 @@ class Receiver:
             yield f'RF_STATE,state={self.state},valid=1,count_a=10,sum_a=-600,count_b=10,sum_b=-660'
             yield f'WS_STATUS,running=0,node={self.state},attempt=1,source=one_shot_done'
         else:
-            for epoch in range(22):
+            for epoch in range(52):
                 for suffix,rssi in (('01',-61),('02',-68)):
                     yield f'C,{epoch},02:00:00:00:00:{suffix},{rssi},{self.state},AAAA'
 
@@ -83,8 +85,35 @@ class BaseStationTests(TestCase):
                 self.assertEqual(record['status'],'complete',record)
                 self.assertEqual(record['data']['sle/main']['rssi_dbm'],{'A':-60.,'B':-66.})
                 self.assertEqual(record['data']['c5/main']['rssi_dbm'],{'A':-61.,'B':-68.})
+                self.assertEqual(record['data']['c5/main']['samples'],{'A':20,'B':20})
                 self.assertEqual(station.start(query),record)
             self.assertEqual([x for x in ws.commands if x.startswith('WSONCE')],['WSONCE,200,205,5','WSONCE,201,205,5'])
+            separate=request('separate_202',202)
+            with self.assertRaises(ValueError):
+                station.start(dict(separate,c5_window_s=.1))
+            station.start(dict(separate,window_s=.5,c5_window_s=.4))
+            self.assertTrue(station.done.wait(2.))
+            self.assertIn('WSONCE,202,505,5',ws.commands)
+            self.assertEqual(station.receipt('separate_202')['data']['c5/main']['samples'],{'A':40,'B':40})
+            parallel=request('parallel_202',202)
+            rendezvous=Barrier(2)
+            ws_lines,c5_lines=ws.lines,c5.lines
+
+            def together(lines):
+                def read(deadline,cancel):
+                    rendezvous.wait(1.)
+                    yield from lines(deadline,cancel)
+                return read
+
+            ws.lines,c5.lines=together(ws_lines),together(c5_lines)
+            try:
+                station.start(dict(parallel,parallel_radios=True))
+                self.assertTrue(station.done.wait(2.))
+                record=station.receipt('parallel_202')
+                self.assertEqual(record['status'],'complete',record)
+                self.assertEqual(set(record['data']),{'sle/main','c5/main'})
+            finally:
+                ws.lines,c5.lines=ws_lines,c5_lines
             partial=path/'partial'
             partial.mkdir()
             station.save(partial/'receipt.json',dict(request('partial',202),status='running'))
@@ -114,3 +143,62 @@ class BaseStationTests(TestCase):
     def test_mapping_preserves_main_card_as_fast_axis(self):
         self.assertEqual([c5_word(n) for n in (0,1,64,4095)],[0,65,65<<12,0xffffff])
         self.assertEqual(len({c5_word(n) for n in range(4096)}),4096)
+
+    def test_serial_recovery_requires_confirmed_close_on_both_radios(self):
+        with TemporaryDirectory() as directory:
+            ws,c5=Receiver('ws'),Receiver('c5')
+            station=Station(ws,c5,Path(directory),{})
+            station.fault=SERIAL_CLOSE_FAULT
+            c5.session='fas_abandoned'
+            ws.reconnect=lambda:ws.commands.append('reconnect')
+            c5.reconnect=lambda:c5.commands.append('reconnect')
+            with patch.object(station.closing,'wait',return_value=False):
+                station.recover_ports()
+            self.assertEqual(ws.commands,['reconnect','WSSTOP'])
+            self.assertEqual(c5.commands,['reconnect','SESSIONSTATUS','SESSIONSTOP,fas_abandoned'])
+            self.assertIsNone(station.fault)
+
+    def test_waited_receipt_is_visible_after_capture_signals_completion(self):
+        with TemporaryDirectory() as directory:
+            folder=Path(directory)
+            station=Station(Receiver('ws'),Receiver('c5'),folder,{})
+            trial=folder/'trial'
+            trial.mkdir()
+            path=trial/'receipt.json'
+            station.save(path,{'status':'running'})
+            station.active=('run','trial')
+            station.done.clear()
+            worker=Thread(target=lambda: self.finish_receipt(station,path))
+            worker.start()
+            try:
+                self.assertEqual(station.wait_receipt('trial',.5),{'status':'complete'})
+            finally:
+                worker.join()
+
+    @staticmethod
+    def finish_receipt(station,path):
+        with station.lock:
+            station.save(path,{'status':'complete'})
+            station.active=None
+            station.done.set()
+
+    def test_temporary_file_sharing_conflicts_retry_atomic_receipt_replace(self):
+        with TemporaryDirectory() as directory:
+            folder=Path(directory)
+            station=Station(Receiver('ws'),Receiver('c5'),folder,{})
+            trial=folder/'trial'
+            trial.mkdir()
+            path=trial/'receipt.json'
+            original=Path.replace
+            attempts=[]
+
+            def replace(source,destination):
+                attempts.append(destination)
+                if len(attempts)==1:
+                    raise PermissionError('file in use')
+                return original(source,destination)
+
+            with patch.object(Path,'replace',replace):
+                station.save(path,{'status':'complete'})
+            self.assertEqual(attempts,[path,path])
+            self.assertEqual(station.receipt('trial'),{'status':'complete'})

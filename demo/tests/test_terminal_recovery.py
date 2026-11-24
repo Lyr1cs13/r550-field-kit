@@ -11,6 +11,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(importlib.util.find_spec('rclpy'), 'Requires ROS message types')
 class RecoveryTests(unittest.TestCase):
+    def test_fas_corridor_arrival_hands_off_the_same_goal_for_stopped_refinement(self):
+        from corridor_ros import CorridorBackend
+
+        backend = CorridorBackend.__new__(CorridorBackend)
+        backend.pose = (.01, .02, .4)
+        target = dict(x=0., y=0., yaw=0.)
+        op = dict(corridor=True, fas_station=True, goal=target, status='corridor_stopped')
+        backend.finish_corridor_goal(op)
+
+        self.assertIs(op['goal'], target)
+        self.assertFalse(op['corridor'])
+        self.assertEqual(op['status'], 'position_settling')
+        self.assertEqual(backend.path, [[.01, .02]])
+
+    def test_terminal_spin_learning_remains_eligible_after_turns_in_transit(self):
+        from unittest.mock import Mock, patch
+        from ros_backend import RosBackend
+
+        now = time.monotonic()
+        backend = SimpleNamespace(pose=(0., 0., 0.), gyro=(now, 12., .001), rest_gyro=[],
+                                  encoders=(0., 0.), confirmed=True, active='move',
+                                  snapshot=lambda: {'stationary': True, 'ready': True},
+                                  spin_action=Mock(), spin_accepted=Mock())
+        op = dict(heading_attempts=3)
+        with patch('ros_backend.scan_confirmed', return_value=True):
+            RosBackend.start_fas_spin(backend, op, .6, 'heading_settling')
+            self.assertTrue(op['learn_terminal_turn'])
+            op['first_terminal_turn'] = op['last_turn'].copy()
+            RosBackend.start_fas_spin(backend, op, .6, 'heading_settling')
+            self.assertFalse(op['learn_terminal_turn'])
+
     def test_first_terminal_measurement_survives_pre_turn_and_a_second_adjustment(self):
         from ros_backend import record_stopped_turn
         op=dict(turn_origin=(0.,0.,0.),last_turn={'stage':'line_settling'})

@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guarded_retreat import GuardedRetreat, rear_is_clear
+from guarded_retreat import GuardedRetreat, RouteRetreat, rear_is_clear
 
 
 class GuardedRetreatTests(unittest.TestCase):
@@ -47,3 +47,17 @@ class GuardedRetreatTests(unittest.TestCase):
         r.reset();r.tick(0.,self.rear,still)
         self.assertEqual(r.tick(2.1,self.rear,still),0.)
         self.assertEqual(r.status,'stalled')
+
+    def test_route_recovery_only_allows_a_second_segment_after_verified_reverse_progress(self):
+        history=RouteRetreat()
+        start=(0.,0.,math.pi/2)
+        self.assertTrue(history.available(start))
+        history.record(start)
+        self.assertFalse(history.available(start))
+        self.assertFalse(history.available((0.,-.10,math.pi/2)))
+        self.assertFalse(history.available((.10,-.20,math.pi/2)))
+        second=(.01,-.20,math.pi/2)
+        self.assertTrue(history.available(second))
+        history.record(second)
+        self.assertFalse(history.available((.01,-.40,math.pi/2)))
+        self.assertTrue(history.available((.01,-.60,math.pi/2)))
