@@ -3,11 +3,14 @@
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import closing
+from functools import partial
 from http.client import IncompleteRead
 import json
 import math
 from pathlib import Path
 from statistics import median
+import sqlite3
 import sys
 import time
 from urllib.error import HTTPError, URLError
@@ -62,14 +65,56 @@ class PauseRequested(Exception):
     pass
 
 
+def recorded_charge_plateau(database, car, origin, floor, *, now=None):
+    """Check the current dock session for a long plateau under the vehicle's normal load."""
+    now=time.time() if now is None else now
+    start=now-24*60
+    if start-origin<60.:
+        return None
+    try:
+        with closing(sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True,timeout=.25)) as db:
+            peak=db.execute("""
+                SELECT MAX(amps) FROM (
+                    SELECT MIN(current) AS amps FROM samples
+                    WHERE car=? AND stamp BETWEEN ? AND ? AND mode='charging'
+                      AND ABS(charge_start-?)<=3 AND current>=0
+                    GROUP BY CAST((stamp-?)/60 AS INTEGER)
+                    HAVING COUNT(*)>=10 AND MAX(stamp)-MIN(stamp)>=50
+                )""",(car,origin-3.,start,origin,origin)).fetchone()[0]
+            rows=db.execute("""SELECT stamp,mode,charge_start,voltage,current FROM samples
+                               WHERE car=? AND stamp BETWEEN ? AND ? ORDER BY stamp""",
+                            (car,start,now)).fetchall()
+    except (OSError,sqlite3.Error):
+        return None
+    if (peak is None or not math.isfinite(peak) or peak<.90 or not rows or rows[0][0]-start>8. or now-rows[-1][0]>8.
+            or any(b[0]-a[0]>12. for a,b in zip(rows,rows[1:]))):
+        return None
+    if any(mode!='charging' or any(v is None or not math.isfinite(v) for v in (since,voltage,amps))
+           or abs(since-origin)>3. or amps<0. for _,mode,since,voltage,amps in rows):
+        return None
+    quarters=[[] for _ in range(4)]
+    for row in rows:
+        quarters[min(3,int((row[0]-start)//360))].append(row)
+    if any(len(group)<60 for group in quarters):
+        return None
+    levels=[median(row[3] for row in group) for group in quarters]
+    currents=[median(row[4] for row in group) for group in quarters]
+    limit=.65*peak
+    if (min(levels)<floor or max(levels)-min(levels)>.012 or abs(levels[-1]-levels[0])>.006
+            or max(currents)>limit or max(currents)-min(currents)>.09):
+        return None
+    return levels[-1],limit
+
+
 class ChargePlateau:
     """Qualify a near-full charge using voltage, current, and the verified seat."""
     TAPER_WINDOW = 120.
     TAPER_CURRENT = .55
 
-    def __init__(self, near_full=None, bulk_charge_start=None):
+    def __init__(self, near_full=None, bulk_charge_start=None, recorded_check=None):
         self.samples = deque()
         self.near_full = near_full
+        self.recorded_check = recorded_check
         self.window = 240. if near_full is None else 360.
         self.reset(bulk_charge_start)
 
@@ -83,6 +128,8 @@ class ChargePlateau:
         self.ready_elapsed = 0.
         self.bulk_since = None
         self.bulk_charge_start = bulk_charge_start
+        self.last_recorded_check = float('-inf')
+        self.recorded_tail = None
 
     def observe(self, now, health, floor, target=12.2, *, wall_stamp=None):
         voltage = health['voltage']
@@ -146,6 +193,15 @@ class ChargePlateau:
             if flat and (self.near_full is None or min(levels)>=target-.005 or
                          (self.bulk_charge_start is not None and self.tapered(self.samples))):
                 self.qualify(health,voltage,elapsed,'达到续采下限并通过电压平台复核')
+            elif flat and self.recorded_check and self.bulk_charge_start is not None:
+                if now-self.last_recorded_check>=30.:
+                    self.recorded_tail=self.recorded_check(self.bulk_charge_start,floor)
+                    self.last_recorded_check=now
+                if self.recorded_tail:
+                    level,limit=self.recorded_tail
+                    if (abs(voltage-level)<=.020 and isinstance(current,(int,float))
+                            and 0. <= current <= limit+.06):
+                        self.qualify(health,voltage,elapsed,'本轮电流已明显回落，连续 24 分钟电压稳定')
 
     def tapered(self, rows):
         currents=[i for _,_,_,i in rows if isinstance(i,(int,float)) and math.isfinite(i) and i>=0.]
@@ -249,7 +305,8 @@ class Base:
 
 
 class Live:
-    def __init__(self, settings, config_dir, stations, journal, links, receivers, *, motion_only=False, pause_file=None):
+    def __init__(self, settings, config_dir, stations, journal, links, receivers, *, motion_only=False, pause_file=None,
+                 energy_history=None):
         self.stations, self.journal, self.links = stations,journal,links
         self.cars = {car:Endpoint(settings['cars'][car]) for car in CARS}
         if len({value.url for value in self.cars.values()}) != 2:
@@ -284,8 +341,11 @@ class Live:
                 raise ValueError('实验电压配置必须为按 A/B 车提供的有限数值')
         if near_full and (set(near_full)!=set(CARS) or not plateau or motion_only):
             raise ValueError('接近充足电压须在双车采集的电压平台模式下同时为 A/B 配置')
-        self.charge_plateaus = {car:ChargePlateau(near_full.get(car),journal.bulk_charge_start(car))
-                                for car in CARS} if plateau and not motion_only else {}
+        self.charge_plateaus = {}
+        if plateau and not motion_only:
+            for car in CARS:
+                check=partial(recorded_charge_plateau,energy_history,car) if energy_history and car in near_full else None
+                self.charge_plateaus[car]=ChargePlateau(near_full.get(car),journal.bulk_charge_start(car),check)
         if self.resume_min_charge_seconds is not None and (not plateau or
                 type(self.resume_min_charge_seconds) not in (int,float) or
                 not math.isfinite(self.resume_min_charge_seconds) or self.resume_min_charge_seconds<300.):
@@ -1606,6 +1666,7 @@ def main():
     parser.add_argument('--c5-window-s',type=float,help='Override the C5 window in seconds for a new radio experiment')
     parser.add_argument('--parallel-radios',action='store_true',help='Run the WS63 and C5 receive windows concurrently')
     parser.add_argument('--live-config',type=Path,help='Explicitly enable physical control with this configuration')
+    parser.add_argument('--energy-history',type=Path,help='Read the local energy recorder for extended charge plateaus')
     parser.add_argument('--motion-only',action='store_true',help='Visit ordered position pairs without a radio or base station')
     parser.add_argument('--unattended',action='store_true',help='Keep a live motion rehearsal running until explicitly stopped')
     parser.add_argument('--recharge-after',type=int,help='Request one real charge-and-resume after this many verified motion rounds')
@@ -1689,7 +1750,7 @@ def main():
             record_config['resume_voltage_by_car']=config['resume_voltage_by_car']
     journal=Journal(args.journal,record_config)
     driver=(Live(config,args.live_config.parent,stations,journal,links,receivers,
-                 motion_only=args.motion_only,pause_file=args.pause_file) if args.live_config
+                 motion_only=args.motion_only,pause_file=args.pause_file,energy_history=args.energy_history) if args.live_config
             else Rehearsal(stations,receivers))
     try:
         if args.live_config:

@@ -76,6 +76,7 @@ def main(choice=None, *, early_launch_voltage=None, expected_run=None):
     pause.unlink(missing_ok=True)
     args = [sys.executable, '-u', str(kit/'tools/fas_experiment.py'), '--route', str(route),
             '--station-count',str(point_count), '--journal',str(journal), '--live-config',str(config_path),
+            '--energy-history',str(field/'energy-history.sqlite'),
             '--pair-first','--start','0','--count','4096','--max-pairs','0','--min-samples','30','--window-s','2']
     release_args=[*args,'--release']
     if early_launch_voltage is not None:

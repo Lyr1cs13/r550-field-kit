@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 from random import Random
+import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -624,6 +625,53 @@ class MotionSimulationTests(TestCase):
                 self.assertIsNone(reopened.bulk_charge_start('A'))
             finally:
                 reopened.close()
+
+    def test_long_charge_plateau_uses_same_car_sustained_bulk_and_continuous_tail(self):
+        start=100000.
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'energy.sqlite'
+            db=sqlite3.connect(path)
+            try:
+                db.execute('CREATE TABLE samples(car,stamp,mode,charge_start,voltage,current,PRIMARY KEY(car,stamp))')
+                for c in 'AB':
+                    rows=[]
+                    for t in range(0,3601,5):
+                        voltage=11.67+.002*(t%10==0)
+                        if c=='B':
+                            voltage+=.00004*t
+                        amps=1.56 if t<1600 else .93
+                        rows.append((c,start+t,'charging',start,voltage,amps))
+                    db.executemany('INSERT INTO samples VALUES (?,?,?,?,?,?)',rows)
+                db.commit()
+                def read(car,origin,floor):
+                    return self.host.recorded_charge_plateau(path,car,origin,floor,now=start+3600.)
+
+                self.assertIsNotNone(read('A',start,11.4))
+                self.assertIsNone(read('B',start,11.4))
+                self.assertIsNone(read('A',start+60.,11.4))
+                self.assertIsNone(read('A',start,11.8))
+                health=dict(stationary=True,charging_stable=True,localization_confirmed=True,
+                            dock_localization={'status':'confirmed'},voltage=11.67,current=.93)
+                window=self.host.ChargePlateau(12.1,start,lambda origin,floor:read('A',origin,floor))
+                for t in range(0,361,5):
+                    health['charging_elapsed_s']=3240.+t
+                    window.observe(t,health,11.4,wall_stamp=start+3240.+t)
+                    self.assertEqual(window.ready,t==360)
+                self.assertIn('24',window.reason)
+                db.execute("UPDATE samples SET current=1.40 WHERE car='A' AND stamp>=?",(start+2000,))
+                db.commit()
+                self.assertIsNone(read('A',start,11.4))
+                db.execute("UPDATE samples SET current=.93 WHERE car='A' AND stamp>=?",(start+2000,))
+                db.execute("UPDATE samples SET mode='unknown' WHERE car='A' AND stamp=?",(start+3500,))
+                db.commit()
+                self.assertIsNone(read('A',start,11.4))
+                db.execute("UPDATE samples SET mode='charging' WHERE car='A' AND stamp=?",(start+3500,))
+                db.execute("UPDATE samples SET current=.97 WHERE car='A' AND stamp<?",(start+2000,))
+                db.execute("UPDATE samples SET current=1.62 WHERE car='A' AND stamp=?",(start+300,))
+                db.commit()
+                self.assertIsNone(read('A',start,11.4))
+            finally:
+                db.close()
 
     def test_short_return_needs_a_recent_clear_plan_and_keeps_fast_low_voltage_trigger(self):
         driver=self.driver((0.,2.),{'a':0.,'b':2.})
