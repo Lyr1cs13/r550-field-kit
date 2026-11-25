@@ -13,6 +13,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(importlib.util.find_spec('rclpy'), 'Requires ROS message types')
 class StopFeedbackTests(unittest.TestCase):
+    def test_wheel_messages_cannot_refresh_brake_evidence_by_repeating_an_old_stamp(self):
+        from motion_gate import MotionGate
+        from nav_msgs.msg import Odometry
+        clock=SimpleNamespace(nanoseconds=10_000_000_000)
+        gate=SimpleNamespace(wheel_stamp_ns=None,last_retreat_odom=-math.inf,retreat_odom=None,
+                             get_clock=lambda:SimpleNamespace(now=lambda:clock))
+        wheel=Odometry()
+        wheel.header.stamp.sec=10
+        with patch('motion_gate.time.monotonic',side_effect=[1.,1.10,1.18,1.60,1.65]):
+            MotionGate.odom(gate,wheel)
+            for stamp,expected in ((10_100_000_000,1.),(10_180_000_000,1.),(10_600_000_000,1.)):
+                clock.nanoseconds=stamp
+                MotionGate.odom(gate,wheel)
+                self.assertEqual(gate.last_retreat_odom,expected)
+            wheel.header.stamp.nanosec=640_000_000
+            clock.nanoseconds=10_650_000_000
+            MotionGate.odom(gate,wheel)
+            self.assertAlmostEqual(gate.last_retreat_odom,1.64)
+
     def test_blocked_reference_replans_the_same_goal_with_native_navigation(self):
         from corridor_ros import CorridorBackend
         from ros_backend import RosBackend
@@ -100,6 +119,34 @@ class StopFeedbackTests(unittest.TestCase):
                 MotionGate.tick(gate)
             self.assertEqual(gate.output.publish.call_args.args[0].linear.x,0.)
             self.assertEqual(gate.ir_disable.publish.call_args.args[0].data,0)
+
+    def test_brake_review_blocks_new_drive_and_requires_fresh_permission_after_rest(self):
+        from motion_gate import MotionGate
+        from motion_health import NativeStopFeedback, OemLease, StopFeedback, VelocityLease
+        with tempfile.TemporaryDirectory() as directory:
+            gate=SimpleNamespace(alive=Mock(),output=Mock(),ir_disable=Mock(),retreat_status=Mock(),
+                lease=VelocityLease(),oem=OemLease(),disable_burst=0,retreat_identity='',
+                retreat_lease=-math.inf,last_scan=0.,last_tick=0.,last_motion=0.,
+                retreat=SimpleNamespace(status='idle'),last_linear=.045,hold_file=Path(directory)/'hold',
+                departure_order=None,stop_feedback=StopFeedback(),native_stop=NativeStopFeedback(),
+                get_logger=Mock(),scan_in_base=lambda:[(1.,0.)]*12,dock_motion_clear=lambda _:True,
+                turn_clear_for_braking=lambda _:True,travel_clear_for_braking=lambda *_:True,dock_departure=-math.inf)
+            gate.stop_feedback.still_moving(0.,(.045,0.,.08),(0.,0.,0.,.038,.068))
+            for i in range(1,25):
+                t=i*.05
+                gate.last_scan=gate.last_retreat_odom=t
+                moving=t<.85
+                gate.retreat_odom=(.038*min(t,.85),0.,.068*min(t,.85),.038 if moving else 0.,.068 if moving else 0.)
+                if i==16:
+                    self.assertTrue(gate.stop_feedback.reviewing)
+                    gate.lease.receive_command(t,(.045,0.,0.))
+                    gate.lease.receive_permit(t,True)
+                with patch('motion_gate.time.monotonic',return_value=t):
+                    MotionGate.tick(gate)
+                self.assertFalse(gate.hold_file.exists())
+                self.assertEqual(gate.output.publish.call_args.args[0].linear.x,0.)
+            self.assertFalse(gate.stop_feedback.reviewing)
+            self.assertFalse(gate.lease.permitted)
 
     def test_dock_contact_inhibits_navigation_without_persistent_lock(self):
         from ros_backend import RosBackend

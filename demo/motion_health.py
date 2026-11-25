@@ -164,11 +164,26 @@ class StopFeedback:
         self.since = None
         self.origin = None
         self.initial_linear_speed = 0.
+        self.last_drive = None
+        self.cut_rates = (0., 0.)
+        self.brake_pose = None
+        self.brake_distance = self.brake_yaw = 0.
+        self.reviewing = False
+        self.quiet_since = self.quiet_stamp = None
+
+    def track_braking(self, odometry):
+        self.brake_distance += math.dist(odometry[:2],self.brake_pose[:2])
+        self.brake_yaw += abs(math.remainder(odometry[2]-self.brake_pose[2],2*math.pi))
+        self.brake_pose = odometry[:3]
 
     def still_moving(self, now, command, odometry, turn_clear=lambda: False, travel_clear=lambda: False):
         if any(command):
             self.last_turn = (now, command[2]) if abs(command[0]) < .01 and command[2] else None
             self.last_travel = (now, command[0]) if abs(command[0]) >= .025 else None
+            if abs(command[0]) >= .008 or abs(command[2]) >= .035:
+                self.last_drive = (now, command[0], command[2])
+        elif odometry is None or (abs(odometry[3]) <= .008 and abs(odometry[4]) <= .035):
+            self.last_drive = None
         if any(command) or odometry is None or (abs(odometry[3]) <= .025 and abs(odometry[4]) <= .10):
             self.since = self.origin = None
             return False
@@ -177,6 +192,10 @@ class StopFeedback:
             self.since = now
             self.origin = odometry[:3]
             self.initial_linear_speed = abs(odometry[3])
+            self.cut_rates = odometry[3:]
+            self.brake_pose = self.origin
+            self.brake_distance = self.brake_yaw = 0.
+        self.track_braking(odometry)
         if now-self.since < .65:
             return False
         linear_speed, yaw_rate = odometry[3:]
@@ -193,6 +212,45 @@ class StopFeedback:
                     and slowing and abs(yaw_rate) <= .12
                     and math.dist(odometry[:2],self.origin[:2]) < grace_distance
                     and abs(math.remainder(odometry[2]-self.origin[2],2*math.pi)) < .06 and travel_clear())
+
+    def requires_lock(self, now, command, odometry, stamp, turn_clear, travel_clear):
+        """Keep a small braking tail at zero until distinct wheel frames prove rest."""
+        if not self.reviewing:
+            if not self.still_moving(now,command,odometry,turn_clear,travel_clear):
+                return False
+            if self.last_drive is None or not 0. <= self.since-self.last_drive[0] <= .30:
+                return True
+        if odometry is None or not 0. <= now-stamp <= .15:
+            self.quiet_since = self.quiet_stamp = None
+            self.reviewing = True
+            return False
+        if self.reviewing:
+            self.track_braking(odometry)
+        speed,turn = odometry[3:]
+        # A near-zero translation during a pivot can have either sign. Check the
+        # direction of every significant component against the last drive and cut.
+        for value,requested,measured,limit in zip((speed,turn),self.last_drive[1:],self.cut_rates,(.025,.10)):
+            if abs(value)>limit and (value*measured<=0. or (abs(requested)>limit and value*requested<0.)):
+                return True
+        if (abs(speed)>.050 or abs(turn)>.16 or self.brake_distance>=.045
+                or self.brake_yaw>=math.radians(8)
+                or not travel_clear()):
+            return True
+        if abs(speed)>.008 or abs(turn)>.035:
+            self.quiet_since = self.quiet_stamp = None
+            if now-self.since >= 1.50:
+                return True
+        elif self.quiet_stamp != stamp:
+            if self.quiet_stamp is None or not 0. < stamp-self.quiet_stamp <= .16:
+                self.quiet_since = stamp
+            self.quiet_stamp = stamp
+            if stamp-self.quiet_since >= .30:
+                self.reviewing = False
+                self.last_drive = self.last_turn = self.last_travel = None
+                self.since = self.origin = self.quiet_since = self.quiet_stamp = None
+                return False
+        self.reviewing = True
+        return False
 
 
 class NativeStopFeedback:

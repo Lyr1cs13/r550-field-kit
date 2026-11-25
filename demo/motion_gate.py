@@ -53,6 +53,7 @@ class MotionGate(Node):
         echo=vehicle.get('antenna_filter',{}).get('retreat_echo')
         self.retreat=GuardedRetreat(echo);self.retreat_lease=-math.inf;self.retreat_identity=''
         self.retreat_scan=None;self.retreat_odom=None;self.last_retreat_odom=-math.inf
+        self.wheel_stamp_ns=None
         self.tf=Buffer();self.listener=TransformListener(self.tf,self)
         self.output = self.create_publisher(Twist, '/cmd_vel', 1)
         self.alive = self.create_publisher(Bool, '/navigation_gate_alive', 1)
@@ -112,10 +113,18 @@ class MotionGate(Node):
         self.retreat_lease=time.monotonic() if msg.data else -math.inf
 
     def odom(self, msg):
+        now=time.monotonic()
+        stamp=msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
+        age=(self.get_clock().now().nanoseconds-stamp)*1e-9
+        if not -.05<=age<=.25 or stamp==self.wheel_stamp_ns:
+            return
+        if self.wheel_stamp_ns is not None and stamp<self.wheel_stamp_ns and now-self.last_retreat_odom<=.25:
+            return
         p=msg.pose.pose;t=msg.twist.twist
         values=(p.position.x,p.position.y,yaw(p.orientation),t.linear.x,t.angular.z)
         self.retreat_odom=values if all(math.isfinite(v) for v in values) else None
-        self.last_retreat_odom=time.monotonic()
+        self.wheel_stamp_ns=stamp
+        self.last_retreat_odom=now-max(age,0.)
 
     def oem_state(self,msg):
         now=time.monotonic()
@@ -165,9 +174,11 @@ class MotionGate(Node):
         self.alive.publish(Bool(data=True))
         now=time.monotonic();v = self.lease.output(now)
         dt=min(.12,now-self.last_tick);self.last_tick=now
-        retreating=now-self.retreat_lease<=.20
+        reviewing=self.stop_feedback.reviewing
+        if reviewing:v=(0.,0.,0.)
+        retreating=not reviewing and now-self.retreat_lease<=.20
         order=self.departure_order
-        departing=order is not None and now-order[0]<=.18
+        departing=not reviewing and order is not None and now-order[0]<=.18
         fresh=now-self.last_retreat_odom<=.25 and self.retreat_odom is not None
         if retreating:
             if self.oem.active or self.disable_burst or self.native_stop.active or any(v) or departing:
@@ -212,17 +223,32 @@ class MotionGate(Node):
         # An accepted cancellation says nothing about the wheels. Keep braking
         # until chassis feedback settles, even if the velocity source is gone.
         native_braking=self.native_stop.active
-        feedback=self.retreat_odom if fresh and (native_braking or not self.oem.active) else None
-        if native_braking:
+        feedback=self.retreat_odom if fresh and (reviewing or native_braking or not self.oem.active) else None
+        if self.hold_file.exists() or reviewing:
+            v=(0.,0.,0.)
+        if native_braking and not reviewing:
             if not disabling_oem:
                 self.ir_disable.publish(Int8(data=0))
             v=(0.,0.,0.)
             persistent=self.native_stop.update(now,feedback)
             self.stop_feedback.still_moving(now,v,None)
         else:
-            persistent=self.stop_feedback.still_moving(
-                now,v,feedback,lambda: self.turn_clear_for_braking(now),
+            persistent=self.stop_feedback.requires_lock(
+                now,v,feedback,self.last_retreat_odom,lambda: self.turn_clear_for_braking(now),
                 lambda: self.travel_clear_for_braking(now,feedback))
+        if reviewing or self.stop_feedback.reviewing:
+            v=(0.,0.,0.)
+            self.lease.receive_permit(now,False)
+            self.lease.receive_command(now,v)
+            self.departure_order=None
+            self.retreat_lease=-math.inf
+            self.ir_disable.publish(Int8(data=0))
+            if self.oem.receive(now,False):
+                self.native_stop.start()
+            if not reviewing:
+                self.get_logger().info('小幅刹停余动，保持零速并复核轮速')
+            elif not self.stop_feedback.reviewing and not self.hold_file.exists():
+                self.get_logger().info('刹停复核已停稳，等待新的行驶许可')
         self.last_linear=v[0]
         if persistent and not self.hold_file.exists():
             self.hold_file.parent.mkdir(parents=True,exist_ok=True)

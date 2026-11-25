@@ -86,6 +86,52 @@ class StopFeedbackTests(unittest.TestCase):
                 self.assertEqual(stops.still_moving(.85, (0., 0., 0.), (.052, 0., .01, .036, .017),
                                                     travel_clear=lambda: True), expect_lock)
 
+    def test_two_observed_wheel_rates_wait_for_fresh_rest_without_latching(self):
+        for cmd,speed,rate in (((.045,0.,.08),.038,.068),((-.03,0.,-.15),-.019,-.125)):
+            with self.subTest(speed=speed):
+                stop=StopFeedback()
+                def check(now,feedback,stamp=None,command=(0.,0.,0.)):
+                    return stop.requires_lock(now,command,feedback,now if stamp is None else stamp,
+                                              lambda:True,lambda:True)
+                self.assertFalse(check(0.,(0.,0.,0.,speed,rate),command=cmd))
+                for i in range(1,16):
+                    t=i*.05
+                    self.assertFalse(check(t,(speed*t,0.,rate*t,speed,rate)))
+                self.assertTrue(stop.reviewing)
+                quiet=(speed*.80,0.,rate*.80,0.,0.)
+                self.assertFalse(check(.80,quiet))
+                self.assertFalse(check(.94,quiet,stamp=.80))
+                self.assertFalse(check(1.01,None))
+                self.assertTrue(stop.reviewing)
+                for t in (1.05,1.12,1.22,1.32):
+                    self.assertFalse(check(t,quiet))
+                    self.assertTrue(stop.reviewing)
+                self.assertFalse(check(1.40,quiet))
+                self.assertFalse(stop.reviewing)
+
+    def test_brake_review_escalates_runaway_reversal_obstacle_and_total_travel(self):
+        for hazard in ('persistent','accelerates','reversal','obstacle','distance','yaw','oscillation','unsolicited'):
+            with self.subTest(hazard=hazard):
+                stop=StopFeedback()
+                def check(t,odom,clear=True,command=(0.,0.,0.)):
+                    return stop.requires_lock(t,command,odom,t,lambda:clear,lambda:clear)
+                if hazard!='unsolicited':
+                    check(0.,(0.,0.,0.,.042,0.),command=(.045,0.,0.))
+                check(.05,(0.,0.,0.,.04,0.))
+                locked=check(.75,(.020,0.,0.,.038,0.))
+                if hazard=='unsolicited':
+                    self.assertTrue(locked)
+                    continue
+                self.assertFalse(locked)
+                self.assertTrue(stop.reviewing)
+                if hazard=='oscillation':
+                    self.assertFalse(check(.80,(.003,0.,0.,.004,0.)))
+                t=1.60 if hazard=='persistent' else .87
+                x=.048 if hazard=='distance' else .020
+                v={'accelerates':.075,'reversal':-.035}.get(hazard,.034)
+                angle=.15 if hazard=='yaw' else 0.
+                self.assertTrue(check(t,(x,0.,angle,v,0.),clear=hazard!='obstacle'))
+
 
 class DockFootprintTests(unittest.TestCase):
     def test_nearby_pass_is_clear_and_swept_contact_is_blocked(self):

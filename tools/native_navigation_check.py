@@ -48,7 +48,7 @@ def main():
     from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
     sys.path.insert(0,str(ROOT/'demo'))
     from directed_route import fas_axis_leg, straight_approach_speed
-    from arrival_policy import FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE
+    from arrival_policy import FAS_STATION_POSITION_TOLERANCE, FAS_STATION_YAW_TOLERANCE, SMALL_SPIN_ANGLE
     from ros_backend import RosBackend
     from turn_approach import TurnApproach
 
@@ -267,7 +267,7 @@ def main():
                                scan_map_agreement=.99,scan_structure_verified=True)
         for name in ('gyro_received','wheel_received','begin_waypoint_heading','start_fas_spin','spin_accepted',
                      'spin_done','finish_native_cancellation','settle_waypoint_heading','should_brake_heading',
-                     'navigate','send_fas_line','fas_line','stamped','send_navigation','directed_validated','directed_speed_ready',
+                     'navigate','send_fas_line','fas_line','stamped','navigation_path_allowed','send_navigation','directed_validated','directed_speed_ready',
                      'update_line_alignment','directed_lookahead_ready','send_directed_path',
                      'follow_directed','nav_accepted','nav_done','retry_arrival','send_arrival_retry','request_speed','stop_at_waypoint',
                      'publish_motion_permit','publish_spin_limit','zero_motion','finish_waypoint_position','complete_waypoint'):
@@ -468,7 +468,7 @@ def main():
         results.append(record);print(json.dumps(record),flush=True)
         if not passed:raise AssertionError('Spin must rotate in place without reversing direction')
         state['allow']=None
-        for angle,hold in ((-3.5,0.),(30.,2.2),(90.,0.)):
+        for angle,hold in ((-3.5,0.),(-7.,0.),(30.,2.2),(90.,0.)):
             goal={'x':state['x']+.018,'y':state['y'],'yaw':state['a']+math.radians(angle)}
             if angle==90.:
                 h=state['a']
@@ -478,6 +478,19 @@ def main():
             bridge=station_bridge(goal,start_time+hold)
             identity=bridge.active
             op=bridge.ops[identity]
+            if abs(math.radians(angle))<=op['yaw_tolerance']:
+                first=len(samples)
+                while op['status']!='succeeded' and time.monotonic()-start_time<8.:
+                    step()
+                passed=(op['status']=='succeeded' and not op['heading_attempts']
+                        and op['final_position_error']<=FAS_STATION_POSITION_TOLERANCE
+                        and op['final_yaw_error_deg']<=math.degrees(FAS_STATION_YAW_TOLERANCE)
+                        and all(abs(r[4])+abs(r[5])<1e-6 for r in samples[first:]))
+                record=dict(case='station_already_within_tolerance',passed=passed,requested_deg=angle)
+                results.append(record);print(json.dumps(record),flush=True)
+                if not passed:raise AssertionError('An in-tolerance stationary waypoint should complete without motion')
+                bridge=None
+                continue
             if angle==90.:
                 while state['v']<.035 and time.monotonic()-start_time<6.:
                     step()
@@ -500,7 +513,10 @@ def main():
             commands=samples[first:]
             sign=math.copysign(1.,angle)
             during_hold=[r for r in commands if r[0]+started<start_time+hold-.1]
-            passed=(bridge.active==identity and op['status']=='succeeded' and op['heading_attempts']==1
+            small_turn=abs(math.radians(angle))<=SMALL_SPIN_ANGLE
+            attempts_ok=(1<=op['heading_attempts']<=2 and time.monotonic()-spin_start<=6.
+                         if small_turn else op['heading_attempts']==1)
+            passed=(bridge.active==identity and op['status']=='succeeded' and attempts_ok
                     and (approach_error is None or approach_error<=.03)
                     and op['final_position_error']<=FAS_STATION_POSITION_TOLERANCE
                     and op['final_yaw_error_deg']<=math.degrees(FAS_STATION_YAW_TOLERANCE)
@@ -515,7 +531,7 @@ def main():
                         turn_and_settle_s=time.monotonic()-spin_start,seconds=time.monotonic()-start_time)
             results.append(record);print(json.dumps(record),flush=True)
             bridge.publish_spin_limit(0.);bridge=None
-            if not passed:raise AssertionError('Station did not complete with one signed spin')
+            if not passed:raise AssertionError('Station turn exceeded its motion, precision or retry limits')
         # The panel uses map +Y for left. Start once at the first station and
         # carry the measured pose through the side leg and both horizontal legs.
         state.update(x=.1,y=-.4,a=math.pi/2,v=0.,w=0.,allow=None,turn_offset=.02)
