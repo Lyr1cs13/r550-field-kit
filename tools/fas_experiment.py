@@ -65,6 +65,12 @@ class PauseRequested(Exception):
     pass
 
 
+def check_chassis_holds(states):
+    for car, state in states.items():
+        if '停车锁定' in (state['health'].get('readiness') or ''):
+            raise RecoveryWait(f'{car} 车底盘停车锁定，等待复核车轮及周围净空并解除锁定')
+
+
 def recorded_charge_plateau(database, car, origin, floor, *, now=None):
     """Check the current dock session for a long plateau under the vehicle's normal load."""
     now=time.time() if now is None else now
@@ -478,6 +484,7 @@ class Live:
               c5_window_s=None, parallel_radios=False):
         self.window_s = window_s
         self.sync(check_operator=not resume_operator)
+        check_chassis_holds(self.states)
         held=tuple(car for car,s in self.states.items() if s['fas']['operator_hold'])
         if not self.motion_only:
             base = self.base.get('/fas/health')
@@ -542,6 +549,7 @@ class Live:
             except OSError:
                 time.sleep(.3)
                 continue
+            check_chassis_holds(self.states)
             if all(s['phase'] in PARKED_PHASES and s['health']['stationary'] and not s['fas']['lease_live']
                    for s in self.states.values()):
                 fitting=any(s['health'].get('charging_stable')
@@ -578,13 +586,12 @@ class Live:
         if self.journal.pending():
             return
         self.sync()
+        check_chassis_holds(self.states)
         if any(s['phase'] not in PARKED_PHASES or not s['health']['stationary'] or s['fas']['lease_live']
                for s in self.states.values()):
             return
         for car,state in self.states.items():
             health=state['health']
-            if '停车锁定' in (health.get('readiness') or ''):
-                raise ValueError(f'{car} 车底盘停车锁定，须核对实车和桩位')
             if fleet_pose_ready(health):
                 if car in self.recovery_claims:
                     self.command(car,'fas_claim',timeout=3.)

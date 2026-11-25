@@ -879,6 +879,46 @@ class MotionSimulationTests(TestCase):
             finally:
                 journal.close()
 
+    def test_chassis_hold_keeps_the_capture_waiting_until_the_verified_release(self):
+        driver=self.driver((0.,2.),{'a':0.,'b':2.})
+        driver.motion_only=False
+        for state in driver.states.values():
+            state.update(phase='idle',fas={'owner':'run','lease_live':False})
+            state['health'].update(ready=True,stationary=True,localization_confirmed=True,
+                                   pose_age_s=.1,scan_map_agreement=.95)
+        locked=driver.states['B']['health']
+        locked.update(ready=False,localization_confirmed=False,readiness='停车锁定：请复核实车')
+        driver.sync=lambda **_:driver.states
+        driver.check_pause=lambda:None
+        waits=[];commands=[];attempts=[];activities=[]
+        driver.journal=SimpleNamespace(run_id='run',pending=lambda:None,
+                                       set_activity=lambda stage,reason:activities.append((stage,reason)))
+        driver.recovery_claims.add('A')
+        driver.command=lambda car,action,**_:commands.append((car,action))
+        driver.stop=lambda:None
+        driver.off=lambda:None
+
+        def wait(delay):
+            waits.append(delay)
+            self.assertEqual(commands,[])
+            if len(waits)==3:
+                locked.update(ready=True,localization_confirmed=True,readiness='就绪')
+
+        def collect():
+            attempts.append('same run')
+            if len(attempts)==1:
+                driver.wait_parked()
+                self.fail('a locked chassis was considered ready')
+            return 'resumed'
+
+        driver.wait_retry=wait
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(self.host.continuous_capture(driver,collect),'resumed')
+        self.assertEqual(waits,[2.,4.,8.])
+        self.assertEqual(commands,[('A','fas_claim')])
+        self.assertEqual(len(attempts),2)
+        self.assertTrue(all('B 车底盘停车锁定' in reason for _,reason in activities[:-1]))
+
     def test_capture_timeout_confirms_close_before_requesting_retry(self):
         events = []
         base = SimpleNamespace(post=lambda *_: events.append('open'),
